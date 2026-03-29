@@ -1,0 +1,455 @@
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path("/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import convert_to_saver_agent as ctsa
+from saver_agent.environment import SaverVideoInteraction
+from saver_agent.schema import SaverEnvironmentState
+
+
+def _collect_verifier_recommended_actions(agent_view):
+    environment = SaverVideoInteraction()
+    state = SaverEnvironmentState()
+    multimodal_cache = {
+        "fps": float(agent_view["video_meta"]["fps"]),
+        "duration": float(agent_view["video_meta"]["duration_sec"]),
+        "question": str((agent_view.get("agent_task") or {}).get("task_prompt") or ""),
+        "structured_target": dict(agent_view.get("structured_target") or {}),
+        "tool_io": dict(agent_view.get("tool_io") or {}),
+    }
+
+    recommended_actions = []
+    for step in list((agent_view.get("oracle_sft") or {}).get("trajectory") or []):
+        payload = json.dumps(
+            {
+                "name": step.get("tool"),
+                "arguments": step.get("arguments") or {},
+            },
+            ensure_ascii=False,
+        )
+        prediction = f"<think>test</think><tool_call>{payload}</tool_call>"
+        next_obs, _, _, _, next_states = environment.execute_predictions(
+            [prediction],
+            [multimodal_cache],
+            [state],
+            [True],
+        )
+        state = next_states[0]
+        if step.get("tool") != "verify_hypothesis":
+            continue
+        tool_message = next_obs[0]
+        verification = json.loads(tool_message["content"][0]["text"])
+        recommended_actions.append(str(verification.get("recommended_action") or ""))
+    return recommended_actions
+
+
+class ConvertToSaverAgentUnitTests(unittest.TestCase):
+    def test_frame_interval_to_seconds_uses_inclusive_end_policy(self):
+        start_sec, end_sec = ctsa.frame_interval_to_seconds(
+            [1, 30], fps=10.0, frame_index_base=1, duration_sec=10.0
+        )
+        self.assertAlmostEqual(start_sec, 0.0)
+        self.assertAlmostEqual(end_sec, 3.0)
+
+    def test_complete_precursor_from_evidence_role(self):
+        record = {
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "duration_sec": 12.0},
+            "label": {"is_anomaly": True},
+            "temporal": {
+                "anomaly_interval_frames": [31, 60],
+                "precursor_interval_frames": None,
+                "earliest_alert_frame": 31,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 11,
+                        "end_frame": 20,
+                        "role": "precursor",
+                        "description": "lead-up",
+                    },
+                    {
+                        "moment_id": "ev2",
+                        "start_frame": 31,
+                        "end_frame": 40,
+                        "role": "trigger",
+                        "description": "event",
+                    },
+                ]
+            },
+        }
+
+        completed = ctsa.complete_precursor_interval(record)
+        self.assertEqual(completed["frames"], [11, 20])
+        self.assertEqual(completed["source"], "evidence_precursor_role")
+        self.assertFalse(completed["auto_completed"])
+
+    def test_complete_precursor_with_heuristic_when_missing(self):
+        record = {
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "duration_sec": 20.0},
+            "label": {"is_anomaly": True},
+            "temporal": {
+                "anomaly_interval_frames": [51, 100],
+                "precursor_interval_frames": None,
+                "earliest_alert_frame": 51,
+            },
+            "evidence": {"evidence_moments": []},
+        }
+
+        completed = ctsa.complete_precursor_interval(record, heuristic_seconds=2.0, heuristic_fraction=0.2)
+        self.assertEqual(completed["frames"], [31, 50])
+        self.assertEqual(completed["source"], "heuristic_preceding_window")
+        self.assertTrue(completed["auto_completed"])
+
+    def test_agent_train_conversion_includes_structured_target_and_tool_io(self):
+        record = {
+            "video_id": "sample_anom",
+            "file_name": "sample_anom.mp4",
+            "video_path": "data/sample_anom.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 120, "duration_sec": 12.0},
+            "scene": {"scenario": "shop"},
+            "key_objects": ["person", "bag"],
+            "label": {"is_anomaly": True, "category": "robbery", "severity": 4, "hard_normal": False},
+            "temporal": {
+                "anomaly_interval_frames": [41, 90],
+                "precursor_interval_frames": [21, 40],
+                "earliest_alert_frame": 41,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 21,
+                        "end_frame": 40,
+                        "role": "precursor",
+                        "description": "suspicious approach",
+                    },
+                    {
+                        "moment_id": "ev2",
+                        "start_frame": 41,
+                        "end_frame": 50,
+                        "role": "trigger",
+                        "description": "bag snatch",
+                    },
+                ]
+            },
+            "counterfactual": {"type": "remove_actor_interaction", "text": "No interaction, no robbery."},
+            "language": {"summary": "A robbery happens.", "rationale": "The suspect approaches and snatches a bag."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="agent_train")
+        self.assertEqual(converted["schema_version"], "saver_agent.v1")
+        self.assertEqual(converted["structured_target"]["existence"], "anomaly")
+        self.assertEqual(converted["structured_target"]["category"], "robbery")
+        self.assertEqual(converted["tool_io"]["allowed_tools"][0], "scan_timeline")
+        self.assertEqual(converted["tool_io"]["oracle_windows_frames"][0]["role"], "precursor")
+        self.assertIn("task_prompt", converted["agent_task"])
+
+    def test_oracle_sft_conversion_emits_alert_and_finalize_steps(self):
+        record = {
+            "video_id": "sample_normal",
+            "file_name": "sample_normal.mp4",
+            "video_path": "data/sample_normal.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "normal_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 100, "duration_sec": 10.0},
+            "scene": {"scenario": "frontdoor"},
+            "key_objects": ["worker"],
+            "label": {"is_anomaly": False, "category": "normal", "severity": 0, "hard_normal": True},
+            "temporal": {
+                "anomaly_interval_frames": None,
+                "precursor_interval_frames": None,
+                "earliest_alert_frame": None,
+            },
+            "evidence": {"evidence_moments": []},
+            "counterfactual": {"type": "none", "text": None},
+            "language": {"summary": "Normal loading activity.", "rationale": "Routine work only."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="oracle_sft")
+        actions = [step["tool"] for step in converted["oracle_sft"]["trajectory"]]
+        self.assertEqual(actions[0], "scan_timeline")
+        self.assertIn("verify_hypothesis", actions)
+        self.assertGreaterEqual(actions.count("scan_timeline"), 4)
+        self.assertEqual(actions[-2], "emit_alert")
+        self.assertEqual(actions[-1], "finalize_case")
+        self.assertEqual(converted["oracle_sft"]["trajectory"][-2]["arguments"]["decision"], "declare_normal")
+
+        recommended_actions = _collect_verifier_recommended_actions(converted)
+        self.assertEqual(recommended_actions, ["finalize"])
+
+    def test_oracle_sft_conversion_carries_moment_id_in_seek_evidence_arguments(self):
+        record = {
+            "video_id": "sample_oracle_anom",
+            "file_name": "sample_oracle_anom.mp4",
+            "video_path": "data/sample_oracle_anom.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 120, "duration_sec": 12.0},
+            "scene": {"scenario": "shop"},
+            "key_objects": ["person", "bag"],
+            "label": {"is_anomaly": True, "category": "robbery", "severity": 4, "hard_normal": False},
+            "temporal": {
+                "anomaly_interval_frames": [41, 90],
+                "precursor_interval_frames": [21, 40],
+                "earliest_alert_frame": 41,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 21,
+                        "end_frame": 40,
+                        "role": "precursor",
+                        "description": "suspicious approach",
+                    },
+                    {
+                        "moment_id": "ev2",
+                        "start_frame": 41,
+                        "end_frame": 50,
+                        "role": "trigger",
+                        "description": "bag snatch",
+                    },
+                ]
+            },
+            "counterfactual": {"type": "remove_actor_interaction", "text": "No interaction, no robbery."},
+            "language": {"summary": "A robbery happens.", "rationale": "The suspect approaches and snatches a bag."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="oracle_sft")
+        seek_steps = [
+            step for step in converted["oracle_sft"]["trajectory"]
+            if step.get("tool") == "seek_evidence"
+        ]
+
+        self.assertGreaterEqual(len(seek_steps), 2)
+        self.assertEqual(seek_steps[0]["arguments"]["moment_id"], "ev1")
+        self.assertEqual(seek_steps[1]["arguments"]["moment_id"], "ev2")
+
+    def test_oracle_sft_conversion_builds_branchy_verifier_trajectory_for_two_moment_anomaly(self):
+        record = {
+            "video_id": "sample_branchy_anom",
+            "file_name": "sample_branchy_anom.mp4",
+            "video_path": "data/sample_branchy_anom.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 120, "duration_sec": 12.0},
+            "scene": {"scenario": "shop"},
+            "key_objects": ["person", "bag"],
+            "label": {"is_anomaly": True, "category": "robbery", "severity": 4, "hard_normal": False},
+            "temporal": {
+                "anomaly_interval_frames": [41, 90],
+                "precursor_interval_frames": [21, 40],
+                "earliest_alert_frame": 41,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 21,
+                        "end_frame": 40,
+                        "role": "precursor",
+                        "description": "suspicious approach",
+                    },
+                    {
+                        "moment_id": "ev2",
+                        "start_frame": 41,
+                        "end_frame": 50,
+                        "role": "trigger",
+                        "description": "bag snatch",
+                    },
+                ]
+            },
+            "counterfactual": {"type": "remove_actor_interaction", "text": "No interaction, no robbery."},
+            "language": {"summary": "A robbery happens.", "rationale": "The suspect approaches and snatches a bag."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="oracle_sft")
+        trajectory = list((converted.get("oracle_sft") or {}).get("trajectory") or [])
+        verify_indices = [index for index, step in enumerate(trajectory) if step.get("tool") == "verify_hypothesis"]
+
+        self.assertGreaterEqual(len(verify_indices), 3)
+        self.assertTrue(
+            any(
+                step.get("tool") in {"scan_timeline", "seek_evidence"}
+                for step in trajectory[verify_indices[0] + 1 : verify_indices[1]]
+            )
+        )
+        self.assertTrue(
+            any(
+                step.get("tool") in {"scan_timeline", "seek_evidence"}
+                for step in trajectory[verify_indices[1] + 1 : verify_indices[2]]
+            )
+        )
+
+        verify_steps = [step for step in trajectory if step.get("tool") == "verify_hypothesis"]
+        feedback_actions = [
+            str((step.get("oracle_verifier_feedback") or {}).get("recommended_action") or "")
+            for step in verify_steps
+        ]
+        self.assertEqual(feedback_actions[:3], ["revise_claim", "continue_search", "finalize"])
+        self.assertEqual(verify_steps[0]["arguments"].get("evidence_moment_ids"), ["ev1"])
+
+        recommended_actions = _collect_verifier_recommended_actions(converted)
+        self.assertEqual(recommended_actions[-1], "finalize")
+        self.assertTrue(all(action != "finalize" for action in recommended_actions[:2]))
+
+
+class ConvertToSaverAgentCliTests(unittest.TestCase):
+    def test_cli_converts_jsonl_to_agent_train(self):
+        sample = {
+            "video_id": "cli_case",
+            "file_name": "cli_case.mp4",
+            "video_path": "data/cli_case.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 5.0, "width": 1280, "height": 720, "total_frames": 50, "duration_sec": 10.0},
+            "scene": {"scenario": "road"},
+            "key_objects": ["car"],
+            "label": {"is_anomaly": True, "category": "traffic_accident", "severity": 3, "hard_normal": False},
+            "temporal": {
+                "anomaly_interval_frames": [11, 40],
+                "precursor_interval_frames": None,
+                "earliest_alert_frame": 11,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 11,
+                        "end_frame": 20,
+                        "role": "trigger",
+                        "description": "collision begins",
+                    }
+                ]
+            },
+            "counterfactual": {"type": "restore_safe_context", "text": "No collision if the road were clear."},
+            "language": {"summary": "A crash occurs.", "rationale": "Two vehicles collide."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.jsonl"
+            output_path = Path(tmpdir) / "output.jsonl"
+            with input_path.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(sample) + "\n")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "convert_to_saver_agent.py"),
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                    "--mode",
+                    "agent_train",
+                ],
+                check=True,
+            )
+
+            with output_path.open(encoding="utf-8") as f:
+                converted = json.loads(f.readline())
+
+            self.assertEqual(converted["video_id"], "cli_case")
+            self.assertEqual(converted["auto_completed"]["precursor_interval"], True)
+            self.assertEqual(converted["structured_target"]["existence"], "anomaly")
+
+    def test_cli_include_splits_filters_output_rows(self):
+        train_sample = {
+            "video_id": "cli_train_case",
+            "file_name": "cli_train_case.mp4",
+            "video_path": "data/cli_train_case.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 5.0, "width": 1280, "height": 720, "total_frames": 50, "duration_sec": 10.0},
+            "scene": {"scenario": "road"},
+            "key_objects": ["car"],
+            "label": {"is_anomaly": True, "category": "traffic_accident", "severity": 3, "hard_normal": False},
+            "temporal": {"anomaly_interval_frames": [11, 40], "precursor_interval_frames": None, "earliest_alert_frame": 11},
+            "evidence": {"evidence_moments": []},
+            "counterfactual": {"type": "restore_safe_context", "text": "No collision if the road were clear."},
+            "language": {"summary": "A crash occurs.", "rationale": "Two vehicles collide."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+        test_sample = {
+            **train_sample,
+            "video_id": "cli_test_case",
+            "split": "test",
+            "source_split": "anomaly_testing",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.jsonl"
+            output_path = Path(tmpdir) / "output.jsonl"
+            with input_path.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(test_sample) + "\n")
+                f.write(json.dumps(train_sample) + "\n")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "convert_to_saver_agent.py"),
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                    "--mode",
+                    "agent_train",
+                    "--include-splits",
+                    "train",
+                ],
+                check=True,
+            )
+
+            with output_path.open(encoding="utf-8") as f:
+                converted_rows = [json.loads(line) for line in f if line.strip()]
+
+        self.assertEqual(len(converted_rows), 1)
+        self.assertEqual(converted_rows[0]["video_id"], "cli_train_case")
+        self.assertEqual(converted_rows[0]["split"], "train")
+
+
+if __name__ == "__main__":
+    unittest.main()

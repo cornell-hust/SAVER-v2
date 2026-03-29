@@ -1,0 +1,45 @@
+{
+  "num_records": 16,
+  "primary_status_counts": {
+    "complete": 15,
+    "incomplete": 1,
+    "redundant": 0,
+    "misaligned": 0,
+    "unknown": 0
+  },
+  "primary_status_ratios": {
+    "complete": 0.9375,
+    "incomplete": 0.0625,
+    "redundant": 0.0,
+    "misaligned": 0.0,
+    "unknown": 0.0
+  },
+  "alert_status_counts": {
+    "justified": 6,
+    "premature": 1,
+    "late": 1,
+    "not_applicable": 8,
+    "unknown": 0
+  },
+  "alert_status_ratios": {
+    "justified": 0.375,
+    "premature": 0.0625,
+    "late": 0.0625,
+    "not_applicable": 0.5,
+    "unknown": 0.0
+  },
+  "mean_total_reward": 0.4317249999999999,
+  "min_total_reward": 0.1,
+  "max_total_reward": 2.1538,
+  "mean_num_turns": 6.0,
+  "min_num_turns": 6.0,
+  "max_num_turns": 6.0,
+  "mean_reward_components": {
+    "alert_reward": 0.0,
+    "counterfactual_reward": 0.081725,
+    "decision_reward": 0.0625,
+    "efficiency_reward": 0.25,
+    "temporal_reward": 0.1033625,
+    "verification_reward": 0.125
+  }
+}

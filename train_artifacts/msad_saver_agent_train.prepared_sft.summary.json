@@ -1,0 +1,1616 @@
+{
+  "input_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/train_artifacts/msad_saver_agent_train.prepared_sft.jsonl",
+  "include_splits": [
+    "train"
+  ],
+  "num_examples": 2554,
+  "num_examples_with_images": 2554,
+  "image_count_stats": {
+    "count": 2554,
+    "sum": 47965.0,
+    "min": 8.0,
+    "max": 48.0,
+    "mean": 18.780344557556774,
+    "median": 16.0,
+    "p90": 32.0,
+    "p95": 37.0,
+    "p99": 45.0
+  },
+  "message_count_stats": {
+    "count": 2554,
+    "sum": 18736.0,
+    "min": 2.0,
+    "max": 20.0,
+    "mean": 7.335943617854346,
+    "median": 6.0,
+    "p90": 16.0,
+    "p95": 18.0,
+    "p99": 20.0
+  },
+  "split_counts": [
+    {
+      "key": "train",
+      "count": 2554
+    }
+  ],
+  "target_action_counts": [
+    {
+      "key": "tool_call",
+      "count": 2074
+    },
+    {
+      "key": "answer",
+      "count": 480
+    }
+  ],
+  "tool_name_counts": [
+    {
+      "key": "emit_alert",
+      "count": 600
+    },
+    {
+      "key": "(none)",
+      "count": 480
+    },
+    {
+      "key": "finalize_case",
+      "count": 480
+    },
+    {
+      "key": "scan_timeline",
+      "count": 480
+    },
+    {
+      "key": "seek_evidence",
+      "count": 394
+    },
+    {
+      "key": "verify_hypothesis",
+      "count": 120
+    }
+  ],
+  "top_videos_by_image_load": [
+    {
+      "video_id": "Fighting_1",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 360,
+      "max_num_images": 48,
+      "mean_num_images": 36.0
+    },
+    {
+      "video_id": "Fighting_2",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 360,
+      "max_num_images": 48,
+      "mean_num_images": 36.0
+    },
+    {
+      "video_id": "Fire_25",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 360,
+      "max_num_images": 48,
+      "mean_num_images": 36.0
+    },
+    {
+      "video_id": "Water_incident_5",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 360,
+      "max_num_images": 48,
+      "mean_num_images": 36.0
+    },
+    {
+      "video_id": "Assault_10",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 352,
+      "max_num_images": 47,
+      "mean_num_images": 35.2
+    },
+    {
+      "video_id": "Robbery_26",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 339,
+      "max_num_images": 45,
+      "mean_num_images": 33.9
+    },
+    {
+      "video_id": "People_falling_22",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 337,
+      "max_num_images": 45,
+      "mean_num_images": 33.7
+    },
+    {
+      "video_id": "Robbery_5",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 330,
+      "max_num_images": 44,
+      "mean_num_images": 33.0
+    },
+    {
+      "video_id": "Robbery_25",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 321,
+      "max_num_images": 42,
+      "mean_num_images": 32.1
+    },
+    {
+      "video_id": "Robbery_12",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 320,
+      "max_num_images": 42,
+      "mean_num_images": 32.0
+    },
+    {
+      "video_id": "Shooting_15",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 319,
+      "max_num_images": 42,
+      "mean_num_images": 31.9
+    },
+    {
+      "video_id": "Object_falling_1",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 315,
+      "max_num_images": 42,
+      "mean_num_images": 31.5
+    },
+    {
+      "video_id": "Robbery_9",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 311,
+      "max_num_images": 41,
+      "mean_num_images": 31.1
+    },
+    {
+      "video_id": "Robbery_22",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 312,
+      "max_num_images": 40,
+      "mean_num_images": 31.2
+    },
+    {
+      "video_id": "Water_incident_7",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 312,
+      "max_num_images": 40,
+      "mean_num_images": 31.2
+    },
+    {
+      "video_id": "Fire_1",
+      "split": "train",
+      "num_examples": 9,
+      "num_tool_examples": 8,
+      "num_answer_examples": 1,
+      "total_num_images": 280,
+      "max_num_images": 40,
+      "mean_num_images": 31.11111111111111
+    },
+    {
+      "video_id": "Robbery_3",
+      "split": "train",
+      "num_examples": 9,
+      "num_tool_examples": 8,
+      "num_answer_examples": 1,
+      "total_num_images": 280,
+      "max_num_images": 40,
+      "mean_num_images": 31.11111111111111
+    },
+    {
+      "video_id": "Robbery_6",
+      "split": "train",
+      "num_examples": 9,
+      "num_tool_examples": 8,
+      "num_answer_examples": 1,
+      "total_num_images": 280,
+      "max_num_images": 40,
+      "mean_num_images": 31.11111111111111
+    },
+    {
+      "video_id": "Water_incident_3",
+      "split": "train",
+      "num_examples": 9,
+      "num_tool_examples": 8,
+      "num_answer_examples": 1,
+      "total_num_images": 280,
+      "max_num_images": 40,
+      "mean_num_images": 31.11111111111111
+    },
+    {
+      "video_id": "Assault_12",
+      "split": "train",
+      "num_examples": 10,
+      "num_tool_examples": 9,
+      "num_answer_examples": 1,
+      "total_num_images": 303,
+      "max_num_images": 40,
+      "mean_num_images": 30.3
+    }
+  ],
+  "heaviest_examples": [
+    {
+      "line_number": 144,
+      "video_id": "Fighting_1",
+      "split": "train",
+      "step_index": 10,
+      "target_action": "answer",
+      "tool_name": null,
+      "num_messages": 20,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 77,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 9,
+        "tool": 9,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 154,
+      "video_id": "Fighting_2",
+      "split": "train",
+      "step_index": 10,
+      "target_action": "answer",
+      "tool_name": null,
+      "num_messages": 20,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 77,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 9,
+        "tool": 9,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 306,
+      "video_id": "Fire_25",
+      "split": "train",
+      "step_index": 10,
+      "target_action": "answer",
+      "tool_name": null,
+      "num_messages": 20,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 77,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 9,
+        "tool": 9,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 1097,
+      "video_id": "Water_incident_5",
+      "split": "train",
+      "step_index": 10,
+      "target_action": "answer",
+      "tool_name": null,
+      "num_messages": 20,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 77,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 9,
+        "tool": 9,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 143,
+      "video_id": "Fighting_1",
+      "split": "train",
+      "step_index": 9,
+      "target_action": "tool_call",
+      "tool_name": "finalize_case",
+      "num_messages": 18,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 74,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 8,
+        "tool": 8,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 153,
+      "video_id": "Fighting_2",
+      "split": "train",
+      "step_index": 9,
+      "target_action": "tool_call",
+      "tool_name": "finalize_case",
+      "num_messages": 18,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 74,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 8,
+        "tool": 8,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 305,
+      "video_id": "Fire_25",
+      "split": "train",
+      "step_index": 9,
+      "target_action": "tool_call",
+      "tool_name": "finalize_case",
+      "num_messages": 18,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 74,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 8,
+        "tool": 8,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 1096,
+      "video_id": "Water_incident_5",
+      "split": "train",
+      "step_index": 9,
+      "target_action": "tool_call",
+      "tool_name": "finalize_case",
+      "num_messages": 18,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 74,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 8,
+        "tool": 8,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 142,
+      "video_id": "Fighting_1",
+      "split": "train",
+      "step_index": 8,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 16,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 71,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 7,
+        "tool": 7,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 152,
+      "video_id": "Fighting_2",
+      "split": "train",
+      "step_index": 8,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 16,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 71,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 7,
+        "tool": 7,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 304,
+      "video_id": "Fire_25",
+      "split": "train",
+      "step_index": 8,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 16,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 71,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 7,
+        "tool": 7,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 1095,
+      "video_id": "Water_incident_5",
+      "split": "train",
+      "step_index": 8,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 16,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 71,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 7,
+        "tool": 7,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 141,
+      "video_id": "Fighting_1",
+      "split": "train",
+      "step_index": 7,
+      "target_action": "tool_call",
+      "tool_name": "verify_hypothesis",
+      "num_messages": 14,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 68,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 6,
+        "tool": 6,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 151,
+      "video_id": "Fighting_2",
+      "split": "train",
+      "step_index": 7,
+      "target_action": "tool_call",
+      "tool_name": "verify_hypothesis",
+      "num_messages": 14,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 68,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 6,
+        "tool": 6,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 303,
+      "video_id": "Fire_25",
+      "split": "train",
+      "step_index": 7,
+      "target_action": "tool_call",
+      "tool_name": "verify_hypothesis",
+      "num_messages": 14,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 68,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 6,
+        "tool": 6,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 1094,
+      "video_id": "Water_incident_5",
+      "split": "train",
+      "step_index": 7,
+      "target_action": "tool_call",
+      "tool_name": "verify_hypothesis",
+      "num_messages": 14,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 68,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 6,
+        "tool": 6,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 140,
+      "video_id": "Fighting_1",
+      "split": "train",
+      "step_index": 6,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 12,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 65,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 5,
+        "tool": 5,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 150,
+      "video_id": "Fighting_2",
+      "split": "train",
+      "step_index": 6,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 12,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 65,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 5,
+        "tool": 5,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 302,
+      "video_id": "Fire_25",
+      "split": "train",
+      "step_index": 6,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 12,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 65,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 5,
+        "tool": 5,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    },
+    {
+      "line_number": 1093,
+      "video_id": "Water_incident_5",
+      "split": "train",
+      "step_index": 6,
+      "target_action": "tool_call",
+      "tool_name": "emit_alert",
+      "num_messages": 12,
+      "num_images": 48,
+      "num_image_refs": 48,
+      "num_inline_images": 0,
+      "num_text_items": 65,
+      "role_image_counts": {
+        "system": 0,
+        "user": 8,
+        "assistant": 0,
+        "tool": 40,
+        "other": 0
+      },
+      "role_message_counts": {
+        "system": 1,
+        "user": 1,
+        "assistant": 5,
+        "tool": 5,
+        "other": 0
+      },
+      "num_tool_messages_with_images": 5,
+      "max_images_in_single_message": 8,
+      "message_image_breakdown": [
+        {
+          "message_index": 1,
+          "role": "user",
+          "num_images": 8,
+          "num_text_items": 9
+        },
+        {
+          "message_index": 3,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 5,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 7,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 9,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        },
+        {
+          "message_index": 11,
+          "role": "tool",
+          "num_images": 8,
+          "num_text_items": 10
+        }
+      ]
+    }
+  ]
+}

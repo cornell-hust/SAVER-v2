@@ -1,0 +1,45 @@
+{
+  "num_records": 16,
+  "primary_status_counts": {
+    "complete": 0,
+    "incomplete": 0,
+    "redundant": 0,
+    "misaligned": 16,
+    "unknown": 0
+  },
+  "primary_status_ratios": {
+    "complete": 0.0,
+    "incomplete": 0.0,
+    "redundant": 0.0,
+    "misaligned": 1.0,
+    "unknown": 0.0
+  },
+  "alert_status_counts": {
+    "justified": 0,
+    "premature": 0,
+    "late": 0,
+    "not_applicable": 16,
+    "unknown": 0
+  },
+  "alert_status_ratios": {
+    "justified": 0.0,
+    "premature": 0.0,
+    "late": 0.0,
+    "not_applicable": 1.0,
+    "unknown": 0.0
+  },
+  "mean_total_reward": -0.35,
+  "min_total_reward": -0.5,
+  "max_total_reward": 0.7,
+  "mean_num_turns": 6.0,
+  "min_num_turns": 6.0,
+  "max_num_turns": 6.0,
+  "mean_reward_components": {
+    "alert_reward": 0.0,
+    "counterfactual_reward": 0.0,
+    "decision_reward": 0.125,
+    "efficiency_reward": 0.25,
+    "temporal_reward": 0.5,
+    "verification_reward": -1.0
+  }
+}

@@ -1,0 +1,85 @@
+import sys
+import unittest
+from pathlib import Path
+
+import torch
+
+
+ROOT = Path("/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from saver_agent.environment import SaverEnvironmentState, SaverVideoInteraction
+from saver_agent.environment import parse_actions_and_contents
+
+
+class SaverAgentEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.env = SaverVideoInteraction()
+        self.multimodal_cache = {
+            "video": torch.zeros(8, 3, 2, 2),
+            "embedding": None,
+            "fps": 1.0,
+            "duration": 8.0,
+            "question": "Determine whether an anomaly exists.",
+            "tool_io": {"finalize_case_schema": {"type": "object", "required": ["existence"]}},
+        }
+
+    def test_execute_predictions_runs_tool_call_and_keeps_episode_active(self):
+        next_obs, dones, valid_actions, is_search, states = self.env.execute_predictions(
+            [
+                '<think>search</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":7.0,"num_frames":3}}</tool_call>'
+            ],
+            [self.multimodal_cache],
+            [SaverEnvironmentState()],
+            [True],
+        )
+
+        self.assertEqual(dones, [0])
+        self.assertEqual(valid_actions, [1])
+        self.assertEqual(is_search, [1])
+        self.assertEqual(next_obs[0]["name"], "scan_timeline")
+        self.assertEqual(len(states[0].visited_windows), 1)
+
+    def test_execute_predictions_accepts_answer_and_marks_done(self):
+        next_obs, dones, valid_actions, is_search, states = self.env.execute_predictions(
+            ['<think>done</think><answer>{"existence":"normal"}</answer>'],
+            [self.multimodal_cache],
+            [SaverEnvironmentState()],
+            [True],
+        )
+
+        self.assertEqual(next_obs, [None])
+        self.assertEqual(dones, [1])
+        self.assertEqual(valid_actions, [1])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(len(states), 1)
+
+    def test_execute_predictions_invalid_tool_format_returns_parse_error_and_keeps_episode_active(self):
+        next_obs, dones, valid_actions, is_search, states = self.env.execute_predictions(
+            ["I will use scan_timeline to inspect the clip."],
+            [self.multimodal_cache],
+            [SaverEnvironmentState()],
+            [True],
+        )
+
+        self.assertEqual(dones, [0])
+        self.assertEqual(valid_actions, [0])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(next_obs[0]["name"], "parse_error")
+        self.assertIn("<tool_call>", next_obs[0]["content"][0]["text"])
+        self.assertEqual(len(states[0].visited_windows), 0)
+
+    def test_parse_actions_accepts_unquoted_tool_name_mapping_payload(self):
+        actions, contents = parse_actions_and_contents(
+            ['<tool_call>{scan_timeline: {"start_time": "0.000s", "end_time": "7.000s"}}</tool_call>']
+        )
+
+        self.assertEqual(actions, ["tool_call"])
+        self.assertEqual(contents[0]["function"]["name"], "scan_timeline")
+        self.assertEqual(contents[0]["function"]["arguments"]["start_sec"], 0.0)
+        self.assertEqual(contents[0]["function"]["arguments"]["end_sec"], 7.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
