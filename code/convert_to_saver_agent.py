@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from split_utils import parse_include_splits
+from saver_agent.proposal import build_proposal_supervision, select_query_for_moment
 
 
 SCHEMA_VERSION = "saver_agent.v1"
@@ -412,6 +413,10 @@ class CanonicalSaverAdapter:
                 "precursor_interval": bool(precursor_info["auto_completed"]),
             },
         }
+        base["proposal_supervision"] = build_proposal_supervision(
+            key_objects=base.get("key_objects") or [],
+            evidence_moments=evidence_moments,
+        )
         return base
 
     def _build_agent_train_view(self, base: Dict[str, Any]) -> Dict[str, Any]:
@@ -540,8 +545,16 @@ class CanonicalSaverAdapter:
                 for moment in sorted_moments
             }
 
+            proposal_supervision = base.get("proposal_supervision")
+
             def append_real_seek(moment: Dict[str, Any]) -> None:
-                trajectory.append(self._seek_evidence_step(moment, category=category))
+                trajectory.append(
+                    self._seek_evidence_step(
+                        moment,
+                        category=category,
+                        proposal_supervision=proposal_supervision,
+                    )
+                )
                 searched_real_moments.append(moment)
 
             remaining_real_moments = list(sorted_moments)
@@ -704,16 +717,6 @@ class CanonicalSaverAdapter:
                     ),
                 }
             )
-            trajectory.append(
-                {
-                    "tool": "emit_alert",
-                    "arguments": {
-                        "decision": "declare_normal",
-                        "existence": "normal",
-                        "reason": language.get("rationale") or structured_target.get("rationale"),
-                    },
-                }
-            )
 
         trajectory.append(
             {
@@ -750,16 +753,29 @@ class CanonicalSaverAdapter:
             ),
         )
 
-    def _seek_evidence_step(self, moment: Dict[str, Any], *, category: str) -> Dict[str, Any]:
+    def _seek_evidence_step(
+        self,
+        moment: Dict[str, Any],
+        *,
+        category: str,
+        proposal_supervision: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         role = str(moment.get("role") or "")
+        fallback_query = self._query_for_role(role, category)
+        query_text, query_source = select_query_for_moment(
+            moment=moment,
+            proposal_supervision=proposal_supervision,
+            fallback_query=fallback_query,
+        )
         return {
             "tool": "seek_evidence",
             "arguments": {
-                "query": self._query_for_role(role, category),
+                "query": query_text,
                 "start_sec": moment["start_sec"],
                 "end_sec": moment["end_sec"],
                 "moment_id": moment["moment_id"],
                 "role": role,
+                "query_source": query_source,
             },
         }
 
@@ -868,11 +884,13 @@ class CanonicalSaverAdapter:
                 continue
             steps.append(
                 {
-                    "tool": "scan_timeline",
+                    "tool": "seek_evidence",
                     "arguments": {
+                        "query": f"check whether segment {idx + 1} contains any actionable anomaly evidence or supports a normal conclusion",
                         "start_sec": start_sec,
                         "end_sec": end_sec,
-                        "purpose": f"normal_check_segment_{idx + 1}",
+                        "role": "normal_check",
+                        "query_source": "oracle_normal_search",
                     },
                 }
             )

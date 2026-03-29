@@ -59,7 +59,8 @@ class SaverAgentAdapterTests(unittest.TestCase):
         self.assertEqual(adapted["name"], "scan_timeline")
         self.assertEqual(sum(1 for item in adapted["content"] if item["type"] == "image"), 2)
         self.assertIn("Here are selected frames.", adapted["content"][-1]["text"])
-        self.assertIn("If the frames provided above are sufficient", adapted["content"][-1]["text"])
+        self.assertIn("do not output <answer> yet", adapted["content"][-1]["text"].lower())
+        self.assertIn("call finalize_case", adapted["content"][-1]["text"])
 
     def test_verify_observation_prompt_pushes_finalize_when_verdict_is_complete(self):
         self.assertIsNotNone(ADAPTER_MODULE, "saver_agent.adapter module is missing")
@@ -87,7 +88,7 @@ class SaverAgentAdapterTests(unittest.TestCase):
         adapted = adapter.adapt_tool_observation(tool_message, multimodal_cache)
 
         self.assertIn("finalize_case", adapted["content"][-1]["text"])
-        self.assertIn("<answer>", adapted["content"][-1]["text"])
+        self.assertNotIn("output <answer> now", adapted["content"][-1]["text"].lower())
 
     def test_finalize_case_observation_prompt_requests_terminal_answer(self):
         self.assertIsNotNone(ADAPTER_MODULE, "saver_agent.adapter module is missing")
@@ -149,6 +150,61 @@ class SaverAgentRolloutRunnerTests(unittest.TestCase):
                 },
             },
         }
+
+    def test_runner_records_proposal_trace_for_feature_guided_seek_evidence(self):
+        self.assertIsNotNone(ADAPTER_MODULE, "saver_agent.adapter module is missing")
+        self.assertIsNotNone(ROLLOUT_MODULE, "saver_agent.rollout module is missing")
+
+        class _FakeProposalRuntime:
+            def encode_texts(self, texts):
+                return torch.tensor([[1.0, 0.0] for _ in texts], dtype=torch.float32)
+
+        self.item["multimodal_cache"]["embedding"] = {
+            "version": "saver_feature_cache_v1",
+            "model_name": "dummy-siglip",
+            "fps": 1.0,
+            "frame_indices": list(range(8)),
+            "timestamps_sec": [float(i) for i in range(8)],
+            "embeddings": torch.tensor(
+                [
+                    [0.1, 0.9],
+                    [0.1, 0.9],
+                    [0.95, 0.05],
+                    [0.96, 0.04],
+                    [0.2, 0.8],
+                    [0.1, 0.9],
+                    [0.1, 0.9],
+                    [0.1, 0.9],
+                ],
+                dtype=torch.float32,
+            ),
+            "embedding_dim": 2,
+            "normalized": True,
+            "frame_cache_signature": "dummy",
+        }
+        self.item["multimodal_cache"]["proposal_runtime"] = _FakeProposalRuntime()
+
+        runner = ROLLOUT_MODULE.SaverRolloutRunner(
+            environment=SaverVideoInteraction(),
+            adapter=ADAPTER_MODULE.TimeSearchRolloutAdapter(),
+            max_turns=2,
+        )
+        policy = ROLLOUT_MODULE.ReplayPolicy(
+            [
+                '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"person in red shirt","start_sec":0.0,"end_sec":7.0,"num_frames":2}}</tool_call>',
+                '<think>done</think><answer>{"existence":"anomaly","category":"assault"}</answer>',
+            ]
+        )
+
+        result = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
+
+        turn = result["turns"][0]
+        self.assertEqual(turn["tool_name"], "seek_evidence")
+        self.assertEqual(turn["proposal_backend"], "feature_topk")
+        self.assertEqual(turn["proposal_query_normalized"], "person in red shirt")
+        self.assertTrue(turn["feature_cache_used"])
+        self.assertEqual(turn["proposal_selected_frame_indices"], [2, 3])
+        self.assertIn("proposal_backend_counts", result["search_trace"])
 
     def test_runner_executes_replay_policy_and_returns_final_answer_payload(self):
         self.assertIsNotNone(ADAPTER_MODULE, "saver_agent.adapter module is missing")
@@ -224,7 +280,7 @@ class SaverAgentRolloutRunnerTests(unittest.TestCase):
         self.assertEqual(len(result["turns"][0]["tool_timestamps"]), 2)
         self.assertIn("selected 2 frames", result["turns"][0]["tool_observation_summary"])
         self.assertEqual(result["turns"][0]["state_delta"]["new_visited_windows"][0]["kind"], "scan")
-        self.assertEqual(result["turns"][0]["new_evidence_ids"], ["e0001"])
+        self.assertEqual(result["turns"][0]["new_evidence_ids"], [])
         self.assertEqual(result["turns"][1]["verifier_primary_status"], "incomplete")
         self.assertEqual(result["turns"][1]["verifier_alert_status"], "premature")
         self.assertEqual(result["turns"][1]["verifier_recommended_action"], "continue_search")

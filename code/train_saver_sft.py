@@ -103,7 +103,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-data-root", default="", help="Root path used to resolve relative video paths for epoch-end rollout eval.")
     parser.add_argument("--eval-include-splits", default="", help="Optional comma-separated split whitelist for --eval-data.")
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on how many eval records to use per epoch.")
-    parser.add_argument("--eval-rollout-max-turns", type=int, default=6, help="Maximum rollout turns for epoch-end eval.")
+    parser.add_argument("--eval-rollout-max-turns", type=int, default=12, help="Maximum rollout turns for epoch-end eval.")
     parser.add_argument(
         "--eval-verifier-backend",
         choices=["heuristic", "qwen_self_verifier", "hybrid"],

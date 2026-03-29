@@ -42,10 +42,18 @@ class FullPipelineScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             exp_root = base / "exp"
+            experiment_base_dir = Path((extra_env or {}).get("EXPERIMENT_BASE_DIR", str(base / "runs")))
+            exp_name = str((extra_env or {}).get("EXP_NAME", "")).strip()
             annotation_dir = exp_root / "benchmark_annotations"
-            artifact_dir = exp_root / "train_artifacts"
-            checkpoint_dir = exp_root / "checkpoints"
-            rollout_dir = exp_root / "rollouts" / "sft_rollout_eval"
+            if exp_name:
+                run_base_dir = experiment_base_dir / exp_name
+                artifact_dir = run_base_dir / "train_artifacts"
+                checkpoint_dir = run_base_dir / "checkpoints"
+                rollout_dir = run_base_dir / "rollouts" / "sft_rollout_eval"
+            else:
+                artifact_dir = exp_root / "train_artifacts"
+                checkpoint_dir = exp_root / "checkpoints"
+                rollout_dir = exp_root / "rollouts" / "sft_rollout_eval"
             model_root = base / "models"
             sft_output_dir = checkpoint_dir / "saver_sft_qwen3vl_8b_eval_ddp"
             raw_rollout_output = rollout_dir / "rollouts.raw.jsonl"
@@ -140,6 +148,7 @@ class FullPipelineScriptTests(unittest.TestCase):
                     "FAKE_CMD_LOG": str(log_path),
                     "DATA_ROOT": str(base),
                     "EXP_ROOT": str(exp_root),
+                    "EXPERIMENT_BASE_DIR": str(experiment_base_dir),
                     "MODEL_ROOT": str(model_root),
                     "SFT_NPROC_PER_NODE": "1",
                     "RL_NPROC_PER_NODE": "1",
@@ -210,6 +219,44 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertIn("train_saver_sft.py", log_text)
         self.assertIn("--max-seq-length 6144", log_text)
         self.assertIn("--keep-recent-text-messages 16", log_text)
+
+    def test_full_pipeline_builds_caches_and_passes_proposal_runtime_when_enabled(self):
+        result, log_text, _ = self._run_pipeline(
+            sft_root_complete=False,
+            raw_rollout_exists=False,
+            scored_rollout_exists=False,
+            summary_exists=False,
+            extra_env={
+                "PROPOSAL_MODEL_PATH": "/tmp/fake_siglip",
+                "BUILD_FRAME_CACHE": "1",
+                "BUILD_FEATURE_CACHE": "1",
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
+        self.assertIn("build_frame_cache.py", log_text)
+        self.assertIn("build_feature_cache.py", log_text)
+        self.assertIn("--proposal-model-path /tmp/fake_siglip", log_text)
+        self.assertLess(log_text.index("build_frame_cache.py"), log_text.index("build_feature_cache.py"))
+        self.assertLess(log_text.index("build_feature_cache.py"), log_text.index("train_saver_sft.py"))
+        self.assertLess(log_text.index("train_saver_sft.py"), log_text.index("batch_run_saver_rollout.py"))
+
+    def test_full_pipeline_uses_experiment_name_to_relocate_outputs(self):
+        result, log_text, sft_output_dir = self._run_pipeline(
+            sft_root_complete=False,
+            raw_rollout_exists=False,
+            scored_rollout_exists=False,
+            summary_exists=False,
+            extra_env={
+                "EXP_NAME": "exp1",
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
+        self.assertIn("/runs/exp1/train_artifacts/msad_saver_agent_train.prepared_sft.jsonl", log_text)
+        self.assertIn(f"--output-dir {sft_output_dir}", log_text)
+        self.assertIn("/runs/exp1/rollouts/sft_rollout_eval/rollouts.raw.jsonl", log_text)
+        self.assertIn("/runs/exp1/checkpoints/saver_cea_grpo_v1", log_text)
 
 
 if __name__ == "__main__":

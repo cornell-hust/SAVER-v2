@@ -14,18 +14,19 @@ from split_utils import parse_include_splits
 from saver_agent.config import PromptConfig, PreviewConfig, RolloutTraceConfig, SaverAgentConfig
 from saver_agent.adapter import TimeSearchRolloutAdapter
 from saver_agent.dataset import SaverAgentDataset
+from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH, QwenGenerationPolicy
 from saver_agent.qwen_verifier import DEFAULT_VERIFIER_MODEL_PATH, QwenSelfVerifier
 from saver_agent.rollout import ReplayPolicy, SaverRolloutRunner
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a minimal SAVER rollout with replayed responses.")
     parser.add_argument("--data", required=True, help="Path to saver_agent JSONL data.")
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data.")
     parser.add_argument("--index", type=int, default=0, help="Dataset sample index.")
-    parser.add_argument("--max-turns", type=int, default=4, help="Maximum rollout turns.")
+    parser.add_argument("--max-turns", type=int, default=12, help="Maximum rollout turns.")
     parser.add_argument(
         "--policy-backend",
         choices=["replay", "qwen"],
@@ -34,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--response", action="append", default=[], help="Replayed model response for one turn.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Local Qwen model path.")
+    parser.add_argument("--proposal-model-path", default="", help="Optional local SigLIP/CLIP path for feature-guided proposal.")
+    parser.add_argument("--proposal-torch-dtype", default="auto", help="Torch dtype for the proposal encoder.")
+    parser.add_argument("--proposal-device", default="cpu", help="Device for the proposal encoder, e.g. cpu or cuda:0.")
     parser.add_argument("--torch-dtype", default="auto", help="Torch dtype passed to from_pretrained.")
     parser.add_argument("--device-map", default="auto", help="Transformers device_map argument.")
     parser.add_argument("--attn-implementation", default="", help="Optional attention backend, e.g. flash_attention_2.")
@@ -85,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         default=0.7,
         help="Hybrid verifier weight on heuristic scores.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _serialize_result(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -170,6 +174,12 @@ def main() -> None:
             max_new_tokens=args.verifier_max_new_tokens,
         )
         item["multimodal_cache"]["verifier_runtime"] = verifier_runtime
+    if args.proposal_model_path:
+        item["multimodal_cache"]["proposal_runtime"] = SiglipFeatureEncoder.from_pretrained(
+            args.proposal_model_path,
+            torch_dtype=args.proposal_torch_dtype,
+            device=args.proposal_device,
+        )
     runner = SaverRolloutRunner(
         adapter=TimeSearchRolloutAdapter(config=config),
         max_turns=args.max_turns,

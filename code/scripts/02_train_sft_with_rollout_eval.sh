@@ -3,12 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/common_experiment.sh"
 
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
 EXP_ROOT="${EXP_ROOT:-${DATA_ROOT}/Wmh/ideas/idea2_v2}"
-ANNOTATION_DIR="${ANNOTATION_DIR:-${EXP_ROOT}/benchmark_annotations}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-${EXP_ROOT}/train_artifacts}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${EXP_ROOT}/checkpoints}"
+DATA_UTILS_DIR="${DATA_UTILS_DIR:-${CODE_DIR}/data_utils}"
+configure_experiment_layout "${CODE_DIR}" "${EXP_ROOT}" "${DATA_UTILS_DIR}"
+ANNOTATION_DIR="${ANNOTATION_DIR:-${DEFAULT_ANNOTATION_DIR}}"
+ARTIFACT_DIR="${ARTIFACT_DIR:-${DEFAULT_ARTIFACT_DIR}}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DEFAULT_CHECKPOINT_DIR}}"
 MODEL_ROOT="${MODEL_ROOT:-${DATA_ROOT}/Wmh/MLLMs}"
 
 PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL:-${ARTIFACT_DIR}/msad_saver_agent_train.prepared_sft.jsonl}"
@@ -27,7 +30,7 @@ ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_3}"
 
 # 设为 0 表示评完整个 eval 数据，不传 --eval-max-records。
 EVAL_MAX_RECORDS="${EVAL_MAX_RECORDS:-0}"
-EVAL_ROLLOUT_MAX_TURNS="${EVAL_ROLLOUT_MAX_TURNS:-6}"
+EVAL_ROLLOUT_MAX_TURNS="${EVAL_ROLLOUT_MAX_TURNS:-12}"
 EVAL_VERIFIER_BACKEND="${EVAL_VERIFIER_BACKEND:-heuristic}"
 EVAL_PROGRESS_EVERY="${EVAL_PROGRESS_EVERY:-1}"
 

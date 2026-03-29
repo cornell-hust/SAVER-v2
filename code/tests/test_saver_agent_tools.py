@@ -23,6 +23,16 @@ class _FakeQwenVerifierRuntime:
         return self.view_scores
 
 
+class _FakeProposalRuntime:
+    def __init__(self, mapping):
+        self.mapping = {str(key): torch.tensor(value, dtype=torch.float32) for key, value in mapping.items()}
+        self.calls = []
+
+    def encode_texts(self, texts):
+        self.calls.append(list(texts))
+        return torch.stack([self.mapping[str(text)] for text in texts], dim=0)
+
+
 class SaverAgentToolsTests(unittest.TestCase):
     def setUp(self):
         self.multimodal_cache = {
@@ -57,12 +67,15 @@ class SaverAgentToolsTests(unittest.TestCase):
             ["scan_timeline", "seek_evidence", "emit_alert", "verify_hypothesis", "finalize_case"],
         )
 
+        scan_schema = next(tool for tool in get_tool_schemas() if tool["function"]["name"] == "scan_timeline")
+        self.assertIn("stride_sec", scan_schema["function"]["parameters"]["properties"])
+
     def test_scan_timeline_updates_visited_windows(self):
         message, state = execute_tool_call(
             {
                 "function": {
                     "name": "scan_timeline",
-                    "arguments": {"start_sec": 0.0, "end_sec": 9.0, "num_frames": 4},
+                    "arguments": {"start_sec": 0.0, "end_sec": 9.0, "num_frames": 4, "stride_sec": 2.0},
                 }
             },
             self.multimodal_cache,
@@ -74,7 +87,9 @@ class SaverAgentToolsTests(unittest.TestCase):
         self.assertEqual(len(state.visited_windows), 1)
         self.assertEqual(state.visited_windows[0]["window_id"], "w0001")
         self.assertEqual(state.visited_windows[0]["kind"], "scan")
-        self.assertEqual(state.evidence_ledger[0]["selected_frame_count"], 4)
+        self.assertEqual(state.visited_windows[0]["selected_frame_count"], 6)
+        self.assertEqual(state.visited_windows[0]["selected_timestamps"], [0.0, 2.0, 4.0, 6.0, 8.0, 9.0])
+        self.assertEqual(state.evidence_ledger, [])
 
     def test_emit_alert_and_finalize_case_update_environment_state(self):
         _, state = execute_tool_call(
@@ -265,6 +280,7 @@ class SaverAgentToolsTests(unittest.TestCase):
             self.multimodal_cache,
             self.state,
         )
+
         message, state = execute_tool_call(
             {
                 "function": {
@@ -284,6 +300,59 @@ class SaverAgentToolsTests(unittest.TestCase):
         self.assertEqual(state.verification_records[-1]["verifier_backend"], "qwen_self_verifier")
         self.assertEqual(message["content"][0]["type"], "text")
         self.assertEqual(runtime.calls, 1)
+
+    def test_seek_evidence_uses_feature_guided_proposal_when_runtime_and_cache_exist(self):
+        self.multimodal_cache["embedding"] = {
+            "version": "saver_feature_cache_v1",
+            "model_name": "dummy-siglip",
+            "fps": 1.0,
+            "frame_indices": list(range(10)),
+            "timestamps_sec": [float(i) for i in range(10)],
+            "embeddings": torch.tensor(
+                [
+                    [0.1, 0.9],
+                    [0.1, 0.9],
+                    [0.2, 0.8],
+                    [0.2, 0.8],
+                    [0.3, 0.7],
+                    [0.98, 0.02],
+                    [0.97, 0.03],
+                    [0.1, 0.9],
+                    [0.1, 0.9],
+                    [0.1, 0.9],
+                ],
+                dtype=torch.float32,
+            ),
+            "embedding_dim": 2,
+            "normalized": True,
+            "frame_cache_signature": "dummy",
+        }
+        self.multimodal_cache["proposal_runtime"] = _FakeProposalRuntime({"person in red shirt": [1.0, 0.0]})
+
+        message, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "seek_evidence",
+                    "arguments": {
+                        "query": "person in red shirt",
+                        "start_sec": 0.0,
+                        "end_sec": 9.0,
+                        "num_frames": 2,
+                    },
+                }
+            },
+            self.multimodal_cache,
+            self.state,
+        )
+
+        self.assertEqual(message["name"], "seek_evidence")
+        entry = state.evidence_ledger[-1]
+        self.assertEqual(entry["proposal_backend"], "feature_topk")
+        self.assertTrue(entry["feature_cache_used"])
+        self.assertEqual(entry["query_normalized"], "person in red shirt")
+        self.assertEqual(entry["selected_frame_indices"], [5, 6])
+        self.assertGreaterEqual(entry["proposal_candidate_count"], 1)
+        self.assertIsNone(entry.get("proposal_fallback_reason"))
 
 
 if __name__ == "__main__":

@@ -3,12 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/common_experiment.sh"
 
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
 EXP_ROOT="${EXP_ROOT:-${DATA_ROOT}/Wmh/ideas/idea2_v2}"
-ANNOTATION_DIR="${ANNOTATION_DIR:-${EXP_ROOT}/benchmark_annotations}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${EXP_ROOT}/checkpoints}"
-ROLLOUT_ROOT="${ROLLOUT_ROOT:-${EXP_ROOT}/rollouts}"
+DATA_UTILS_DIR="${DATA_UTILS_DIR:-${CODE_DIR}/data_utils}"
+configure_experiment_layout "${CODE_DIR}" "${EXP_ROOT}" "${DATA_UTILS_DIR}"
+ANNOTATION_DIR="${ANNOTATION_DIR:-${DEFAULT_ANNOTATION_DIR}}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DEFAULT_CHECKPOINT_DIR}}"
+ROLLOUT_ROOT="${ROLLOUT_ROOT:-${DEFAULT_ROLLOUT_ROOT}}"
 MODEL_ROOT="${MODEL_ROOT:-${DATA_ROOT}/Wmh/MLLMs}"
 
 DATA_PATH="${DATA_PATH:-${ANNOTATION_DIR}/msad_saver_oracle_sft_test.jsonl}"
@@ -20,7 +23,7 @@ RUN_DIR="${RUN_DIR:-${ROLLOUT_ROOT}/${RUN_NAME}}"
 START_INDEX="${START_INDEX:-0}"
 # 设为 0 表示从 START_INDEX 开始一路跑到该 split 结束，不截断。
 COUNT="${COUNT:-0}"
-MAX_TURNS="${MAX_TURNS:-6}"
+MAX_TURNS="${MAX_TURNS:-12}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-5}"
 TORCH_DTYPE="${TORCH_DTYPE:-auto}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"

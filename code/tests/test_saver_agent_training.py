@@ -372,6 +372,29 @@ class SaverAgentTrainingTests(unittest.TestCase):
         self.assertIn(str(video_path), output)
         self.assertEqual(output.count("[cache-warning]"), 1)
 
+    def test_frame_reference_resolver_evicts_old_frame_cache_entries(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video_a = root / "videos" / "resolver_a.mp4"
+            video_b = root / "videos" / "resolver_b.mp4"
+            self._write_test_video(video_a, num_frames=4, fps=4.0)
+            self._write_test_video(video_b, num_frames=4, fps=4.0)
+
+            resolver = training._FrameReferenceResolver(max_cached_videos=1)
+            ref_a = {"video_path": str(video_a), "raw_frame_index": 0}
+            ref_b = {"video_path": str(video_b), "raw_frame_index": 0}
+
+            resolver._resolve_image_ref(ref_a)
+            self.assertIn(str(video_a), resolver._frame_cache_tensors)
+            self.assertEqual(len(resolver._frame_cache_tensors), 1)
+
+            resolver._resolve_image_ref(ref_b)
+            self.assertNotIn(str(video_a), resolver._frame_cache_tensors)
+            self.assertIn(str(video_b), resolver._frame_cache_tensors)
+            self.assertEqual(len(resolver._frame_cache_tensors), 1)
+
     def test_compute_grpo_surrogate_loss_uses_signed_advantages_and_clipping(self):
         self.assertIsNotNone(training, "saver_agent.training module is missing")
 

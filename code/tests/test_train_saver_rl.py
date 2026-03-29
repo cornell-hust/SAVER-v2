@@ -69,6 +69,21 @@ class TrainSaverRlTests(unittest.TestCase):
         self.assertAlmostEqual(kwargs["kl_beta"], 0.025, places=6)
         self.assertEqual(kwargs["lora_target_modules"], ["q_proj", "k_proj"])
 
+    def test_parse_args_defaults_rollout_turn_limits_to_twelve(self):
+        self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")
+
+        args = train_saver_rl.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/rl_out",
+            ]
+        )
+
+        self.assertEqual(args.rollout_max_turns, 12)
+        self.assertEqual(args.eval_rollout_max_turns, 12)
+
     def test_build_training_kwargs_can_enable_reference_diagnostics_for_epoch_end_eval(self):
         self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")
 

@@ -21,11 +21,13 @@ DEFAULT_PREVIEW_INSTRUCTION = (
 
 DEFAULT_TOOL_RESPONSE_TEMPLATE = (
     "Here are selected frames. They are located at {timestamps}.\n"
-    "If the frames provided above are sufficient to answer the user's question, "
-    "please put your final answer within <answer></answer>. "
+    "Use them to decide the next tool step.\n"
+    "If the evidence is already sufficient, call finalize_case next instead of answering directly. "
+    "Only output <answer></answer> after a finalize_case observation explicitly asks for the terminal answer. "
     "Otherwise invoke the next tool with exactly one "
     '<tool_call>{{"name":"...","arguments":{{...}}}}</tool_call>.\n'
-    "Do not describe the intended tool call in plain English. Do not output bare tool names.\n"
+    "Do not describe the intended tool call in plain English. Do not output bare tool names. "
+    "Do not output <answer> yet unless finalize_case has already returned.\n"
 )
 
 

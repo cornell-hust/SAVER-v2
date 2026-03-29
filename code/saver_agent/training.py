@@ -561,10 +561,11 @@ def _build_response_labels(
 
 
 class _FrameReferenceResolver:
-    def __init__(self):
-        self._frame_cache_tensors: Dict[str, Optional[torch.Tensor]] = {}
-        self._frame_cache_status: Dict[str, str] = {}
-        self._decord_readers: Dict[str, Any] = {}
+    def __init__(self, *, max_cached_videos: int = 2):
+        self.max_cached_videos = max(0, int(max_cached_videos))
+        self._frame_cache_tensors: "OrderedDict[str, Optional[torch.Tensor]]" = OrderedDict()
+        self._frame_cache_status: "OrderedDict[str, str]" = OrderedDict()
+        self._decord_readers: "OrderedDict[str, Any]" = OrderedDict()
         self._logged_raw_frame_fallbacks: set[tuple[str, str, str]] = set()
 
     def materialize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -610,25 +611,25 @@ class _FrameReferenceResolver:
     def _load_frame_cache_tensor(self, video_path: Path) -> tuple[Optional[torch.Tensor], str]:
         key = str(video_path)
         if key in self._frame_cache_tensors:
+            self._touch_cache_key(key)
             return self._frame_cache_tensors[key], self._frame_cache_status.get(key, "missing")
 
         cache_path = _frame_cache_path(video_path)
         if not cache_path.exists():
-            self._frame_cache_tensors[key] = None
-            self._frame_cache_status[key] = "missing"
+            self._store_frame_cache_entry(key, None, "missing")
             return None, "missing"
 
         try:
             cache = torch.load(cache_path, map_location="cpu")
         except Exception:
-            self._frame_cache_tensors[key] = None
-            self._frame_cache_status[key] = "load_error"
+            self._store_frame_cache_entry(key, None, "load_error")
             return None, "load_error"
 
         frame_tensor = cache.get("frame_tensor")
-        self._frame_cache_tensors[key] = frame_tensor if isinstance(frame_tensor, torch.Tensor) else None
-        self._frame_cache_status[key] = "loaded" if self._frame_cache_tensors[key] is not None else "invalid"
-        return self._frame_cache_tensors[key], self._frame_cache_status[key]
+        resolved_tensor = frame_tensor if isinstance(frame_tensor, torch.Tensor) else None
+        resolved_status = "loaded" if resolved_tensor is not None else "invalid"
+        self._store_frame_cache_entry(key, resolved_tensor, resolved_status)
+        return resolved_tensor, resolved_status
 
     def _warn_raw_frame_fallback(self, *, video_path: Path, cache_status: str, fallback_reason: str) -> None:
         warning_key = (str(video_path), str(cache_status), str(fallback_reason))
@@ -679,12 +680,48 @@ class _FrameReferenceResolver:
     def _get_decord_reader(self, video_path: Path):
         key = str(video_path)
         if key in self._decord_readers:
+            self._touch_cache_key(key)
             return self._decord_readers[key]
         from decord import VideoReader, cpu
 
         reader = VideoReader(str(video_path), ctx=cpu(0))
         self._decord_readers[key] = reader
+        self._touch_cache_key(key)
+        self._prune_cached_videos()
         return reader
+
+    def _store_frame_cache_entry(self, key: str, tensor: Optional[torch.Tensor], status: str) -> None:
+        self._frame_cache_tensors[key] = tensor
+        self._frame_cache_status[key] = str(status)
+        self._touch_cache_key(key)
+        self._prune_cached_videos()
+
+    def _touch_cache_key(self, key: str) -> None:
+        if key in self._frame_cache_tensors:
+            self._frame_cache_tensors.move_to_end(key)
+        if key in self._frame_cache_status:
+            self._frame_cache_status.move_to_end(key)
+        if key in self._decord_readers:
+            self._decord_readers.move_to_end(key)
+
+    def _prune_cached_videos(self) -> None:
+        if self.max_cached_videos <= 0:
+            keys_to_drop = list(self._frame_cache_tensors.keys())
+            keys_to_drop.extend([key for key in self._decord_readers.keys() if key not in self._frame_cache_tensors])
+            for key in list(dict.fromkeys(keys_to_drop)):
+                self._evict_cache_key(key)
+            return
+        while len(self._frame_cache_tensors) > self.max_cached_videos:
+            oldest_key = next(iter(self._frame_cache_tensors))
+            self._evict_cache_key(oldest_key)
+        while len(self._decord_readers) > self.max_cached_videos:
+            oldest_key = next(iter(self._decord_readers))
+            self._evict_cache_key(oldest_key)
+
+    def _evict_cache_key(self, key: str) -> None:
+        self._frame_cache_tensors.pop(key, None)
+        self._frame_cache_status.pop(key, None)
+        self._decord_readers.pop(key, None)
 
     @staticmethod
     def _load_raw_video_frame_with_cv2(video_path: Path, frame_index: int) -> torch.Tensor:

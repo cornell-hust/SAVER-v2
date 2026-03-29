@@ -461,6 +461,11 @@ def build_oracle_sft_examples(
                 ),
                 "sample_weight": normalized_sample_weight,
                 "tool_name": tool_name,
+                "proposal_supervision": (
+                    _proposal_supervision_for_query(record, arguments.get("query", ""))
+                    if tool_name == "seek_evidence"
+                    else {}
+                ),
             }
         )
 
@@ -529,6 +534,44 @@ def _latest_alert_from_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
     if alerts:
         return copy.deepcopy(alerts[-1])
     return {}
+
+
+def _proposal_supervision_for_query(record: Dict[str, Any], query: str) -> Dict[str, Any]:
+    proposal_supervision = record.get("proposal_supervision") or {}
+    normalized_query = " ".join(str(query or "").strip().lower().split())
+    for query_group in proposal_supervision.get("queries") or []:
+        normalized_entries = list(query_group.get("normalized_queries") or [])
+        normalized_texts = {str(entry.get("text") or "") for entry in normalized_entries}
+        if normalized_query in normalized_texts:
+            return {
+                "query_id": query_group.get("query_id"),
+                "raw_text": query_group.get("raw_text"),
+                "normalized_queries": copy.deepcopy(normalized_entries),
+                "linked_moment_ids": list(query_group.get("linked_moment_ids") or []),
+                "linked_roles": list(query_group.get("linked_roles") or []),
+                "linked_windows_sec": copy.deepcopy(query_group.get("linked_windows_sec") or []),
+                "alignment_source": query_group.get("alignment_source"),
+            }
+    return {}
+
+
+def _proposal_metadata_from_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
+    if str(turn.get("tool_name") or "") != "seek_evidence":
+        return {}
+    return {
+        "backend": turn.get("proposal_backend"),
+        "feature_cache_used": turn.get("feature_cache_used"),
+        "query_raw": turn.get("proposal_query_raw"),
+        "query_normalized": turn.get("proposal_query_normalized"),
+        "query_source": turn.get("proposal_query_source"),
+        "candidate_count": turn.get("proposal_candidate_count"),
+        "candidate_frame_indices": list(turn.get("proposal_candidate_frame_indices") or []),
+        "candidate_frame_scores": list(turn.get("proposal_candidate_frame_scores") or []),
+        "candidate_windows": copy.deepcopy(turn.get("proposal_candidate_windows") or []),
+        "selected_frame_indices": list(turn.get("proposal_selected_frame_indices") or []),
+        "selected_frame_scores": list(turn.get("proposal_selected_frame_scores") or []),
+        "fallback_reason": turn.get("proposal_fallback_reason"),
+    }
 
 
 def _selected_window_ids_from_turn(turn: Dict[str, Any]) -> List[str]:
@@ -990,6 +1033,7 @@ def build_counterfactual_grpo_examples(
                     "selected_evidence_ids": _selected_evidence_ids_from_turn(turn),
                 },
                 "tool_name": turn.get("tool_name"),
+                "proposal_metadata": _proposal_metadata_from_turn(turn),
             }
         )
 
@@ -1078,6 +1122,7 @@ def build_reward_weighted_examples(
                         "alpha": float(turn_advantage_alpha),
                     },
                     "tool_name": turn.get("tool_name"),
+                    "proposal_metadata": _proposal_metadata_from_turn(turn),
                 }
             )
 

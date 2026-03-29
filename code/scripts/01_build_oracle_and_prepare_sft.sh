@@ -6,8 +6,9 @@ CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
 EXP_ROOT="${EXP_ROOT:-${DATA_ROOT}/Wmh/ideas/idea2_v2}"
-ANNOTATION_DIR="${ANNOTATION_DIR:-${EXP_ROOT}/benchmark_annotations}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-${EXP_ROOT}/train_artifacts}"
+DATA_UTILS_DIR="${DATA_UTILS_DIR:-${CODE_DIR}/data_utils}"
+ANNOTATION_DIR="${ANNOTATION_DIR:-${DATA_UTILS_DIR}}"
+ARTIFACT_DIR="${ARTIFACT_DIR:-${DATA_UTILS_DIR}}"
 
 CANONICAL_JSONL="${CANONICAL_JSONL:-${ANNOTATION_DIR}/msad_saver_with_qwen.jsonl}"
 TRAIN_SPLIT="${TRAIN_SPLIT:-train}"

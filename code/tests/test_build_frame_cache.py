@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -131,6 +132,36 @@ class BuildFrameCacheTests(unittest.TestCase):
             self.assertFalse(test_cache.exists())
             self.assertEqual(first_summary["written"], 1)
             self.assertEqual(second_summary["skipped_existing"], 1)
+
+    def test_build_frame_cache_does_not_log_per_file_skip_messages(self):
+        self.assertIsNotNone(build_frame_cache, "build_frame_cache.py is missing")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video_path = root / "videos" / "sample_cache_video.mp4"
+            _write_test_video(video_path, num_frames=8, fps=4.0)
+            data_path = root / "agent.jsonl"
+            data_path.write_text(json.dumps(self._sample_record()) + "\n", encoding="utf-8")
+
+            build_frame_cache.build_frame_caches(
+                data_path=data_path,
+                data_root=root,
+                include_splits="train",
+                overwrite=False,
+                progress_every=1,
+            )
+            with patch.object(build_frame_cache, "_print_progress") as mock_print_progress:
+                summary = build_frame_cache.build_frame_caches(
+                    data_path=data_path,
+                    data_root=root,
+                    include_splits="train",
+                    overwrite=False,
+                    progress_every=1,
+                )
+
+            logged_messages = [call.args[0] for call in mock_print_progress.call_args_list]
+            self.assertEqual(summary["skipped_existing"], 1)
+            self.assertFalse(any("skip existing cache" in message for message in logged_messages))
 
 
 if __name__ == "__main__":

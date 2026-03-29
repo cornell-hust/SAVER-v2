@@ -111,6 +111,18 @@ class SaverRolloutRunner:
                 "verifier_verified_window_ids": None,
                 "verifier_best_effort_window_ids": None,
                 "verifier_failure_reasons": None,
+                "proposal_backend": None,
+                "feature_cache_used": None,
+                "proposal_query_raw": None,
+                "proposal_query_normalized": None,
+                "proposal_query_source": None,
+                "proposal_candidate_count": None,
+                "proposal_candidate_frame_indices": [],
+                "proposal_candidate_frame_scores": [],
+                "proposal_candidate_windows": [],
+                "proposal_selected_frame_indices": [],
+                "proposal_selected_frame_scores": [],
+                "proposal_fallback_reason": None,
             }
             tool_message = next_obs[0] if isinstance(next_obs[0], dict) and next_obs[0].get("role") == "tool" else None
 
@@ -132,6 +144,7 @@ class SaverRolloutRunner:
                     turn_info["new_alerts"] = state_delta["new_alerts"]
                     turn_info["new_verifications"] = state_delta["new_verifications"]
                     turn_info["new_finalized_case"] = state_delta["new_finalized_case"]
+                    self._attach_search_turn_trace(turn_info, state_delta=state_delta)
                 self._attach_counterfactual_turn_trace(
                     turn_info,
                     state_before=state_before,
@@ -155,6 +168,7 @@ class SaverRolloutRunner:
                 turn_info["new_alerts"] = state_delta["new_alerts"]
                 turn_info["new_verifications"] = state_delta["new_verifications"]
                 turn_info["new_finalized_case"] = state_delta["new_finalized_case"]
+                self._attach_search_turn_trace(turn_info, state_delta=state_delta)
             if action != "answer":
                 turn_info["parsed_answer"] = None
             self._attach_counterfactual_turn_trace(
@@ -187,6 +201,7 @@ class SaverRolloutRunner:
             "decision_turn_indices": self._decision_turn_indices(turns),
             "latest_claim_trace": self._build_latest_claim_trace(turns),
             "latest_alert_trace": self._build_latest_alert_trace(turns),
+            "search_trace": self._build_search_trace(turns),
         }
         if self.config.rollout_trace.record_message_history:
             result["messages"] = messages
@@ -242,6 +257,27 @@ class SaverRolloutRunner:
         turn_info["counterfactual_actual_search_branch"] = self._actual_search_branch(turn_info)
         turn_info["counterfactual_actual_alert_branch"] = self._actual_alert_branch(turn_info)
         turn_info["counterfactual_actual_evidence_branch"] = self._actual_evidence_branch(turn_info)
+
+    @staticmethod
+    def _attach_search_turn_trace(turn_info: Dict[str, Any], *, state_delta: Dict[str, Any]) -> None:
+        if str(turn_info.get("tool_name") or "") != "seek_evidence":
+            return
+        new_windows = list(state_delta.get("new_evidence_windows") or [])
+        if not new_windows:
+            return
+        latest = dict(new_windows[-1])
+        turn_info["proposal_backend"] = latest.get("proposal_backend")
+        turn_info["feature_cache_used"] = latest.get("feature_cache_used")
+        turn_info["proposal_query_raw"] = latest.get("query")
+        turn_info["proposal_query_normalized"] = latest.get("query_normalized")
+        turn_info["proposal_query_source"] = latest.get("query_source")
+        turn_info["proposal_candidate_count"] = latest.get("proposal_candidate_count")
+        turn_info["proposal_candidate_frame_indices"] = list(latest.get("proposal_candidate_frame_indices") or [])
+        turn_info["proposal_candidate_frame_scores"] = list(latest.get("proposal_candidate_frame_scores") or [])
+        turn_info["proposal_candidate_windows"] = copy.deepcopy(latest.get("proposal_candidate_windows") or [])
+        turn_info["proposal_selected_frame_indices"] = list(latest.get("selected_frame_indices") or [])
+        turn_info["proposal_selected_frame_scores"] = list(latest.get("selected_frame_scores") or [])
+        turn_info["proposal_fallback_reason"] = latest.get("proposal_fallback_reason")
 
     def _summarize_tool_message(self, tool_message: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not tool_message:
@@ -503,3 +539,33 @@ class SaverRolloutRunner:
                 }
             )
         return trace
+
+    @staticmethod
+    def _build_search_trace(turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+        seek_turns = [turn for turn in turns if str(turn.get("tool_name") or "") == "seek_evidence"]
+        backend_counts: Dict[str, int] = {}
+        query_sequence: List[str] = []
+        num_feature_guided = 0
+        num_uniform_fallback = 0
+        for turn in seek_turns:
+            backend = str(turn.get("proposal_backend") or "unknown")
+            backend_counts[backend] = backend_counts.get(backend, 0) + 1
+            if backend == "feature_topk":
+                num_feature_guided += 1
+            if backend == "uniform":
+                num_uniform_fallback += 1
+            query_text = str(turn.get("proposal_query_normalized") or turn.get("proposal_query_raw") or "").strip()
+            if query_text:
+                query_sequence.append(query_text)
+        num_query_revisions = 0
+        for previous, current in zip(query_sequence, query_sequence[1:]):
+            if current != previous:
+                num_query_revisions += 1
+        return {
+            "num_seek_turns": len(seek_turns),
+            "num_feature_guided_searches": num_feature_guided,
+            "num_uniform_fallback_searches": num_uniform_fallback,
+            "num_query_revisions": num_query_revisions,
+            "query_sequence": query_sequence,
+            "proposal_backend_counts": backend_counts,
+        }

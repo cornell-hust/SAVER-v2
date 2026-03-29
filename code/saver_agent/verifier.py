@@ -236,6 +236,59 @@ def _fallback_view_scores(view_windows: Sequence[Dict[str, Any]]) -> Dict[str, f
     return scores
 
 
+def _video_coverage_ratio(view_windows: Sequence[Dict[str, Any]], multimodal_cache: Dict[str, Any]) -> float:
+    intervals = _merge_intervals(
+        (window.get("start_sec"), window.get("end_sec"))
+        for window in view_windows
+    )
+    if not intervals:
+        return 0.0
+    covered_duration = sum(max(0.0, end_sec - start_sec) for start_sec, end_sec in intervals)
+    duration = 0.0
+    try:
+        duration = float(multimodal_cache.get("duration") or 0.0)
+    except Exception:
+        duration = 0.0
+    if duration <= 0.0:
+        duration = max(float(intervals[-1][1]), 1e-6)
+    return max(0.0, min(1.0, covered_duration / max(duration, 1e-6)))
+
+
+def _fallback_normal_view_scores(
+    view_windows: Sequence[Dict[str, Any]],
+    multimodal_cache: Dict[str, Any],
+) -> Dict[str, float]:
+    if not view_windows:
+        return {
+            "exist_support": 0.0,
+            "category_support": 0.0,
+            "temporal_support": 0.0,
+            "precursor_support": 0.0,
+            "alert_support": 0.0,
+            "counterfactual_support": 0.0,
+            "overall_support": 0.0,
+        }
+
+    coverage = _video_coverage_ratio(view_windows, multimodal_cache)
+    search_windows = float(len(view_windows))
+    exist_support = min(1.0, 0.25 + 0.60 * coverage + 0.05 * search_windows)
+    category_support = min(1.0, 0.20 + 0.55 * coverage + 0.05 * search_windows)
+    temporal_support = min(1.0, 0.15 + 0.60 * coverage + 0.05 * max(0.0, search_windows - 1.0))
+    alert_support = min(1.0, 0.15 + 0.50 * coverage + 0.05 * search_windows)
+    counterfactual_support = min(1.0, 0.10 + 0.50 * coverage + 0.05 * search_windows)
+
+    scores = {
+        "exist_support": round(exist_support, 6),
+        "category_support": round(category_support, 6),
+        "temporal_support": round(temporal_support, 6),
+        "precursor_support": 0.0,
+        "alert_support": round(alert_support, 6),
+        "counterfactual_support": round(counterfactual_support, 6),
+    }
+    scores["overall_support"] = round(_weighted_support(scores), 6)
+    return scores
+
+
 def _weighted_support(scores: Dict[str, float]) -> float:
     total = 0.0
     for key, weight in DEFAULT_SUPPORT_WEIGHTS.items():
@@ -258,6 +311,9 @@ def _score_view(
         multimodal_cache,
         use_reference_supervision=use_reference_supervision,
     )
+    claim_existence = str(claim.get("existence") or target.get("existence") or "").strip().lower()
+    if claim_existence == "normal" and not oracle_windows:
+        return _fallback_normal_view_scores(view_windows, multimodal_cache)
     if not oracle_windows and not target:
         return _fallback_view_scores(view_windows)
 
@@ -551,9 +607,12 @@ def run_counterfactual_verifier(
     )
 
     selected_window_ids = set(_window_ids(selected_windows))
-    full_windows = list(state.visited_windows)
+    full_windows = list(state.evidence_ledger)
     if not full_windows:
-        full_windows = list(state.evidence_ledger)
+        full_windows = [
+            entry for entry in state.visited_windows
+            if str(entry.get("kind") or "") != "scan"
+        ]
     drop_windows = [entry for entry in full_windows if entry.get("window_id") not in selected_window_ids]
 
     alert_sec = None

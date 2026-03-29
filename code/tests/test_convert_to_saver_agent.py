@@ -163,6 +163,62 @@ class ConvertToSaverAgentUnitTests(unittest.TestCase):
         self.assertEqual(converted["tool_io"]["oracle_windows_frames"][0]["role"], "precursor")
         self.assertIn("task_prompt", converted["agent_task"])
 
+    def test_agent_train_conversion_builds_proposal_supervision_from_key_objects(self):
+        record = {
+            "video_id": "sample_proposal",
+            "file_name": "sample_proposal.mp4",
+            "video_path": "data/sample_proposal.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 120, "duration_sec": 12.0},
+            "scene": {"scenario": "shop"},
+            "key_objects": ["person in a red shirt being attacked by the person in a black shirt"],
+            "label": {"is_anomaly": True, "category": "assault", "severity": 4, "hard_normal": False},
+            "temporal": {
+                "anomaly_interval_frames": [41, 90],
+                "precursor_interval_frames": [21, 40],
+                "earliest_alert_frame": 41,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 21,
+                        "end_frame": 40,
+                        "role": "precursor",
+                        "description": "A person in red approaches a person in black before the assault.",
+                    },
+                    {
+                        "moment_id": "ev2",
+                        "start_frame": 41,
+                        "end_frame": 50,
+                        "role": "trigger",
+                        "description": "The person in red attacks the person in black and the victim falls.",
+                    },
+                ]
+            },
+            "counterfactual": {"type": "remove_actor_interaction", "text": "No interaction, no assault."},
+            "language": {"summary": "An assault happens.", "rationale": "The attacker in red hits the victim in black."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="agent_train")
+
+        self.assertIn("proposal_supervision", converted)
+        queries = converted["proposal_supervision"]["queries"]
+        self.assertGreaterEqual(len(queries), 1)
+        normalized_texts = [entry["text"] for entry in queries[0]["normalized_queries"]]
+        self.assertIn("person in red shirt", normalized_texts)
+        self.assertIn("person in black shirt", normalized_texts)
+        self.assertIn("physical struggle", normalized_texts)
+        self.assertEqual(queries[0]["alignment_source"], "weak_alignment")
+        self.assertIn("ev1", queries[0]["linked_moment_ids"])
+        self.assertIn("ev2", queries[0]["linked_moment_ids"])
+
     def test_oracle_sft_conversion_emits_alert_and_finalize_steps(self):
         record = {
             "video_id": "sample_normal",
@@ -193,13 +249,46 @@ class ConvertToSaverAgentUnitTests(unittest.TestCase):
         actions = [step["tool"] for step in converted["oracle_sft"]["trajectory"]]
         self.assertEqual(actions[0], "scan_timeline")
         self.assertIn("verify_hypothesis", actions)
-        self.assertGreaterEqual(actions.count("scan_timeline"), 4)
-        self.assertEqual(actions[-2], "emit_alert")
+        self.assertEqual(actions.count("scan_timeline"), 1)
+        self.assertGreaterEqual(actions.count("seek_evidence"), 3)
+        self.assertEqual(actions[-2], "verify_hypothesis")
         self.assertEqual(actions[-1], "finalize_case")
-        self.assertEqual(converted["oracle_sft"]["trajectory"][-2]["arguments"]["decision"], "declare_normal")
+        self.assertNotIn("emit_alert", actions)
 
         recommended_actions = _collect_verifier_recommended_actions(converted)
         self.assertEqual(recommended_actions, ["finalize"])
+
+    def test_oracle_sft_scan_timeline_arguments_match_registered_schema(self):
+        record = {
+            "video_id": "sample_stride",
+            "file_name": "sample_stride.mp4",
+            "video_path": "data/sample_stride.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "normal_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 100, "duration_sec": 10.0},
+            "scene": {"scenario": "frontdoor"},
+            "key_objects": ["worker"],
+            "label": {"is_anomaly": False, "category": "normal", "severity": 0, "hard_normal": True},
+            "temporal": {
+                "anomaly_interval_frames": None,
+                "precursor_interval_frames": None,
+                "earliest_alert_frame": None,
+            },
+            "evidence": {"evidence_moments": []},
+            "counterfactual": {"type": "none", "text": None},
+            "language": {"summary": "Normal loading activity.", "rationale": "Routine work only."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="oracle_sft")
+        first_step = converted["oracle_sft"]["trajectory"][0]
+
+        self.assertEqual(first_step["tool"], "scan_timeline")
+        self.assertIn("stride_sec", first_step["arguments"])
 
     def test_oracle_sft_conversion_carries_moment_id_in_seek_evidence_arguments(self):
         record = {

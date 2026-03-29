@@ -32,6 +32,11 @@ class SaverAgentPromptTests(unittest.TestCase):
         self.assertIn("hard_alert_check", prompt)
         self.assertIn("full_keep_drop", prompt)
 
+    def test_build_system_prompt_requires_finalize_before_terminal_answer(self):
+        prompt = build_system_prompt(get_tool_schemas())
+
+        self.assertIn("Only output <answer> after finalize_case", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

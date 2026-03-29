@@ -244,6 +244,20 @@ class TrainSaverSftTests(unittest.TestCase):
 
         self.assertTrue(config.attach_reference_diagnostics)
 
+    def test_parse_args_defaults_eval_rollout_max_turns_to_twelve(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+            ]
+        )
+
+        self.assertEqual(args.eval_rollout_max_turns, 12)
+
     def test_main_passes_dataloader_knobs_to_run_weighted_sft(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
 

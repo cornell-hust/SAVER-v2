@@ -112,6 +112,60 @@ def _make_partial_state(window_ids):
     )
 
 
+def _make_normal_multimodal_cache():
+    return {
+        "fps": 1.0,
+        "duration": 9.0,
+        "question": "Determine whether the video is normal and whether more search is needed.",
+        "structured_target": {},
+        "tool_io": {},
+    }
+
+
+def _make_normal_state():
+    entries = [
+        {
+            "window_id": "w0001",
+            "evidence_id": "e0001",
+            "moment_id": None,
+            "kind": "evidence",
+            "query": "normal check segment 1",
+            "start_sec": 0.0,
+            "end_sec": 3.0,
+            "selected_timestamps": [0.0, 1.0, 2.0],
+            "selected_frame_count": 3,
+        },
+        {
+            "window_id": "w0002",
+            "evidence_id": "e0002",
+            "moment_id": None,
+            "kind": "evidence",
+            "query": "normal check segment 2",
+            "start_sec": 3.0,
+            "end_sec": 6.0,
+            "selected_timestamps": [3.0, 4.0, 5.0],
+            "selected_frame_count": 3,
+        },
+        {
+            "window_id": "w0003",
+            "evidence_id": "e0003",
+            "moment_id": None,
+            "kind": "evidence",
+            "query": "normal check segment 3",
+            "start_sec": 6.0,
+            "end_sec": 9.0,
+            "selected_timestamps": [6.0, 7.0, 8.0],
+            "selected_frame_count": 3,
+        },
+    ]
+    return SaverEnvironmentState(
+        visited_windows=list(entries),
+        evidence_ledger=list(entries),
+        next_evidence_id=4,
+        next_window_id=4,
+    )
+
+
 class SaverAgentVerifierTests(unittest.TestCase):
     def test_counterfactual_verifier_resolves_candidate_evidence_moment_ids_to_runtime_subset(self):
         verdict = run_counterfactual_verifier(
@@ -203,6 +257,22 @@ class SaverAgentVerifierTests(unittest.TestCase):
 
         self.assertEqual(verdict["alert_status"], "premature")
         self.assertLess(verdict["derived_scores"]["alertability"], 0.65)
+
+    def test_counterfactual_verifier_marks_normal_claim_complete_after_broad_search_without_reference_targets(self):
+        verdict = run_counterfactual_verifier(
+            state=_make_normal_state(),
+            multimodal_cache=_make_normal_multimodal_cache(),
+            verification_mode="final_check",
+            claim={"existence": "normal", "category": "normal"},
+            candidate_window_ids=["w0001", "w0002", "w0003"],
+            backend="heuristic",
+            use_reference_supervision=False,
+        )
+
+        self.assertEqual(verdict["primary_status"], "complete")
+        self.assertEqual(verdict["alert_status"], "not_applicable")
+        self.assertEqual(verdict["recommended_action"], "finalize")
+        self.assertGreaterEqual(verdict["derived_scores"]["sufficiency"], 0.60)
 
     def test_counterfactual_verifier_uses_qwen_runtime_when_requested(self):
         qwen_scores = {

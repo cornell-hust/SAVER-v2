@@ -3,9 +3,10 @@ set -euo pipefail
 
 # Full SAVER pipeline:
 #   1. 如果缺失，则构建 agent_train / oracle_sft / prepared_sft
-#   2. 多卡训练 SFT，并在每个 epoch 后做 rollout 评估
-#   3. 批量 rollout、离线打分、汇总
-#   4. 多卡训练 RL
+#   2. 预建 .frame_cache / .feature_cache
+#   3. 多卡训练 SFT，并在每个 epoch 后做 rollout 评估
+#   4. 用 proposal runtime 跑批量 rollout、离线打分、汇总
+#   5. 多卡训练 RL
 #
 # 使用方式:
 #   bash code/scripts/00_full_pipeline.sh
@@ -20,6 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/common_experiment.sh"
 
 # -----------------------------
 # 基础路径
@@ -29,11 +31,13 @@ CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
 # 实验根目录。
 EXP_ROOT="${EXP_ROOT:-${DATA_ROOT}/Wmh/ideas/idea2_v2}"
-# 标注、训练产物、checkpoint、rollout 输出目录。
-ANNOTATION_DIR="${ANNOTATION_DIR:-${EXP_ROOT}/benchmark_annotations}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-${EXP_ROOT}/train_artifacts}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${EXP_ROOT}/checkpoints}"
-ROLLOUT_ROOT="${ROLLOUT_ROOT:-${EXP_ROOT}/rollouts}"
+DATA_UTILS_DIR="${DATA_UTILS_DIR:-${CODE_DIR}/data_utils}"
+configure_experiment_layout "${CODE_DIR}" "${EXP_ROOT}" "${DATA_UTILS_DIR}"
+# 预处理类 json/jsonl/json 默认放在 code/data_utils；checkpoint/rollout 继续走 ckpt/<EXP_NAME>。
+ANNOTATION_DIR="${ANNOTATION_DIR:-${DEFAULT_ANNOTATION_DIR}}"
+ARTIFACT_DIR="${ARTIFACT_DIR:-${DEFAULT_ARTIFACT_DIR}}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DEFAULT_CHECKPOINT_DIR}}"
+ROLLOUT_ROOT="${ROLLOUT_ROOT:-${DEFAULT_ROLLOUT_ROOT}}"
 # 模型目录，默认假设 Qwen3-VL 权重放在这里。
 MODEL_ROOT="${MODEL_ROOT:-${DATA_ROOT}/Wmh/MLLMs}"
 
@@ -73,7 +77,32 @@ VALIDATE_MATERIALIZATION="${VALIDATE_MATERIALIZATION:-0}"
 VALIDATION_MAX_EXAMPLES="${VALIDATION_MAX_EXAMPLES:-0}"
 
 # -----------------------------
-# Stage 2: SFT
+# Stage 2: frame / feature cache
+# BUILD_FEATURE_CACHE=auto 时，只在提供 PROPOSAL_MODEL_PATH 后自动开启。
+# Stage 4 的真实 rollout 也会在同样条件下自动接 proposal runtime。
+# -----------------------------
+BUILD_FRAME_CACHE="${BUILD_FRAME_CACHE:-1}"
+BUILD_FEATURE_CACHE="${BUILD_FEATURE_CACHE:-auto}"
+FRAME_CACHE_DATA="${FRAME_CACHE_DATA:-${ORACLE_JSONL}}"
+FRAME_CACHE_INCLUDE_SPLITS="${FRAME_CACHE_INCLUDE_SPLITS:-${TRAIN_SPLIT},${EVAL_SPLIT}}"
+FRAME_CACHE_VIDEO_FPS="${FRAME_CACHE_VIDEO_FPS:-2.0}"
+FRAME_CACHE_MAX_FRAMES="${FRAME_CACHE_MAX_FRAMES:-256}"
+FRAME_CACHE_PROGRESS_EVERY="${FRAME_CACHE_PROGRESS_EVERY:-50}"
+FRAME_CACHE_OVERWRITE="${FRAME_CACHE_OVERWRITE:-0}"
+FRAME_CACHE_SUMMARY_OUTPUT="${FRAME_CACHE_SUMMARY_OUTPUT:-${ARTIFACT_DIR}/frame_cache_summary.json}"
+PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-}"
+PROPOSAL_TORCH_DTYPE="${PROPOSAL_TORCH_DTYPE:-auto}"
+PROPOSAL_DEVICE="${PROPOSAL_DEVICE:-}"
+ROLLOUT_USE_PROPOSAL_RUNTIME="${ROLLOUT_USE_PROPOSAL_RUNTIME:-auto}"
+FEATURE_CACHE_DATA="${FEATURE_CACHE_DATA:-${FRAME_CACHE_DATA}}"
+FEATURE_CACHE_INCLUDE_SPLITS="${FEATURE_CACHE_INCLUDE_SPLITS:-${FRAME_CACHE_INCLUDE_SPLITS}}"
+FEATURE_CACHE_DEVICE="${FEATURE_CACHE_DEVICE:-${PROPOSAL_DEVICE:-cpu}}"
+FEATURE_CACHE_PROGRESS_EVERY="${FEATURE_CACHE_PROGRESS_EVERY:-25}"
+FEATURE_CACHE_OVERWRITE="${FEATURE_CACHE_OVERWRITE:-0}"
+FEATURE_CACHE_SUMMARY_OUTPUT="${FEATURE_CACHE_SUMMARY_OUTPUT:-${ARTIFACT_DIR}/feature_cache_summary.json}"
+
+# -----------------------------
+# Stage 3: SFT
 # 最常改:
 #   - SFT_NPROC_PER_NODE
 #   - SFT_NUM_TRAIN_EPOCHS
@@ -84,12 +113,12 @@ SFT_NPROC_PER_NODE="${SFT_NPROC_PER_NODE:-4}"
 SFT_LEARNING_RATE="${SFT_LEARNING_RATE:-1e-5}"
 SFT_NUM_TRAIN_EPOCHS="${SFT_NUM_TRAIN_EPOCHS:-2.0}"
 SFT_PER_DEVICE_TRAIN_BATCH_SIZE="${SFT_PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
-SFT_GRADIENT_ACCUMULATION_STEPS="${SFT_GRADIENT_ACCUMULATION_STEPS:-4}"
+SFT_GRADIENT_ACCUMULATION_STEPS="${SFT_GRADIENT_ACCUMULATION_STEPS:-8}"
 SFT_LOGGING_STEPS="${SFT_LOGGING_STEPS:-5}"
 SFT_ATTN_IMPLEMENTATION="${SFT_ATTN_IMPLEMENTATION:-flash_attention_3}"
 # 设为 0 表示评完整个 EVAL_SPLIT，不传 --eval-max-records。
 SFT_EVAL_MAX_RECORDS="${SFT_EVAL_MAX_RECORDS:-0}"
-SFT_EVAL_ROLLOUT_MAX_TURNS="${SFT_EVAL_ROLLOUT_MAX_TURNS:-6}"
+SFT_EVAL_ROLLOUT_MAX_TURNS="${SFT_EVAL_ROLLOUT_MAX_TURNS:-12}"
 SFT_EVAL_VERIFIER_BACKEND="${SFT_EVAL_VERIFIER_BACKEND:-heuristic}"
 SFT_EVAL_PROGRESS_EVERY="${SFT_EVAL_PROGRESS_EVERY:-1}"
 # 以下三个是训练时的显存/信息裁剪开关。
@@ -105,12 +134,12 @@ SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES="${SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES:-0}"
 SFT_MAX_TOTAL_IMAGES="${SFT_MAX_TOTAL_IMAGES:-0}"
 SFT_MAX_SEQ_LENGTH="${SFT_MAX_SEQ_LENGTH:-4096}"
 SFT_KEEP_RECENT_TEXT_MESSAGES="${SFT_KEEP_RECENT_TEXT_MESSAGES:-12}"
-SFT_DATALOADER_NUM_WORKERS="${SFT_DATALOADER_NUM_WORKERS:-16}"
+SFT_DATALOADER_NUM_WORKERS="${SFT_DATALOADER_NUM_WORKERS:-8}"
 SFT_DATALOADER_PREFETCH_FACTOR="${SFT_DATALOADER_PREFETCH_FACTOR:-2}"
 SFT_DATALOADER_PERSISTENT_WORKERS="${SFT_DATALOADER_PERSISTENT_WORKERS:-1}"
 
 # -----------------------------
-# Stage 3: 批量 rollout / score / summarize
+# Stage 4: 批量 rollout / score / summarize
 # 默认从 SFT checkpoint 在 test split 上跑。
 # 如果只想快速 smoke test，可以把 ROLLOUT_COUNT 调小。
 # -----------------------------
@@ -119,7 +148,7 @@ ROLLOUT_RUN_DIR="${ROLLOUT_RUN_DIR:-${ROLLOUT_ROOT}/${ROLLOUT_RUN_NAME}}"
 ROLLOUT_START_INDEX="${ROLLOUT_START_INDEX:-0}"
 # 设为 0 表示从 ROLLOUT_START_INDEX 开始一路跑到该 split 结束，不截断。
 ROLLOUT_COUNT="${ROLLOUT_COUNT:-0}"
-ROLLOUT_MAX_TURNS="${ROLLOUT_MAX_TURNS:-6}"
+ROLLOUT_MAX_TURNS="${ROLLOUT_MAX_TURNS:-12}"
 ROLLOUT_PROGRESS_EVERY="${ROLLOUT_PROGRESS_EVERY:-5}"
 ROLLOUT_TORCH_DTYPE="${ROLLOUT_TORCH_DTYPE:-auto}"
 ROLLOUT_DEVICE_MAP="${ROLLOUT_DEVICE_MAP:-auto}"
@@ -142,7 +171,7 @@ SCORED_ROLLOUT_OUTPUT="${SCORED_ROLLOUT_OUTPUT:-${ROLLOUT_RUN_DIR}/rollouts.scor
 ROLLOUT_SUMMARY_OUTPUT="${ROLLOUT_SUMMARY_OUTPUT:-${ROLLOUT_RUN_DIR}/summary.json}"
 
 # -----------------------------
-# Stage 4: RL
+# Stage 5: RL
 # 默认用 SFT 输出作为当前 policy 和 reference policy 的起点。
 # 如果你想锁定一个不同的 reference checkpoint，单独改 RL_REFERENCE_MODEL_PATH。
 # RL update 阶段和 SFT 一样，建议显式打开视觉 + 文本双预算，
@@ -152,12 +181,12 @@ RL_NPROC_PER_NODE="${RL_NPROC_PER_NODE:-4}"
 RL_REFERENCE_MODEL_PATH="${RL_REFERENCE_MODEL_PATH:-${SFT_OUTPUT_DIR}}"
 # 设为 0 表示评完整个 EVAL_SPLIT，不传 --eval-max-records。
 RL_EVAL_MAX_RECORDS="${RL_EVAL_MAX_RECORDS:-0}"
-RL_EVAL_ROLLOUT_MAX_TURNS="${RL_EVAL_ROLLOUT_MAX_TURNS:-6}"
+RL_EVAL_ROLLOUT_MAX_TURNS="${RL_EVAL_ROLLOUT_MAX_TURNS:-12}"
 RL_EVAL_VERIFIER_BACKEND="${RL_EVAL_VERIFIER_BACKEND:-heuristic}"
 RL_NUM_ITERATIONS="${RL_NUM_ITERATIONS:-3}"
 RL_ROLLOUT_COUNT="${RL_ROLLOUT_COUNT:-16}"
 RL_NUM_GENERATIONS="${RL_NUM_GENERATIONS:-4}"
-RL_ROLLOUT_MAX_TURNS="${RL_ROLLOUT_MAX_TURNS:-6}"
+RL_ROLLOUT_MAX_TURNS="${RL_ROLLOUT_MAX_TURNS:-12}"
 RL_POLICY_DO_SAMPLE="${RL_POLICY_DO_SAMPLE:-1}"
 RL_POLICY_TEMPERATURE="${RL_POLICY_TEMPERATURE:-0.7}"
 RL_POLICY_TOP_P="${RL_POLICY_TOP_P:-0.9}"
@@ -195,7 +224,7 @@ RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES="${RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES:-0}"
 RL_MAX_TOTAL_IMAGES="${RL_MAX_TOTAL_IMAGES:-44}"
 RL_MAX_SEQ_LENGTH="${RL_MAX_SEQ_LENGTH:-4096}"
 RL_KEEP_RECENT_TEXT_MESSAGES="${RL_KEEP_RECENT_TEXT_MESSAGES:-12}"
-RL_DATALOADER_NUM_WORKERS="${RL_DATALOADER_NUM_WORKERS:-4}"
+RL_DATALOADER_NUM_WORKERS="${RL_DATALOADER_NUM_WORKERS:-8}"
 RL_DATALOADER_PREFETCH_FACTOR="${RL_DATALOADER_PREFETCH_FACTOR:-4}"
 RL_DATALOADER_PERSISTENT_WORKERS="${RL_DATALOADER_PERSISTENT_WORKERS:-1}"
 
@@ -284,10 +313,32 @@ resolve_complete_model_checkpoint_dir() {
   return 1
 }
 
+resolve_toggle() {
+  local value="${1:-0}"
+  local auto_nonempty="${2:-}"
+
+  case "${value}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+    auto|AUTO)
+      [[ -n "${auto_nonempty}" ]]
+      return
+      ;;
+    *)
+      echo "Unsupported toggle value: ${value}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 mkdir -p "${ANNOTATION_DIR}" "${ARTIFACT_DIR}" "${CHECKPOINT_DIR}" "${ROLLOUT_RUN_DIR}"
 cd "${CODE_DIR}"
 
-echo "[Stage 1/4] Build data artifacts if missing"
+echo "[Stage 1/5] Build data artifacts if missing"
 # 这三个文件只要存在就跳过:
 #   - AGENT_TRAIN_JSONL
 #   - ORACLE_JSONL
@@ -354,7 +405,55 @@ else
   "${cmd[@]}"
 fi
 
-echo "[Stage 2/4] Multi-GPU SFT with epoch-end rollout evaluation"
+echo "[Stage 2/5] Build frame cache / feature cache"
+if resolve_toggle "${BUILD_FRAME_CACHE}" "1"; then
+  frame_cmd=(
+    python build_frame_cache.py
+    --data "${FRAME_CACHE_DATA}"
+    --data-root "${DATA_ROOT}"
+    --include-splits "${FRAME_CACHE_INCLUDE_SPLITS}"
+    --cache-video-fps "${FRAME_CACHE_VIDEO_FPS}"
+    --max-cache-frames "${FRAME_CACHE_MAX_FRAMES}"
+    --progress-every "${FRAME_CACHE_PROGRESS_EVERY}"
+    --summary-output "${FRAME_CACHE_SUMMARY_OUTPUT}"
+  )
+  if [[ "${FRAME_CACHE_OVERWRITE}" == "1" ]]; then
+    frame_cmd+=(--overwrite)
+  fi
+  "${frame_cmd[@]}"
+else
+  echo "  - Skip frame cache stage (BUILD_FRAME_CACHE=${BUILD_FRAME_CACHE})"
+fi
+
+if resolve_toggle "${BUILD_FEATURE_CACHE}" "${PROPOSAL_MODEL_PATH}"; then
+  if [[ -z "${PROPOSAL_MODEL_PATH}" ]]; then
+    echo "BUILD_FEATURE_CACHE is enabled, but PROPOSAL_MODEL_PATH is empty." >&2
+    exit 1
+  fi
+  feature_cmd=(
+    python build_feature_cache.py
+    --data "${FEATURE_CACHE_DATA}"
+    --data-root "${DATA_ROOT}"
+    --include-splits "${FEATURE_CACHE_INCLUDE_SPLITS}"
+    --model-path "${PROPOSAL_MODEL_PATH}"
+    --torch-dtype "${PROPOSAL_TORCH_DTYPE}"
+    --device "${FEATURE_CACHE_DEVICE}"
+    --progress-every "${FEATURE_CACHE_PROGRESS_EVERY}"
+    --summary-output "${FEATURE_CACHE_SUMMARY_OUTPUT}"
+  )
+  if [[ "${FEATURE_CACHE_OVERWRITE}" == "1" ]]; then
+    feature_cmd+=(--overwrite)
+  fi
+  "${feature_cmd[@]}"
+else
+  if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
+    echo "  - Skip feature cache stage (BUILD_FEATURE_CACHE=${BUILD_FEATURE_CACHE})"
+  else
+    echo "  - Skip feature cache stage because PROPOSAL_MODEL_PATH is empty."
+  fi
+fi
+
+echo "[Stage 3/5] Multi-GPU SFT with epoch-end rollout evaluation"
 RESOLVED_SFT_MODEL_PATH="$(resolve_complete_model_checkpoint_dir "${SFT_OUTPUT_DIR}" || true)"
 if [[ -n "${RESOLVED_SFT_MODEL_PATH}" ]]; then
   echo "  - Skip SFT, found complete checkpoint: ${RESOLVED_SFT_MODEL_PATH}"
@@ -431,7 +530,7 @@ if [[ "${EFFECTIVE_RL_REFERENCE_MODEL_PATH}" == "${SFT_OUTPUT_DIR}" ]]; then
   EFFECTIVE_RL_REFERENCE_MODEL_PATH="${RESOLVED_SFT_MODEL_PATH}"
 fi
 
-echo "[Stage 3/4] Batch rollout, scoring, and summary"
+echo "[Stage 4/5] Batch rollout, scoring, and summary"
 need_batch_rollout=0
 need_score_rollout=0
 need_summarize_rollout=0
@@ -474,6 +573,19 @@ else
     )
     if [[ -n "${ROLLOUT_ATTN_IMPLEMENTATION}" ]]; then
       batch_cmd+=(--attn-implementation "${ROLLOUT_ATTN_IMPLEMENTATION}")
+    fi
+    if resolve_toggle "${ROLLOUT_USE_PROPOSAL_RUNTIME}" "${PROPOSAL_MODEL_PATH}"; then
+      if [[ -z "${PROPOSAL_MODEL_PATH}" ]]; then
+        echo "ROLLOUT_USE_PROPOSAL_RUNTIME is enabled, but PROPOSAL_MODEL_PATH is empty." >&2
+        exit 1
+      fi
+      batch_cmd+=(
+        --proposal-model-path "${PROPOSAL_MODEL_PATH}"
+        --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"
+      )
+      if [[ -n "${PROPOSAL_DEVICE}" ]]; then
+        batch_cmd+=(--proposal-device "${PROPOSAL_DEVICE}")
+      fi
     fi
     if [[ "${ROLLOUT_DO_SAMPLE}" == "1" ]]; then
       batch_cmd+=(--do-sample --temperature "${ROLLOUT_TEMPERATURE}" --top-p "${ROLLOUT_TOP_P}")
@@ -532,7 +644,7 @@ if [[ ! -f "${RAW_ROLLOUT_OUTPUT}" || ! -f "${SCORED_ROLLOUT_OUTPUT}" || ! -f "$
   exit 1
 fi
 
-echo "[Stage 4/4] RL training"
+echo "[Stage 5/5] RL training"
 # RL_NPROC_PER_NODE=1 时退回单进程 python；
 # 大于 1 时自动用 torchrun 多卡训练。
 rl_launcher=(python)
@@ -621,6 +733,9 @@ fi
 "${rl_cmd[@]}"
 
 echo "Full pipeline finished."
+echo "FRAME_CACHE_SUMMARY_OUTPUT=${FRAME_CACHE_SUMMARY_OUTPUT}"
+echo "FEATURE_CACHE_SUMMARY_OUTPUT=${FEATURE_CACHE_SUMMARY_OUTPUT}"
+echo "PROPOSAL_MODEL_PATH=${PROPOSAL_MODEL_PATH}"
 echo "SFT_OUTPUT_DIR=${SFT_OUTPUT_DIR}"
 echo "RESOLVED_SFT_MODEL_PATH=${RESOLVED_SFT_MODEL_PATH}"
 echo "RAW_ROLLOUT_OUTPUT=${RAW_ROLLOUT_OUTPUT}"

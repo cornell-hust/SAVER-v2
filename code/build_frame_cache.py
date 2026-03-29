@@ -113,10 +113,6 @@ def build_frame_caches(
 
         if cache_path.exists() and not overwrite:
             summary["skipped_existing"] += 1
-            if _should_log_progress(index, total_records, progress_every):
-                _print_progress(
-                    f"[{index}/{total_records}] skip existing cache: video_id={record.get('video_id', '')} path={cache_path}"
-                )
             continue
 
         if not video_path.exists():

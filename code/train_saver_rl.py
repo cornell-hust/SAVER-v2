@@ -56,7 +56,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--rollout-count", type=int, default=16, help="Number of videos per iteration.")
     parser.add_argument("--num-generations", type=int, default=4, help="Number of sampled rollouts per video per iteration.")
     parser.add_argument("--rollout-start-index", type=int, default=0, help="Start index for the first iteration.")
-    parser.add_argument("--rollout-max-turns", type=int, default=6, help="Maximum rollout turns.")
+    parser.add_argument("--rollout-max-turns", type=int, default=12, help="Maximum rollout turns.")
     parser.add_argument("--dry-run", action="store_true", help="Collect/score examples but skip gradient updates.")
     parser.add_argument(
         "--min-weight",
@@ -232,7 +232,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-data-root", default="", help="Root path used to resolve relative video paths for epoch-end rollout eval.")
     parser.add_argument("--eval-include-splits", default="", help="Optional comma-separated split whitelist for --eval-data.")
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on eval records per epoch-end rollout eval.")
-    parser.add_argument("--eval-rollout-max-turns", type=int, default=6, help="Maximum rollout turns for epoch-end rollout eval.")
+    parser.add_argument("--eval-rollout-max-turns", type=int, default=12, help="Maximum rollout turns for epoch-end rollout eval.")
     parser.add_argument(
         "--eval-verifier-backend",
         choices=["heuristic", "qwen_self_verifier", "hybrid"],

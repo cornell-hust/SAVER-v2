@@ -97,8 +97,9 @@ def build_system_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
         "Think carefully before each action. "
         "Use tools to inspect evidence, raise or suppress alerts, verify the current hypothesis, "
         "and only finalize after you have enough support. "
+        "Only output <answer> after finalize_case has returned or the environment explicitly asks for the terminal answer. "
         "If you use a tool, respond as <think>...</think><tool_call>{...}</tool_call>. "
-        "If you finalize directly, respond as <think>...</think><answer>{...}</answer>. "
+        "Do not skip finalize_case when the protocol requires a structured final decision. "
         f"{tool_contract}\n"
         f"{tool_use_prompt}"
     )

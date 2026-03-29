@@ -13,6 +13,7 @@ import torch
 from split_utils import filter_records_by_split, parse_include_splits
 
 from saver_agent.config import PreviewConfig, SaverAgentConfig
+from saver_agent.proposal import coerce_feature_cache_payload
 from saver_agent.prompts import build_system_prompt, build_user_prompt
 from saver_agent.tool_registry import get_tool_schemas
 
@@ -198,10 +199,10 @@ class SaverAgentDataset(torch.utils.data.Dataset):
         if frame_cache is None:
             self._warn_frame_cache_fallback(record=record, video_path=video_path, cache_status=cache_status)
             frame_cache = self._maybe_sample_video_frames(video_path, record)
-        feature_cache = self._maybe_load_feature_cache(video_path)
         fps = frame_cache["fps"] if frame_cache else float(record["video_meta"]["fps"])
         frames = frame_cache["frame_tensor"] if frame_cache else None
         frame_indices = list(frame_cache.get("frame_indices") or []) if frame_cache else []
+        feature_cache = self._maybe_load_feature_cache(video_path, fps=float(fps), frame_indices=frame_indices)
         preview_frames, preview_timestamps, preview_frame_indices = self._build_preview(frames, float(fps))
         return {
             "video": frames,
@@ -234,14 +235,15 @@ class SaverAgentDataset(torch.utils.data.Dataset):
         return cache, "loaded"
 
     @staticmethod
-    def _maybe_load_feature_cache(video_path: Path):
+    def _maybe_load_feature_cache(video_path: Path, *, fps: Optional[float] = None, frame_indices: Optional[Sequence[int]] = None):
         cache_path = Path(str(video_path) + ".feature_cache")
         if not cache_path.exists():
             return None
         try:
-            return torch.load(cache_path)
+            payload = torch.load(cache_path)
         except Exception:
             return None
+        return coerce_feature_cache_payload(payload, fps=fps, frame_indices=frame_indices)
 
     def _resolve_video_path(self, raw_video_path: str | Path) -> Path:
         raw_path = Path(raw_video_path)

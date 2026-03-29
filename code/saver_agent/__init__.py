@@ -8,8 +8,19 @@ from .qwen_policy import QwenGenerationPolicy
 from .qwen_verifier import QwenSelfVerifier
 from .reward import score_rollout_trace
 from .rollout import ReplayPolicy, SaverRolloutRunner
-from .training_data import build_oracle_sft_examples, build_reward_weighted_examples
 from .verifier import run_counterfactual_verifier
+
+
+def build_oracle_sft_examples(*args, **kwargs):
+    from .training_data import build_oracle_sft_examples as _build_oracle_sft_examples
+
+    return _build_oracle_sft_examples(*args, **kwargs)
+
+
+def build_reward_weighted_examples(*args, **kwargs):
+    from .training_data import build_reward_weighted_examples as _build_reward_weighted_examples
+
+    return _build_reward_weighted_examples(*args, **kwargs)
 
 __all__ = [
     "PromptConfig",

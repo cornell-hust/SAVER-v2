@@ -13,6 +13,7 @@ from run_saver_rollout import _serialize_result
 from saver_agent.adapter import TimeSearchRolloutAdapter
 from saver_agent.config import PromptConfig, PreviewConfig, RolloutTraceConfig, SaverAgentConfig
 from saver_agent.dataset import SaverAgentDataset
+from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH, QwenGenerationPolicy
 from saver_agent.qwen_verifier import DEFAULT_VERIFIER_MODEL_PATH, QwenSelfVerifier
 from saver_agent.runtime import (
@@ -27,7 +28,7 @@ from saver_agent.runtime import (
 from saver_agent.rollout import ReplayPolicy, SaverRolloutRunner
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch-run SAVER rollouts over a dataset slice.")
     parser.add_argument("--data", required=True, help="Path to saver_agent JSONL data.")
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
@@ -38,8 +39,13 @@ def parse_args() -> argparse.Namespace:
         help="Optional explicit dataset indices, e.g. '0,1,5-7'. Overrides --start-index/--count.",
     )
     parser.add_argument("--start-index", type=int, default=0, help="Start dataset index for batch rollout.")
-    parser.add_argument("--count", type=int, default=0, help="Number of samples to roll out from start-index.")
-    parser.add_argument("--max-turns", type=int, default=4, help="Maximum rollout turns per sample.")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=0,
+        help="Number of samples to roll out from start-index. Use 0 to run until the end of the filtered dataset.",
+    )
+    parser.add_argument("--max-turns", type=int, default=12, help="Maximum rollout turns per sample.")
     parser.add_argument(
         "--policy-backend",
         choices=["replay", "qwen"],
@@ -53,6 +59,9 @@ def parse_args() -> argparse.Namespace:
         help="Replayed model response for one turn. Reused for every sample when policy-backend=replay.",
     )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Local Qwen model path.")
+    parser.add_argument("--proposal-model-path", default="", help="Optional local SigLIP/CLIP path for feature-guided proposal.")
+    parser.add_argument("--proposal-torch-dtype", default="auto", help="Torch dtype for the proposal encoder.")
+    parser.add_argument("--proposal-device", default="", help="Optional device for the proposal encoder. Defaults to cpu or current local cuda device.")
     parser.add_argument("--torch-dtype", default="auto", help="Torch dtype passed to from_pretrained.")
     parser.add_argument("--device-map", default="auto", help="Transformers device_map argument.")
     parser.add_argument("--attn-implementation", default="", help="Optional attention backend.")
@@ -121,7 +130,7 @@ def parse_args() -> argparse.Namespace:
         default=0.7,
         help="Hybrid verifier weight on heuristic scores.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _build_config(args: argparse.Namespace) -> SaverAgentConfig:
@@ -167,9 +176,16 @@ def _resolve_dataset_indices(args: argparse.Namespace, dataset_size: int) -> Lis
     if args.indices:
         indices = _parse_indices(args.indices)
     else:
-        if args.count <= 0:
-            raise SystemExit("Provide either --indices or a positive --count for batch rollout.")
-        indices = list(range(args.start_index, args.start_index + args.count))
+        if args.start_index < 0 or args.start_index >= dataset_size:
+            raise SystemExit(
+                f"Dataset index out of range: {args.start_index}. Valid range is [0, {max(dataset_size - 1, 0)}]."
+            )
+        if args.count < 0:
+            raise SystemExit("Provide either --indices or a non-negative --count for batch rollout.")
+        if args.count == 0:
+            indices = list(range(args.start_index, dataset_size))
+        else:
+            indices = list(range(args.start_index, args.start_index + args.count))
 
     if not indices:
         raise SystemExit("No dataset indices were resolved for batch rollout.")
@@ -199,6 +215,14 @@ def _attach_verifier_runtime(
         item["multimodal_cache"]["verifier_runtime"] = verifier_runtime
 
 
+def _attach_proposal_runtime(
+    item: Dict[str, Any],
+    proposal_runtime: Any,
+) -> None:
+    if proposal_runtime is not None:
+        item["multimodal_cache"]["proposal_runtime"] = proposal_runtime
+
+
 def _build_qwen_policy(args: argparse.Namespace, *, runtime: Any) -> QwenGenerationPolicy:
     return QwenGenerationPolicy.from_pretrained(
         args.model_path,
@@ -223,6 +247,25 @@ def _build_qwen_verifier(args: argparse.Namespace, *, runtime: Any) -> QwenSelfV
         device_map=resolve_inference_device_map(args.verifier_device_map, runtime=runtime),
         attn_implementation=args.verifier_attn_implementation or None,
         max_new_tokens=args.verifier_max_new_tokens,
+    )
+
+
+def _build_proposal_runtime(args: argparse.Namespace, *, runtime: Any) -> SiglipFeatureEncoder | None:
+    if not args.proposal_model_path:
+        return None
+    if args.proposal_device:
+        device = args.proposal_device
+    else:
+        try:
+            import torch
+        except Exception:
+            device = "cpu"
+        else:
+            device = f"cuda:{int(runtime.local_rank)}" if torch.cuda.is_available() else "cpu"
+    return SiglipFeatureEncoder.from_pretrained(
+        args.proposal_model_path,
+        torch_dtype=args.proposal_torch_dtype,
+        device=device,
     )
 
 
@@ -286,6 +329,13 @@ def main() -> None:
             runtime=runtime,
         )
         verifier_runtime = _build_qwen_verifier(args, runtime=runtime)
+    proposal_runtime = None
+    if args.proposal_model_path and local_indices:
+        runtime_log(
+            f"loading proposal model from {args.proposal_model_path}",
+            runtime=runtime,
+        )
+        proposal_runtime = _build_proposal_runtime(args, runtime=runtime)
     qwen_policy = None
     if args.policy_backend == "qwen" and local_indices:
         runtime_log(
@@ -309,6 +359,7 @@ def main() -> None:
             verifier_runtime,
             verifier_device_map=effective_verifier_device_map,
         )
+        _attach_proposal_runtime(item, proposal_runtime)
         policy = qwen_policy if qwen_policy is not None else ReplayPolicy(args.response)
         result = runner.run_episode(item, policy)
         serialized = _serialize_result(result)

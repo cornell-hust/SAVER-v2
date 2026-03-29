@@ -1,0 +1,69 @@
+{
+  "num_records": 240,
+  "primary_status_counts": {
+    "complete": 238,
+    "incomplete": 0,
+    "redundant": 1,
+    "misaligned": 1,
+    "unknown": 0
+  },
+  "primary_status_ratios": {
+    "complete": 0.9916666666666667,
+    "incomplete": 0.0,
+    "redundant": 0.004166666666666667,
+    "misaligned": 0.004166666666666667,
+    "unknown": 0.0
+  },
+  "alert_status_counts": {
+    "justified": 237,
+    "premature": 1,
+    "late": 0,
+    "not_applicable": 2,
+    "unknown": 0
+  },
+  "alert_status_ratios": {
+    "justified": 0.9875,
+    "premature": 0.004166666666666667,
+    "late": 0.0,
+    "not_applicable": 0.008333333333333333,
+    "unknown": 0.0
+  },
+  "mean_total_reward": 1.6210808333333344,
+  "min_total_reward": -1.3696,
+  "max_total_reward": 3.234,
+  "mean_num_turns": 6.0,
+  "min_num_turns": 6.0,
+  "max_num_turns": 6.0,
+  "mean_reward_components": {
+    "alert_reward": 0.33166666666666694,
+    "counterfactual_reward": 0.5452208333333312,
+    "decision_reward": 0.0,
+    "efficiency_reward": 0.25,
+    "temporal_reward": 0.7231541666666654,
+    "verification_reward": 0.3500916666666666
+  },
+  "saver_metrics": {
+    "num_records": 240,
+    "existence_ap": 0.9670861824675767,
+    "existence_accuracy": 0.6375,
+    "category_macro_f1": 0.22702036654605823,
+    "temporal_miou": 0.0,
+    "precursor_miou": 0.0,
+    "alert_utility": 0.22975889992988172,
+    "premature_alert_rate": 0.03333333333333333,
+    "late_alert_rate": 0.23333333333333334,
+    "false_alert_rate": 0.6666666666666666,
+    "hard_normal_false_alert_rate": 0.6666666666666666,
+    "evidence_precision_at_3": 0.40555555555555567,
+    "evidence_recall_at_3": 0.1619444444444443,
+    "evidence_f1_at_3": 0.21255952380952364,
+    "counterfactual_type_accuracy": 0.0,
+    "severity_mae": 0.0,
+    "mean_inspected_clip_ratio": 0.9999999965972904,
+    "mean_search_steps": 1.2875,
+    "mean_num_turns": 6.0,
+    "tool_call_validity_rate": 0.8659722222222209,
+    "protocol_compliance_rate": 0.0,
+    "main_metrics_reference_free": true
+  }
+}

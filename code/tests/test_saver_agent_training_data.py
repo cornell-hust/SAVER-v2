@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 import sys
@@ -79,6 +80,23 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         }
         self.record = {
             "video_id": "sample_training_data",
+            "proposal_supervision": {
+                "queries": [
+                    {
+                        "query_id": "pq1",
+                        "raw_text": "person attacking another person",
+                        "normalized_queries": [
+                            {"text": "physical struggle", "kind": "event_relation", "weight": 0.9},
+                            {"text": "person on ground", "kind": "event_relation", "weight": 0.8},
+                        ],
+                        "linked_moment_ids": ["ev1"],
+                        "linked_roles": ["trigger"],
+                        "linked_windows_sec": [[1.0, 4.0]],
+                        "alignment_source": "weak_alignment",
+                    }
+                ],
+                "has_oracle_supervision": True,
+            },
             "label": {"is_anomaly": True, "category": "assault", "severity": 4, "hard_normal": False},
             "temporal": {
                 "anomaly_interval_sec": [1.0, 4.0],
@@ -178,6 +196,31 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         self.assertGreater(len(examples), 0)
         self.assertAlmostEqual(sum(float(example["sample_weight"]) for example in examples), 1.0, places=6)
 
+    def test_build_oracle_sft_examples_attaches_matching_proposal_supervision(self):
+        self.assertIsNotNone(build_oracle_sft_examples, "saver_agent.training_data module is missing")
+
+        record = copy.deepcopy(self.record)
+        record["oracle_sft"] = {
+            "trajectory": [
+                {
+                    "tool": "seek_evidence",
+                    "arguments": {
+                        "query": "physical struggle",
+                        "start_sec": 1.0,
+                        "end_sec": 4.0,
+                        "moment_id": "ev1",
+                        "role": "trigger",
+                    },
+                }
+            ],
+            "final_decision": self.item["multimodal_cache"]["structured_target"],
+        }
+
+        examples = build_oracle_sft_examples(self.item, record, config=SaverAgentConfig())
+
+        self.assertEqual(examples[0]["proposal_supervision"]["query_id"], "pq1")
+        self.assertIn("ev1", examples[0]["proposal_supervision"]["linked_moment_ids"])
+
     def test_build_oracle_sft_examples_prefers_oracle_verifier_feedback_over_runtime_fallback(self):
         self.assertIsNotNone(build_oracle_sft_examples, "saver_agent.training_data module is missing")
 
@@ -248,6 +291,42 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         self.assertAlmostEqual(examples[1]["rollout_advantage"], 1.2, places=6)
         self.assertIn("turn_credit", examples[0]["advantage_metadata"])
         self.assertIn("<answer>", examples[-1]["target_response"])
+
+    def test_build_reward_weighted_examples_preserve_seek_evidence_proposal_metadata(self):
+        self.assertIsNotNone(build_reward_weighted_examples, "saver_agent.training_data module is missing")
+
+        rollout = {
+            "video_id": "sample_training_data",
+            "reward_summary": {"total_reward": 0.8},
+            "group_advantage": 0.6,
+            "turns": [
+                {
+                    "step_index": 1,
+                    "action": "tool_call",
+                    "assistant_response_raw": '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"physical struggle","start_sec":1.0,"end_sec":4.0}}</tool_call>',
+                    "tool_name": "seek_evidence",
+                    "valid_action": True,
+                    "new_evidence_ids": ["e0001"],
+                    "proposal_backend": "feature_topk",
+                    "feature_cache_used": True,
+                    "proposal_query_raw": "physical struggle",
+                    "proposal_query_normalized": "physical struggle",
+                    "proposal_query_source": "model",
+                    "proposal_candidate_count": 1,
+                    "proposal_candidate_frame_indices": [1, 2],
+                    "proposal_candidate_frame_scores": [0.9, 0.8],
+                    "proposal_candidate_windows": [{"frame_indices": [1, 2], "score_max": 0.9}],
+                    "proposal_selected_frame_indices": [1, 2],
+                    "proposal_selected_frame_scores": [0.9, 0.8],
+                    "proposal_fallback_reason": None,
+                }
+            ],
+        }
+
+        examples = build_reward_weighted_examples(self.item, rollout)
+
+        self.assertEqual(examples[0]["proposal_metadata"]["backend"], "feature_topk")
+        self.assertEqual(examples[0]["proposal_metadata"]["selected_frame_indices"], [1, 2])
 
     def test_build_reward_weighted_examples_penalizes_invalid_turns_when_requested(self):
         self.assertIsNotNone(build_reward_weighted_examples, "saver_agent.training_data module is missing")

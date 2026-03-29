@@ -1,0 +1,14 @@
+{
+  "data_path": "data_utils/msad_saver_oracle_sft_train.jsonl",
+  "data_root": "/mnt/shared-storage-user/mineru2-shared/zengweijun",
+  "include_splits": "train",
+  "num_records": 480,
+  "written": 480,
+  "skipped_existing": 0,
+  "missing_videos": 0,
+  "missing_frame_cache": 0,
+  "encode_failures": 0,
+  "failures": [],
+  "succeeded": 480,
+  "failed": 0
+}

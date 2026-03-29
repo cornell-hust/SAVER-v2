@@ -207,6 +207,46 @@ class SaverAgentDatasetTests(unittest.TestCase):
         self.assertIn("cached=1/2", message)
         self.assertIn("missing_frame_cache=1", message)
 
+    def test_dataset_loads_structured_feature_cache_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video_path = root / "videos" / "sample_feature.mp4"
+            _write_test_video(video_path)
+            torch.save(
+                {
+                    "frame_tensor": torch.zeros(3, 3, 32, 32, dtype=torch.uint8),
+                    "frame_indices": [0, 2, 5],
+                    "fps": 2.0,
+                },
+                Path(str(video_path) + ".frame_cache"),
+            )
+            torch.save(
+                {
+                    "version": "saver_feature_cache_v1",
+                    "model_name": "dummy-siglip",
+                    "fps": 2.0,
+                    "frame_indices": [0, 2, 5],
+                    "timestamps_sec": [0.0, 1.0, 2.5],
+                    "embeddings": torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]], dtype=torch.float32),
+                    "embedding_dim": 2,
+                    "normalized": True,
+                    "frame_cache_signature": "abc123",
+                },
+                Path(str(video_path) + ".feature_cache"),
+            )
+            data_path = root / "agent.jsonl"
+            data_path.write_text(json.dumps(self._sample_record(video_id="feature_case", video_path="videos/sample_feature.mp4")) + "\n", encoding="utf-8")
+
+            dataset = SaverAgentDataset(data_path, data_root=root)
+            item = dataset[0]
+
+        embedding = item["multimodal_cache"]["embedding"]
+        self.assertIsInstance(embedding, dict)
+        self.assertEqual(embedding["version"], "saver_feature_cache_v1")
+        self.assertEqual(embedding["model_name"], "dummy-siglip")
+        self.assertEqual(embedding["frame_indices"], [0, 2, 5])
+        self.assertEqual(tuple(embedding["embeddings"].shape), (3, 2))
+
     def test_dataset_loads_frames_from_video_when_cache_missing(self):
         sample = {
             "schema_version": "saver_agent.v1",
