@@ -1,2 +1,6 @@
 /checkpoints/
 code/ckpt
+/train_artifacts/
+/rollouts/
+/docs/
+# /code/data_utils
