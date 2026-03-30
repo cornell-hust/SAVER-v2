@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List, Tuple
 
 from saver_agent.schema import SaverEnvironmentState
@@ -114,8 +115,17 @@ TOOL_IMPLS = {
 }
 
 
-def get_tool_schemas() -> List[Dict[str, Any]]:
-    return [tool.copy() for tool in TOOL_SCHEMAS]
+def get_tool_schemas(*, finalize_case_schema: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    tool_schemas = copy.deepcopy(TOOL_SCHEMAS)
+    if not finalize_case_schema:
+        return tool_schemas
+    for tool in tool_schemas:
+        function = tool.get("function") or {}
+        if function.get("name") != "finalize_case":
+            continue
+        function["parameters"] = copy.deepcopy(finalize_case_schema)
+        break
+    return tool_schemas
 
 
 def execute_tool_call(

@@ -90,7 +90,7 @@ FRAME_CACHE_MAX_FRAMES="${FRAME_CACHE_MAX_FRAMES:-256}"
 FRAME_CACHE_PROGRESS_EVERY="${FRAME_CACHE_PROGRESS_EVERY:-50}"
 FRAME_CACHE_OVERWRITE="${FRAME_CACHE_OVERWRITE:-0}"
 FRAME_CACHE_SUMMARY_OUTPUT="${FRAME_CACHE_SUMMARY_OUTPUT:-${ARTIFACT_DIR}/frame_cache_summary.json}"
-PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-}"
+PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip}"
 PROPOSAL_TORCH_DTYPE="${PROPOSAL_TORCH_DTYPE:-auto}"
 PROPOSAL_DEVICE="${PROPOSAL_DEVICE:-}"
 ROLLOUT_USE_PROPOSAL_RUNTIME="${ROLLOUT_USE_PROPOSAL_RUNTIME:-auto}"
@@ -100,6 +100,9 @@ FEATURE_CACHE_DEVICE="${FEATURE_CACHE_DEVICE:-${PROPOSAL_DEVICE:-cpu}}"
 FEATURE_CACHE_PROGRESS_EVERY="${FEATURE_CACHE_PROGRESS_EVERY:-25}"
 FEATURE_CACHE_OVERWRITE="${FEATURE_CACHE_OVERWRITE:-0}"
 FEATURE_CACHE_SUMMARY_OUTPUT="${FEATURE_CACHE_SUMMARY_OUTPUT:-${ARTIFACT_DIR}/feature_cache_summary.json}"
+EVAL_PROPOSAL_MODEL_PATH="${EVAL_PROPOSAL_MODEL_PATH:-${PROPOSAL_MODEL_PATH}}"
+EVAL_PROPOSAL_TORCH_DTYPE="${EVAL_PROPOSAL_TORCH_DTYPE:-${PROPOSAL_TORCH_DTYPE}}"
+EVAL_PROPOSAL_DEVICE="${EVAL_PROPOSAL_DEVICE:-${PROPOSAL_DEVICE}}"
 
 # -----------------------------
 # Stage 3: SFT
@@ -134,7 +137,7 @@ SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES="${SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES:-0}"
 SFT_MAX_TOTAL_IMAGES="${SFT_MAX_TOTAL_IMAGES:-0}"
 SFT_MAX_SEQ_LENGTH="${SFT_MAX_SEQ_LENGTH:-4096}"
 SFT_KEEP_RECENT_TEXT_MESSAGES="${SFT_KEEP_RECENT_TEXT_MESSAGES:-12}"
-SFT_DATALOADER_NUM_WORKERS="${SFT_DATALOADER_NUM_WORKERS:-8}"
+SFT_DATALOADER_NUM_WORKERS="${SFT_DATALOADER_NUM_WORKERS:-4}"
 SFT_DATALOADER_PREFETCH_FACTOR="${SFT_DATALOADER_PREFETCH_FACTOR:-2}"
 SFT_DATALOADER_PERSISTENT_WORKERS="${SFT_DATALOADER_PERSISTENT_WORKERS:-1}"
 
@@ -402,6 +405,15 @@ else
   if [[ "${VALIDATION_MAX_EXAMPLES}" != "0" ]]; then
     cmd+=(--validation-max-examples "${VALIDATION_MAX_EXAMPLES}")
   fi
+  if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
+    cmd+=(
+      --proposal-model-path "${PROPOSAL_MODEL_PATH}"
+      --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"
+    )
+    if [[ -n "${PROPOSAL_DEVICE}" ]]; then
+      cmd+=(--proposal-device "${PROPOSAL_DEVICE}")
+    fi
+  fi
   "${cmd[@]}"
 fi
 
@@ -514,6 +526,15 @@ else
   fi
   if [[ "${SFT_EVAL_MAX_RECORDS}" != "0" ]]; then
     sft_cmd+=(--eval-max-records "${SFT_EVAL_MAX_RECORDS}")
+  fi
+  if [[ -n "${EVAL_PROPOSAL_MODEL_PATH}" ]]; then
+    sft_cmd+=(
+      --eval-proposal-model-path "${EVAL_PROPOSAL_MODEL_PATH}"
+      --eval-proposal-torch-dtype "${EVAL_PROPOSAL_TORCH_DTYPE}"
+    )
+    if [[ -n "${EVAL_PROPOSAL_DEVICE}" ]]; then
+      sft_cmd+=(--eval-proposal-device "${EVAL_PROPOSAL_DEVICE}")
+    fi
   fi
   "${sft_cmd[@]}"
 
@@ -703,6 +724,24 @@ rl_cmd=(
   --dataloader-prefetch-factor "${RL_DATALOADER_PREFETCH_FACTOR}"
   --logging-steps "${RL_LOGGING_STEPS}"
 )
+if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
+  rl_cmd+=(
+    --proposal-model-path "${PROPOSAL_MODEL_PATH}"
+    --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"
+  )
+  if [[ -n "${PROPOSAL_DEVICE}" ]]; then
+    rl_cmd+=(--proposal-device "${PROPOSAL_DEVICE}")
+  fi
+fi
+if [[ -n "${EVAL_PROPOSAL_MODEL_PATH}" ]]; then
+  rl_cmd+=(
+    --eval-proposal-model-path "${EVAL_PROPOSAL_MODEL_PATH}"
+    --eval-proposal-torch-dtype "${EVAL_PROPOSAL_TORCH_DTYPE}"
+  )
+  if [[ -n "${EVAL_PROPOSAL_DEVICE}" ]]; then
+    rl_cmd+=(--eval-proposal-device "${EVAL_PROPOSAL_DEVICE}")
+  fi
+fi
 if [[ "${RL_DATALOADER_PERSISTENT_WORKERS}" == "1" ]]; then
   rl_cmd+=(--dataloader-persistent-workers)
 fi

@@ -17,20 +17,36 @@ INVALID_TOOL_CALL_PROMPT = (
 
 
 def cleanup_llm_response(response_str: str) -> str:
+    tagged_blocks = list(re.finditer(r"<(tool_call|answer)>(.*?)</\1>", response_str, re.DOTALL))
+    if tagged_blocks:
+        return tagged_blocks[-1].group(0)
     if "<think>" in response_str:
         response_str = "<think>" + response_str.split("<think>")[-1]
-    if "</tool_call>" in response_str:
-        return response_str.split("</tool_call>")[0] + "</tool_call>"
-    if "</answer>" in response_str:
-        return response_str.split("</answer>")[0] + "</answer>"
     return response_str
 
 
-def invalid_tool_call_message() -> Dict[str, Any]:
+def _finalize_retry_prompt(multimodal_cache: Dict[str, Any] | None = None) -> str:
+    schema = ((multimodal_cache or {}).get("tool_io") or {}).get("finalize_case_schema") or {}
+    required = [str(field_name) for field_name in list(schema.get("required") or []) if str(field_name).strip()]
+    required_text = ", ".join(required) if required else "the required finalize_case fields"
+    return (
+        "The previous finalize_case call was invalid. Retry immediately with exactly one "
+        '<tool_call>{"name":"finalize_case","arguments":{...}}</tool_call>. '
+        f"finalize_case requires: {required_text}. "
+        "Do not output <answer> yet. Do not describe the intended tool call in plain English."
+    )
+
+
+def invalid_tool_call_message(
+    *,
+    tool_name: str | None = None,
+    multimodal_cache: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    prompt_text = _finalize_retry_prompt(multimodal_cache) if tool_name == "finalize_case" else INVALID_TOOL_CALL_PROMPT
     return {
         "role": "tool",
         "name": "parse_error",
-        "content": [{"type": "text", "text": INVALID_TOOL_CALL_PROMPT}],
+        "content": [{"type": "text", "text": prompt_text}],
     }
 
 
@@ -133,13 +149,17 @@ def parse_actions_and_contents(predictions: List[Any]) -> Tuple[List[str | None]
     actions: List[str | None] = []
     contents: List[Any] = []
     for prediction in predictions:
-        match = re.search(r"<(tool_call|answer)>(.*?)</\1>", prediction, re.DOTALL)
+        stripped_prediction = re.sub(r"<think>.*?</think>", "", prediction, flags=re.DOTALL)
+        matches = re.findall(r"<(tool_call|answer)>(.*?)</\1>", stripped_prediction, re.DOTALL)
+        if not matches:
+            matches = re.findall(r"<(tool_call|answer)>(.*?)</\1>", prediction, re.DOTALL)
+        match = matches[-1] if matches else None
         if not match:
             actions.append(None)
             contents.append("")
             continue
-        action = match.group(1)
-        content = match.group(2).strip()
+        action = match[0]
+        content = match[1].strip()
         if action == "tool_call":
             func = _parse_tool_payload(content)
             if func is None:
@@ -201,14 +221,19 @@ class SaverVideoInteraction:
                     is_search.append(1)
                     next_states.append(next_state)
                 except Exception:
-                    next_obs.append(invalid_tool_call_message())
+                    next_obs.append(
+                        invalid_tool_call_message(
+                            tool_name=content["function"]["name"],
+                            multimodal_cache=multimodal_cache,
+                        )
+                    )
                     dones.append(0)
                     valid_actions.append(0)
                     is_search.append(0)
                     next_states.append(state)
                 continue
 
-            next_obs.append(invalid_tool_call_message())
+            next_obs.append(invalid_tool_call_message(multimodal_cache=multimodal_cache))
             dones.append(0)
             valid_actions.append(0)
             is_search.append(0)

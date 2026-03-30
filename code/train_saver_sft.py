@@ -11,9 +11,10 @@ from split_utils import parse_include_splits
 from saver_agent.config import PromptConfig, PreviewConfig, RolloutTraceConfig, SaverAgentConfig
 from saver_agent.dataset import SaverAgentDataset
 from saver_agent.evaluation import RolloutEvaluationConfig
+from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH
 from saver_agent.runtime import distributed_runtime_from_env, runtime_log, should_log_progress
-from saver_agent.training import run_weighted_sft, validate_prepared_examples
+from saver_agent.training import default_sft_tensor_cache_dir, run_weighted_sft, validate_prepared_examples
 from saver_agent.training_data import build_oracle_sft_examples
 
 
@@ -21,12 +22,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Warm-start SAVER policy with oracle stepwise SFT supervision.")
     parser.add_argument("--data", default="", help="Path to SAVER agent/oracle JSONL data.")
     parser.add_argument("--prepared-data", default="", help="Optional path to pre-generated lightweight SFT JSONL.")
+    parser.add_argument(
+        "--tensor-cache-dir",
+        default="",
+        help="Optional offline tensor cache directory. If omitted and --prepared-data is set, defaults to <prepared-data>.tensor_cache.",
+    )
     parser.add_argument("--prepare-output", default="", help="Optional path to write lightweight prepared SFT JSONL.")
     parser.add_argument("--prepare-only", action="store_true", help="Prepare lightweight SFT JSONL and exit before training.")
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data/--prepared-data, e.g. train or train,val.")
     parser.add_argument("--output-dir", default="", help="Training output directory.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Local Qwen model path.")
+    parser.add_argument("--proposal-model-path", default="", help="Optional local SigLIP/CLIP path for query-conditioned proposal during SFT example preparation.")
+    parser.add_argument("--proposal-torch-dtype", default="auto", help="Torch dtype for the proposal encoder used during SFT example preparation.")
+    parser.add_argument("--proposal-device", default="", help="Optional device for the proposal encoder during SFT example preparation.")
     parser.add_argument("--max-records", type=int, default=0, help="Optional limit on the number of records.")
     parser.add_argument("--max-train-examples", type=int, default=0, help="Optional limit on built SFT examples.")
     parser.add_argument("--dry-run", action="store_true", help="Build examples and print summary without training.")
@@ -111,6 +120,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Offline verifier backend used for epoch-end rollout metrics.",
     )
     parser.add_argument("--eval-verifier-model-path", default="", help="Optional verifier model path for epoch-end rollout eval.")
+    parser.add_argument("--eval-proposal-model-path", default="", help="Optional proposal encoder path for epoch-end rollout eval. Defaults to --proposal-model-path.")
+    parser.add_argument("--eval-proposal-torch-dtype", default="auto", help="Torch dtype for epoch-end eval proposal encoder.")
+    parser.add_argument("--eval-proposal-device", default="", help="Optional device for epoch-end eval proposal encoder.")
     parser.add_argument("--eval-verifier-torch-dtype", default="auto", help="Torch dtype for epoch-end eval verifier.")
     parser.add_argument("--eval-verifier-device-map", default="auto", help="device_map for epoch-end eval verifier.")
     parser.add_argument("--eval-verifier-attn-implementation", default="", help="Attention backend for epoch-end eval verifier.")
@@ -215,6 +227,9 @@ def _build_rollout_eval_config(
         rollout_max_turns=args.eval_rollout_max_turns,
         verifier_backend=args.eval_verifier_backend,
         verifier_model_path=args.eval_verifier_model_path or args.model_path,
+        proposal_model_path=args.eval_proposal_model_path or args.proposal_model_path,
+        proposal_torch_dtype=args.eval_proposal_torch_dtype,
+        proposal_device=args.eval_proposal_device,
         verifier_torch_dtype=args.eval_verifier_torch_dtype,
         verifier_device_map=args.eval_verifier_device_map,
         verifier_attn_implementation=args.eval_verifier_attn_implementation,
@@ -224,6 +239,33 @@ def _build_rollout_eval_config(
         progress_every=args.eval_progress_every,
         saver_config=config,
     )
+
+
+def _resolve_proposal_device(explicit_device: str, *, runtime: Any) -> str:
+    if str(explicit_device or "").strip():
+        return str(explicit_device)
+    try:
+        import torch
+    except Exception:
+        return "cpu"
+    if torch.cuda.is_available():
+        return f"cuda:{int(getattr(runtime, 'local_rank', 0))}"
+    return "cpu"
+
+
+def _build_proposal_runtime(args: argparse.Namespace, *, runtime: Any) -> SiglipFeatureEncoder | None:
+    if not args.proposal_model_path:
+        return None
+    return SiglipFeatureEncoder.from_pretrained(
+        args.proposal_model_path,
+        torch_dtype=args.proposal_torch_dtype,
+        device=_resolve_proposal_device(args.proposal_device, runtime=runtime),
+    )
+
+
+def _attach_proposal_runtime(item: Dict[str, Any], proposal_runtime: Any) -> None:
+    if proposal_runtime is not None:
+        item["multimodal_cache"]["proposal_runtime"] = proposal_runtime
 
 
 def build_sft_examples_from_jsonl(
@@ -236,6 +278,7 @@ def build_sft_examples_from_jsonl(
     progress_every: int = 0,
     runtime=None,
     config: Optional[SaverAgentConfig] = None,
+    proposal_runtime: Any = None,
 ) -> List[Dict[str, Any]]:
     config = config or SaverAgentConfig()
     runtime = runtime or distributed_runtime_from_env()
@@ -258,6 +301,7 @@ def build_sft_examples_from_jsonl(
     examples: List[Dict[str, Any]] = []
     for idx, record in enumerate(raw_records):
         item = dataset[idx]
+        _attach_proposal_runtime(item, proposal_runtime)
         examples.extend(build_oracle_sft_examples(item, record, config=config))
         completed = idx + 1
         if should_log_progress(completed, total_records, int(progress_every)):
@@ -279,6 +323,7 @@ def build_prepared_sft_examples_from_jsonl(
     progress_every: int = 0,
     runtime=None,
     config: Optional[SaverAgentConfig] = None,
+    proposal_runtime: Any = None,
 ) -> List[Dict[str, Any]]:
     config = config or SaverAgentConfig()
     runtime = runtime or distributed_runtime_from_env()
@@ -301,6 +346,7 @@ def build_prepared_sft_examples_from_jsonl(
     examples: List[Dict[str, Any]] = []
     for idx, record in enumerate(raw_records):
         item = dataset[idx]
+        _attach_proposal_runtime(item, proposal_runtime)
         examples.extend(
             build_oracle_sft_examples(
                 item,
@@ -366,6 +412,14 @@ def main() -> None:
     )
     config = _build_config(args)
     rollout_eval_config = _build_rollout_eval_config(args, config=config)
+    proposal_runtime = None
+    if not args.prepared_data and args.proposal_model_path:
+        runtime_log(
+            f"loading proposal model from {args.proposal_model_path} for SFT example preparation",
+            runtime=runtime,
+            main_process_only=True,
+        )
+        proposal_runtime = _build_proposal_runtime(args, runtime=runtime)
     if args.prepared_data:
         runtime_log(f"loading prepared SFT examples from {args.prepared_data}", runtime=runtime, main_process_only=True)
         examples = _load_jsonl(
@@ -391,6 +445,7 @@ def main() -> None:
             progress_every=args.progress_every,
             runtime=runtime,
             config=config,
+            proposal_runtime=proposal_runtime,
         )
     if args.max_train_examples > 0:
         examples = examples[: args.max_train_examples]
@@ -409,11 +464,16 @@ def main() -> None:
             print(json.dumps({**summary, **validation}, ensure_ascii=False, indent=2))
         return
 
+    tensor_cache_dir = args.tensor_cache_dir
+    if not tensor_cache_dir and args.prepared_data:
+        tensor_cache_dir = str(default_sft_tensor_cache_dir(args.prepared_data))
+
     lora_target_modules = [module.strip() for module in args.lora_target_modules.split(",") if module.strip()]
     result = run_weighted_sft(
         examples,
         model_path=args.model_path,
         output_dir=args.output_dir,
+        tensor_cache_dir=tensor_cache_dir,
         torch_dtype=args.torch_dtype,
         attn_implementation=args.attn_implementation or None,
         gradient_checkpointing=args.gradient_checkpointing,

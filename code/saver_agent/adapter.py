@@ -10,6 +10,7 @@ from saver_agent.prompts import build_tool_response_prompt
 
 
 TIMESTAMP_PATTERN = re.compile(r"^\d+(?:\.\d+)?s$")
+THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 class TimeSearchRolloutAdapter:
@@ -49,6 +50,10 @@ class TimeSearchRolloutAdapter:
         if adapted.get("name") == "verify_hypothesis":
             verification = self._extract_json_payload(content)
             recommended_action = str((verification or {}).get("recommended_action") or "")
+            finalize_required = self._finalize_required_fields(multimodal_cache)
+            finalize_suffix = ""
+            if finalize_required:
+                finalize_suffix = " Required finalize_case fields: " + ", ".join(finalize_required) + "."
             if recommended_action == "finalize":
                 content.append(
                     {
@@ -57,6 +62,7 @@ class TimeSearchRolloutAdapter:
                             "Verifier says the current evidence is sufficient. "
                             "Call finalize_case next using your current structured claim supported by searched evidence only. "
                             "After finalize_case returns, output the final answer inside <answer></answer>."
+                            f"{finalize_suffix}"
                         ),
                     }
                 )
@@ -121,10 +127,14 @@ class TimeSearchRolloutAdapter:
 
     @staticmethod
     def parse_answer_text(response_text: str) -> Optional[str]:
-        match = re.search(r"<answer>(.*?)</answer>", response_text, re.DOTALL)
-        if not match:
-            return None
-        return match.group(1).strip()
+        stripped = THINK_BLOCK_PATTERN.sub("", response_text)
+        matches = re.findall(r"<answer>(.*?)</answer>", stripped, re.DOTALL)
+        if matches:
+            return matches[-1].strip()
+        matches = re.findall(r"<answer>(.*?)</answer>", response_text, re.DOTALL)
+        if matches:
+            return matches[-1].strip()
+        return None
 
     @staticmethod
     def _extract_timestamps(content: List[Dict[str, Any]]) -> List[str]:
@@ -150,3 +160,9 @@ class TimeSearchRolloutAdapter:
             if isinstance(payload, dict):
                 return payload
         return None
+
+    @staticmethod
+    def _finalize_required_fields(multimodal_cache: Dict[str, Any]) -> List[str]:
+        schema = (multimodal_cache.get("tool_io") or {}).get("finalize_case_schema") or {}
+        required = list(schema.get("required") or [])
+        return [str(field_name) for field_name in required if str(field_name).strip()]

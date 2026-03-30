@@ -824,13 +824,13 @@ class CanonicalSaverAdapter:
                     "role": "confirmation",
                 },
                 {
-                    "query": f"look for broader temporal context around the suspected {category}",
+                    "query": "look for broader temporal context around the suspected anomaly",
                     "start_sec": max(0.0, anomaly_start - max(0.15 * anomaly_span, 0.5)),
                     "end_sec": min(duration, anomaly_end + max(0.15 * anomaly_span, 0.5)),
                     "role": "context",
                 },
                 {
-                    "query": f"look for the full temporal context of the suspected {category}",
+                    "query": "look for the full temporal context of the suspected anomaly",
                     "start_sec": anomaly_start,
                     "end_sec": anomaly_end,
                     "role": "context",
@@ -918,14 +918,14 @@ class CanonicalSaverAdapter:
     @staticmethod
     def _query_for_role(role: str, category: str) -> str:
         if role == "precursor":
-            return f"look for early cues or suspicious lead-up before a potential {category}"
+            return "look for early cues, suspicious lead-up, or precursor evidence before a possible anomaly"
         if role == "trigger":
-            return f"look for the decisive trigger moment of the {category}"
+            return "look for the decisive trigger event or first clearly actionable moment"
         if role == "peak_action":
-            return f"look for the strongest visible action of the {category}"
+            return "look for the strongest visible anomalous action or interaction"
         if role == "confirmation":
-            return f"look for confirmation that the {category} has occurred"
-        return f"look for evidence relevant to the {category}"
+            return "look for confirmation that the suspected anomaly has actually occurred"
+        return "look for evidence relevant to the suspected anomaly"
 
 
 ADAPTERS = {

@@ -18,6 +18,12 @@ PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL:-${ARTIFACT_DIR}/msad_saver_agent_t
 EVAL_DATA="${EVAL_DATA:-${ANNOTATION_DIR}/msad_saver_oracle_sft_test.jsonl}"
 MODEL_PATH="${MODEL_PATH:-${MODEL_ROOT}/qwen3-vl-8b-Instruct}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_DIR}/saver_sft_qwen3vl_8b_eval_ddp}"
+PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-}"
+PROPOSAL_TORCH_DTYPE="${PROPOSAL_TORCH_DTYPE:-auto}"
+PROPOSAL_DEVICE="${PROPOSAL_DEVICE:-}"
+EVAL_PROPOSAL_MODEL_PATH="${EVAL_PROPOSAL_MODEL_PATH:-${PROPOSAL_MODEL_PATH}}"
+EVAL_PROPOSAL_TORCH_DTYPE="${EVAL_PROPOSAL_TORCH_DTYPE:-${PROPOSAL_TORCH_DTYPE}}"
+EVAL_PROPOSAL_DEVICE="${EVAL_PROPOSAL_DEVICE:-${PROPOSAL_DEVICE}}"
 
 INCLUDE_SPLITS="${INCLUDE_SPLITS:-train}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -110,6 +116,15 @@ if [[ "${KEEP_RECENT_TEXT_MESSAGES}" != "0" ]]; then
 fi
 if [[ "${EVAL_MAX_RECORDS}" != "0" ]]; then
   cmd+=(--eval-max-records "${EVAL_MAX_RECORDS}")
+fi
+if [[ -n "${EVAL_PROPOSAL_MODEL_PATH}" ]]; then
+  cmd+=(
+    --eval-proposal-model-path "${EVAL_PROPOSAL_MODEL_PATH}"
+    --eval-proposal-torch-dtype "${EVAL_PROPOSAL_TORCH_DTYPE}"
+  )
+  if [[ -n "${EVAL_PROPOSAL_DEVICE}" ]]; then
+    cmd+=(--eval-proposal-device "${EVAL_PROPOSAL_DEVICE}")
+  fi
 fi
 
 "${cmd[@]}"

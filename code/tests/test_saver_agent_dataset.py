@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from saver_agent.dataset import SaverAgentDataset
 from saver_agent.config import PromptConfig, PreviewConfig, SaverAgentConfig
+from saver_agent.prompts import build_public_case_id
 
 
 def _write_test_video(path: Path, *, num_frames: int = 6, fps: float = 4.0) -> None:
@@ -128,6 +129,30 @@ class SaverAgentDatasetTests(unittest.TestCase):
         self.assertIn('"name":"scan_timeline"', item["messages"][0]["content"][0]["text"])
         self.assertIn("Find anomaly evidence", item["messages"][1]["content"][0]["text"])
         self.assertEqual(item["multimodal_cache"]["duration"], 12.0)
+
+    def test_dataset_system_prompt_uses_record_finalize_schema(self):
+        sample = self._sample_record(video_id="schema_case", video_path="videos/schema_case.mp4")
+        sample["tool_io"]["finalize_case_schema"] = {
+            "type": "object",
+            "properties": {
+                "existence": {"type": "string"},
+                "summary": {"type": "string"},
+                "counterfactual_type": {"type": "string"},
+            },
+            "required": ["existence", "summary", "counterfactual_type"],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "agent.jsonl"
+            with path.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(sample) + "\n")
+
+            dataset = SaverAgentDataset(path, data_root="/dataset/root")
+            item = dataset[0]
+
+        system_prompt = item["messages"][0]["content"][0]["text"]
+        self.assertIn("summary", system_prompt)
+        self.assertIn("counterfactual_type", system_prompt)
 
     def test_dataset_resolves_legacy_data_prefix_to_existing_video_root(self):
         sample = {
@@ -417,7 +442,7 @@ class SaverAgentDatasetTests(unittest.TestCase):
         user_content = item["messages"][1]["content"]
         image_items = [entry for entry in user_content if entry["type"] == "image"]
         self.assertEqual(len(image_items), 2)
-        self.assertIn("Case: sample_configured_preview", user_content[-1]["text"])
+        self.assertIn(f"Case: {build_public_case_id(sample)}", user_content[-1]["text"])
         self.assertIn("Custom preview instruction.", user_content[-1]["text"])
 
     def test_dataset_filters_records_by_split(self):

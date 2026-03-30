@@ -77,6 +77,59 @@ class SaverAgentEvaluationTests(unittest.TestCase):
         self.assertFalse(captured["force_reverify"])
         self.assertFalse(captured["attach_reference_offline_verifier"])
 
+    def test_run_rollout_evaluation_attaches_proposal_runtime_when_configured(self):
+        captured = {}
+
+        class ProposalAwareRunner:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_episode(self, item, policy):
+                captured["proposal_runtime"] = item["multimodal_cache"].get("proposal_runtime")
+                return {"video_id": item["video_id"], "turns": [], "state": {}, "num_turns": 1}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            data_path = tmpdir_path / "data.jsonl"
+            data_path.write_text(
+                json.dumps(
+                    {
+                        "video_id": "eval_vid",
+                        "video_meta": {"fps": 1.0, "duration_sec": 4.0, "total_frames": 4},
+                        "structured_target": {"existence": "normal", "category": "normal", "severity": 0},
+                        "tool_io": {"oracle_windows_sec": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch("saver_agent.evaluation.SaverAgentDataset", _DummyDataset), patch(
+                "saver_agent.evaluation.SaverRolloutRunner",
+                ProposalAwareRunner,
+            ), patch("saver_agent.evaluation._serialize_result", side_effect=lambda result: dict(result)), patch(
+                "saver_agent.evaluation._load_proposal_runtime",
+                return_value="siglip_runtime",
+            ), patch(
+                "saver_agent.evaluation.score_rollout_records",
+                side_effect=lambda records, **kwargs: list(records),
+            ), patch(
+                "saver_agent.evaluation.summarize_saver_metrics",
+                return_value={"num_records": 1},
+            ):
+                run_rollout_evaluation(
+                    policy=object(),
+                    eval_config=RolloutEvaluationConfig(
+                        data_path=data_path,
+                        proposal_model_path="/models/siglip_base",
+                    ),
+                    output_dir=tmpdir_path,
+                    epoch_index=0,
+                    runtime=DistributedRuntime(),
+                )
+
+        self.assertEqual(captured["proposal_runtime"], "siglip_runtime")
+
 
 if __name__ == "__main__":
     unittest.main()

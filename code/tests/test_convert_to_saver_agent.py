@@ -258,6 +258,59 @@ class ConvertToSaverAgentUnitTests(unittest.TestCase):
         recommended_actions = _collect_verifier_recommended_actions(converted)
         self.assertEqual(recommended_actions, ["finalize"])
 
+    def test_oracle_sft_seek_queries_do_not_leak_category_name(self):
+        record = {
+            "video_id": "Assault_1",
+            "file_name": "Assault_1.mp4",
+            "video_path": "data/Assault_1.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 120, "duration_sec": 12.0},
+            "scene": {"scenario": "street"},
+            "key_objects": ["person in red", "person in black"],
+            "label": {"is_anomaly": True, "category": "assault", "severity": 4, "hard_normal": False},
+            "temporal": {
+                "anomaly_interval_frames": [41, 90],
+                "precursor_interval_frames": [21, 40],
+                "earliest_alert_frame": 41,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 21,
+                        "end_frame": 40,
+                        "role": "precursor",
+                        "description": "A confrontation builds up.",
+                    },
+                    {
+                        "moment_id": "ev2",
+                        "start_frame": 41,
+                        "end_frame": 50,
+                        "role": "trigger",
+                        "description": "Physical aggressive contact starts.",
+                    },
+                ]
+            },
+            "counterfactual": {"type": "remove_actor_interaction", "text": "No interaction, no assault."},
+            "language": {"summary": "An assault happens.", "rationale": "One person attacks another."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="oracle_sft")
+        queries = [
+            str((step.get("arguments") or {}).get("query") or "")
+            for step in converted["oracle_sft"]["trajectory"]
+            if str(step.get("tool") or "") == "seek_evidence"
+        ]
+
+        self.assertGreaterEqual(len(queries), 1)
+        self.assertTrue(all("assault" not in query.lower() for query in queries))
+
     def test_oracle_sft_scan_timeline_arguments_match_registered_schema(self):
         record = {
             "video_id": "sample_stride",

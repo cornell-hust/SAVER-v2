@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path("/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code")
@@ -108,6 +109,39 @@ class TrainSaverRlTests(unittest.TestCase):
         )
 
         self.assertTrue(kwargs["rollout_eval_config"].attach_reference_diagnostics)
+
+    def test_build_training_kwargs_passes_eval_proposal_runtime_fields(self):
+        self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")
+
+        args = train_saver_rl.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/rl_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--proposal-model-path",
+                "/models/siglip_base",
+                "--eval-proposal-torch-dtype",
+                "bfloat16",
+                "--eval-proposal-device",
+                "cuda:2",
+            ]
+        )
+
+        kwargs = train_saver_rl.build_training_kwargs(
+            current_model_path="/models/policy_iter_1",
+            checkpoint_dir="/tmp/rl_out/iter_000/checkpoint",
+            args=args,
+            reference_model_path="/models/policy_reference",
+            config=train_saver_rl._build_config(args),
+        )
+
+        eval_config = kwargs["rollout_eval_config"]
+        self.assertEqual(str(eval_config.proposal_model_path), "/models/siglip_base")
+        self.assertEqual(eval_config.proposal_torch_dtype, "bfloat16")
+        self.assertEqual(eval_config.proposal_device, "cuda:2")
 
     def test_build_training_kwargs_defaults_to_grpo_objective_and_clip_settings(self):
         self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")
@@ -418,8 +452,59 @@ class TrainSaverRlTests(unittest.TestCase):
 
         self.assertEqual(len(examples), 2)
         self.assertLess(examples[0]["advantage"], examples[1]["advantage"])
-        self.assertEqual(examples[0]["sample_weight"], max(examples[0]["advantage"], 0.0))
-        self.assertEqual(examples[1]["sample_weight"], max(examples[1]["advantage"], 0.0))
+
+    def test_collect_rollouts_attaches_proposal_runtime_to_multimodal_cache(self):
+        self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")
+
+        captured = {}
+
+        class DummyDataset:
+            def __init__(self, *args, **kwargs):
+                self.records = [{"video_id": "vid_1"}]
+
+            def format_frame_cache_status(self, *, prefix="frame cache", max_examples=5):
+                return f"{prefix}: ok"
+
+            def __getitem__(self, index):
+                return {"video_id": "vid_1", "multimodal_cache": {}}
+
+        class DummyRunner:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_episode(self, item, policy):
+                captured["proposal_runtime"] = item["multimodal_cache"].get("proposal_runtime")
+                return {"video_id": item["video_id"], "turns": [], "state": {}, "num_turns": 1}
+
+        args = train_saver_rl.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/rl_out",
+            ]
+        )
+
+        with patch("train_saver_rl.SaverAgentDataset", DummyDataset), patch(
+            "train_saver_rl.SaverRolloutRunner",
+            DummyRunner,
+        ), patch("train_saver_rl._build_policy", return_value=object()), patch(
+            "train_saver_rl._serialize_result",
+            side_effect=lambda result: dict(result),
+        ):
+            rollouts = train_saver_rl.collect_rollouts(
+                data_path="/tmp/data.jsonl",
+                data_root="/tmp",
+                rollout_specs=[{"dataset_index": 0, "group_id": "g1", "generation_id": 0}],
+                model_path="/models/policy",
+                args=args,
+                runtime=train_saver_rl.distributed_runtime_from_env(),
+                verifier_runtime=None,
+                proposal_runtime="siglip_runtime",
+            )
+
+        self.assertEqual(captured["proposal_runtime"], "siglip_runtime")
+        self.assertEqual(len(rollouts), 1)
 
     def test_load_jsonl_filters_by_split(self):
         self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")

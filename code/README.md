@@ -95,6 +95,19 @@ python train_saver_sft.py \
   --progress-every 25
 ```
 
+```bash
+python prepare_sft_tensor_cache.py \
+  --prepared-data data_utils/msad_saver_agent_train.prepared_sft.jsonl \
+  --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct \
+  --include-splits train \
+  --max-seq-length 4096 \
+  --keep-recent-text-messages 12 \
+  --max-image-side 0 \
+  --max-image-pixels 0 \
+  --keep-recent-tool-image-messages 0 \
+  --max-total-images 0
+```
+
 这一阶段产物都在 [`data_utils`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code/data_utils)：
 
 - `msad_saver_agent_train.jsonl`

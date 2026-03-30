@@ -21,6 +21,7 @@ from saver_agent.offline_scoring import (
     save_rollout_records,
     score_rollout_records,
 )
+from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH, QwenGenerationPolicy
 from saver_agent.qwen_verifier import DEFAULT_VERIFIER_MODEL_PATH, QwenSelfVerifier
 from saver_agent.runtime import (
@@ -47,6 +48,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data, e.g. train or train,val.")
     parser.add_argument("--output-dir", required=True, help="Directory to store iterative RL outputs.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Initial Qwen policy checkpoint.")
+    parser.add_argument(
+        "--proposal-model-path",
+        default="",
+        help="Optional local SigLIP/CLIP path for query-conditioned proposal during RL rollout collection.",
+    )
+    parser.add_argument("--proposal-torch-dtype", default="auto", help="Torch dtype for the proposal encoder used during RL rollout collection.")
+    parser.add_argument("--proposal-device", default="", help="Optional device for the proposal encoder during RL rollout collection.")
     parser.add_argument(
         "--reference-model-path",
         default="",
@@ -233,6 +241,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-include-splits", default="", help="Optional comma-separated split whitelist for --eval-data.")
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on eval records per epoch-end rollout eval.")
     parser.add_argument("--eval-rollout-max-turns", type=int, default=12, help="Maximum rollout turns for epoch-end rollout eval.")
+    parser.add_argument("--eval-proposal-model-path", default="", help="Optional proposal encoder path for epoch-end rollout eval. Defaults to --proposal-model-path.")
+    parser.add_argument("--eval-proposal-torch-dtype", default="auto", help="Torch dtype for epoch-end eval proposal encoder.")
+    parser.add_argument("--eval-proposal-device", default="", help="Optional device for epoch-end eval proposal encoder.")
     parser.add_argument(
         "--eval-verifier-backend",
         choices=["heuristic", "qwen_self_verifier", "hybrid"],
@@ -380,6 +391,33 @@ def _build_verifier_runtime(args: argparse.Namespace, *, runtime: Any) -> Option
     )
 
 
+def _resolve_proposal_device(explicit_device: str, *, runtime: Any) -> str:
+    if str(explicit_device or "").strip():
+        return str(explicit_device)
+    try:
+        import torch
+    except Exception:
+        return "cpu"
+    if torch.cuda.is_available():
+        return f"cuda:{int(getattr(runtime, 'local_rank', 0))}"
+    return "cpu"
+
+
+def _build_proposal_runtime(args: argparse.Namespace, *, runtime: Any) -> Optional[SiglipFeatureEncoder]:
+    if not args.proposal_model_path:
+        return None
+    return SiglipFeatureEncoder.from_pretrained(
+        args.proposal_model_path,
+        torch_dtype=args.proposal_torch_dtype,
+        device=_resolve_proposal_device(args.proposal_device, runtime=runtime),
+    )
+
+
+def _attach_proposal_context(item: Dict[str, Any], proposal_runtime: Any) -> None:
+    if proposal_runtime is not None:
+        item["multimodal_cache"]["proposal_runtime"] = proposal_runtime
+
+
 def _attach_verifier_context(
     item: Dict[str, Any],
     args: argparse.Namespace,
@@ -416,6 +454,9 @@ def build_training_kwargs(
             include_splits=parse_include_splits(args.eval_include_splits),
             max_records=args.eval_max_records,
             rollout_max_turns=args.eval_rollout_max_turns,
+            proposal_model_path=args.eval_proposal_model_path or args.proposal_model_path,
+            proposal_torch_dtype=args.eval_proposal_torch_dtype,
+            proposal_device=args.eval_proposal_device,
             verifier_backend=args.eval_verifier_backend,
             verifier_model_path=args.eval_verifier_model_path or args.verifier_model_path or current_model_path,
             verifier_torch_dtype=args.eval_verifier_torch_dtype,
@@ -477,6 +518,7 @@ def collect_rollouts(
     args: argparse.Namespace,
     runtime: Any,
     verifier_runtime: Any = None,
+    proposal_runtime: Any = None,
 ) -> List[Dict[str, Any]]:
     if not rollout_specs:
         return []
@@ -501,6 +543,7 @@ def collect_rollouts(
     for completed, spec in enumerate(rollout_specs, start=1):
         dataset_index = int(spec["dataset_index"])
         item = dataset[dataset_index]
+        _attach_proposal_context(item, proposal_runtime)
         _attach_verifier_context(
             item,
             args,
@@ -712,6 +755,13 @@ def main() -> None:
                 runtime=runtime,
             )
             verifier_runtime = _build_verifier_runtime(args, runtime=runtime)
+        proposal_runtime = None
+        if args.proposal_model_path and local_rollout_specs:
+            runtime_log(
+                f"loading proposal model from {args.proposal_model_path} for RL rollout collection",
+                runtime=runtime,
+            )
+            proposal_runtime = _build_proposal_runtime(args, runtime=runtime)
 
         local_rollouts = collect_rollouts(
             data_path=args.data,
@@ -721,6 +771,7 @@ def main() -> None:
             args=args,
             runtime=runtime,
             verifier_runtime=verifier_runtime,
+            proposal_runtime=proposal_runtime,
         )
         local_rollout_path = rollout_shard_dir / f"part.rank{runtime.rank:02d}-of-{runtime.world_size:02d}.jsonl"
         save_rollout_records(local_rollouts, local_rollout_path, metadata={"input_kind": "jsonl"})

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 from collections import OrderedDict
@@ -24,6 +25,8 @@ DEFAULT_LORA_TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
+
+SFT_TENSOR_CACHE_SCHEMA_VERSION = "saver_agent.sft_tensor_cache.v1"
 
 
 def _frame_cache_path(video_path: Path) -> Path:
@@ -116,6 +119,363 @@ def format_example_frame_cache_status(
         )
         message += f" missing_examples=[{preview}]"
     return message
+
+
+def default_sft_tensor_cache_dir(prepared_data_path: str | Path) -> Path:
+    return Path(str(prepared_data_path) + ".tensor_cache")
+
+
+def _hash_json_payload(payload: Any) -> str:
+    encoded = json.dumps(
+        _strip_private_fields_for_cache_key(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _safe_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None or not hasattr(obj, "to_dict"):
+        return {}
+    try:
+        payload = obj.to_dict()
+    except Exception:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def build_processor_signature_payload(processor: Any) -> Dict[str, Any]:
+    tokenizer = getattr(processor, "tokenizer", None)
+    image_processor = getattr(processor, "image_processor", None)
+
+    tokenizer_payload: Dict[str, Any] = {
+        "class_name": type(tokenizer).__name__ if tokenizer is not None else "",
+        "init_kwargs": _safe_to_dict(tokenizer) or _strip_private_fields_for_cache_key(
+            getattr(tokenizer, "init_kwargs", {}) or {}
+        ),
+        "special_tokens_map": _strip_private_fields_for_cache_key(
+            getattr(tokenizer, "special_tokens_map", {}) or {}
+        ),
+        "chat_template": str(
+            getattr(tokenizer, "chat_template", None)
+            or getattr(processor, "chat_template", None)
+            or ""
+        ),
+    }
+    if tokenizer is not None:
+        try:
+            added_vocab = tokenizer.get_added_vocab()
+        except Exception:
+            added_vocab = {}
+        tokenizer_payload["added_vocab"] = _strip_private_fields_for_cache_key(added_vocab)
+        try:
+            vocab = tokenizer.get_vocab()
+        except Exception:
+            vocab = {}
+        tokenizer_payload["vocab_size"] = int(len(vocab) or getattr(tokenizer, "vocab_size", 0) or 0)
+        tokenizer_payload["vocab_digest"] = _hash_json_payload(vocab) if vocab else ""
+
+    image_processor_payload = {
+        "class_name": type(image_processor).__name__ if image_processor is not None else "",
+        "config": _safe_to_dict(image_processor),
+    }
+    processor_payload = {
+        "class_name": type(processor).__name__,
+        "config": _safe_to_dict(processor),
+        "tokenizer": tokenizer_payload,
+        "image_processor": image_processor_payload,
+    }
+    return _strip_private_fields_for_cache_key(processor_payload)
+
+
+def build_processor_signature(processor: Any) -> str:
+    return _hash_json_payload(build_processor_signature_payload(processor))
+
+
+def load_processor_signature_from_model_path(model_path: str | Path) -> str:
+    try:
+        from transformers import AutoProcessor
+    except Exception as exc:
+        raise ImportError("Computing processor signatures requires the `transformers` package.") from exc
+    processor = AutoProcessor.from_pretrained(str(model_path))
+    return build_processor_signature(processor)
+
+
+def build_processor_signature_summary(processor: Any) -> Dict[str, Any]:
+    payload = build_processor_signature_payload(processor)
+    tokenizer_payload = dict(payload.get("tokenizer") or {})
+    image_processor_payload = dict(payload.get("image_processor") or {})
+    return {
+        "processor_class": str(payload.get("class_name") or ""),
+        "tokenizer_class": str(tokenizer_payload.get("class_name") or ""),
+        "image_processor_class": str(image_processor_payload.get("class_name") or ""),
+        "vocab_size": int(tokenizer_payload.get("vocab_size") or 0),
+        "signature": build_processor_signature(processor),
+    }
+
+
+def _strip_private_fields_for_cache_key(payload: Any) -> Any:
+    if payload is None or isinstance(payload, (str, int, float, bool)):
+        return payload
+    if isinstance(payload, dict):
+        return {
+            str(key): _strip_private_fields_for_cache_key(value)
+            for key, value in payload.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(payload, list):
+        return [_strip_private_fields_for_cache_key(value) for value in payload]
+    if isinstance(payload, tuple):
+        return [_strip_private_fields_for_cache_key(value) for value in payload]
+    if isinstance(payload, (set, frozenset)):
+        normalized_items = [_strip_private_fields_for_cache_key(value) for value in payload]
+        return sorted(
+            normalized_items,
+            key=lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        )
+    if isinstance(payload, Path):
+        return str(payload)
+    if isinstance(payload, bytes):
+        try:
+            return payload.decode("utf-8")
+        except Exception:
+            return {"__type__": "bytes", "hex": payload.hex()}
+    if isinstance(payload, torch.Tensor):
+        return {
+            "__type__": "torch.Tensor",
+            "shape": list(payload.shape),
+            "dtype": str(payload.dtype),
+        }
+    if hasattr(payload, "item") and callable(getattr(payload, "item")):
+        try:
+            return _strip_private_fields_for_cache_key(payload.item())
+        except Exception:
+            pass
+    if hasattr(payload, "to_dict") and callable(getattr(payload, "to_dict")):
+        try:
+            return _strip_private_fields_for_cache_key(payload.to_dict())
+        except Exception:
+            pass
+    if hasattr(payload, "__getstate__") and callable(getattr(payload, "__getstate__")):
+        try:
+            state = payload.__getstate__()
+            if state is not None:
+                return {
+                    "__type__": type(payload).__name__,
+                    "state": _strip_private_fields_for_cache_key(state),
+                }
+        except Exception:
+            pass
+    if hasattr(payload, "__dict__"):
+        try:
+            return {
+                "__type__": type(payload).__name__,
+                "attrs": _strip_private_fields_for_cache_key(vars(payload)),
+            }
+        except Exception:
+            pass
+    if hasattr(payload, "size") and hasattr(payload, "mode"):
+        try:
+            width, height = payload.size
+            return {
+                "__type__": type(payload).__name__,
+                "size": [int(width), int(height)],
+                "mode": str(payload.mode),
+            }
+        except Exception:
+            return {"__type__": type(payload).__name__}
+    return {"__type__": type(payload).__name__, "repr": repr(payload)}
+
+
+def build_sft_tensor_cache_key(example: Dict[str, Any]) -> str:
+    normalized_payload = _strip_private_fields_for_cache_key(example)
+    encoded = json.dumps(
+        normalized_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def normalize_sft_tensor_cache_config(
+    *,
+    processor_signature: str,
+    max_image_side: int = 0,
+    max_image_pixels: int = 0,
+    keep_recent_tool_image_messages: int = 0,
+    max_total_images: int = 0,
+    max_seq_length: int = 0,
+    keep_recent_text_messages: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "processor_signature": str(processor_signature or ""),
+        "max_image_side": int(max_image_side),
+        "max_image_pixels": int(max_image_pixels),
+        "keep_recent_tool_image_messages": int(keep_recent_tool_image_messages),
+        "max_total_images": int(max_total_images),
+        "max_seq_length": int(max_seq_length),
+        "keep_recent_text_messages": int(keep_recent_text_messages),
+    }
+
+
+def build_sft_tensor_cache_metadata(
+    *,
+    model_path: str | Path,
+    processor_signature: str,
+    processor_signature_summary: Optional[Dict[str, Any]] = None,
+    max_image_side: int = 0,
+    max_image_pixels: int = 0,
+    keep_recent_tool_image_messages: int = 0,
+    max_total_images: int = 0,
+    max_seq_length: int = 0,
+    keep_recent_text_messages: int = 0,
+    prepared_data_path: str | Path = "",
+    num_examples: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "schema_version": SFT_TENSOR_CACHE_SCHEMA_VERSION,
+        "cache_config": normalize_sft_tensor_cache_config(
+            processor_signature=processor_signature,
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
+            keep_recent_tool_image_messages=keep_recent_tool_image_messages,
+            max_total_images=max_total_images,
+            max_seq_length=max_seq_length,
+            keep_recent_text_messages=keep_recent_text_messages,
+        ),
+        "model_path": str(model_path),
+        "processor_signature_summary": dict(processor_signature_summary or {}),
+        "prepared_data_path": str(prepared_data_path) if prepared_data_path else "",
+        "num_examples": int(num_examples),
+    }
+
+
+def resolve_sft_tensor_cache_config_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    actual_config = dict(metadata.get("cache_config") or {})
+    if str(actual_config.get("processor_signature") or "").strip():
+        return actual_config
+
+    legacy_model_path = str(actual_config.get("model_path") or metadata.get("model_path") or "").strip()
+    if not legacy_model_path:
+        return actual_config
+
+    migrated_config = dict(actual_config)
+    migrated_config.pop("model_path", None)
+    migrated_config["processor_signature"] = load_processor_signature_from_model_path(legacy_model_path)
+    return migrated_config
+
+
+def sft_tensor_cache_entry_path(cache_dir: str | Path, cache_key: str) -> Path:
+    normalized_key = str(cache_key)
+    prefix = normalized_key[:2] if len(normalized_key) >= 2 else "xx"
+    return Path(cache_dir) / "entries" / prefix / f"{normalized_key}.pt"
+
+
+class PreparedSFTTensorCache:
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        *,
+        expected_config: Dict[str, Any],
+        runtime=None,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.expected_config = dict(expected_config)
+        self.runtime = runtime or distributed_runtime_from_env()
+        self.metadata_path = self.cache_dir / "metadata.json"
+        self.enabled = False
+        self.status = "disabled"
+        self.message = ""
+        self.metadata: Dict[str, Any] = {}
+        self._logged_missing_keys: set[str] = set()
+
+        if not self.cache_dir.exists():
+            self.status = "missing_dir"
+            self.message = (
+                f"SFT tensor cache not found at {self.cache_dir}; "
+                "falling back to on-the-fly multimodal preprocessing."
+            )
+            return
+        if not self.metadata_path.exists():
+            self.status = "missing_metadata"
+            self.message = (
+                f"SFT tensor cache metadata is missing at {self.metadata_path}; "
+                "falling back to on-the-fly multimodal preprocessing."
+            )
+            return
+        try:
+            self.metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.status = "invalid_metadata"
+            self.message = (
+                f"Failed to read SFT tensor cache metadata from {self.metadata_path}: {exc}; "
+                "falling back to on-the-fly multimodal preprocessing."
+            )
+            return
+        if str(self.metadata.get("schema_version") or "") != SFT_TENSOR_CACHE_SCHEMA_VERSION:
+            self.status = "schema_mismatch"
+            self.message = (
+                f"SFT tensor cache schema mismatch at {self.metadata_path}; "
+                "falling back to on-the-fly multimodal preprocessing."
+            )
+            return
+
+        try:
+            actual_config = resolve_sft_tensor_cache_config_from_metadata(self.metadata)
+        except Exception as exc:
+            self.status = "legacy_upgrade_failed"
+            self.message = (
+                f"Failed to resolve SFT tensor cache config from {self.metadata_path}: {exc}; "
+                "falling back to on-the-fly multimodal preprocessing."
+            )
+            return
+        if actual_config != self.expected_config:
+            self.status = "config_mismatch"
+            self.message = (
+                f"SFT tensor cache config mismatch at {self.metadata_path}; "
+                f"expected={json.dumps(self.expected_config, ensure_ascii=False, sort_keys=True)} "
+                f"actual={json.dumps(actual_config, ensure_ascii=False, sort_keys=True)}. "
+                "Falling back to on-the-fly multimodal preprocessing."
+            )
+            return
+
+        self.enabled = True
+        self.status = "enabled"
+        self.message = (
+            f"SFT tensor cache enabled: dir={self.cache_dir} "
+            f"num_examples={int(self.metadata.get('num_examples', 0) or 0)}"
+        )
+
+    def log_status(self) -> None:
+        runtime_log(self.message, runtime=self.runtime, main_process_only=True)
+
+    def entry_path(self, cache_key: str) -> Path:
+        return sft_tensor_cache_entry_path(self.cache_dir, cache_key)
+
+    def load(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        path = self.entry_path(cache_key)
+        if not path.exists():
+            if cache_key not in self._logged_missing_keys and len(self._logged_missing_keys) < 10:
+                self._logged_missing_keys.add(cache_key)
+                runtime_log(
+                    (
+                        f"SFT tensor cache miss: key={cache_key} path={path}; "
+                        "falling back to on-the-fly multimodal preprocessing for this example."
+                    ),
+                    runtime=self.runtime,
+                    main_process_only=True,
+                )
+            return None
+        payload = torch.load(path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid SFT tensor cache payload at {path}: expected dict.")
+        return payload
 
 
 def _unwrap_model(model: Any) -> Any:
@@ -560,6 +920,139 @@ def _build_response_labels(
     return labels
 
 
+def materialize_example_for_training(
+    example: Dict[str, Any],
+    *,
+    resolver: Optional["_FrameReferenceResolver"] = None,
+) -> Dict[str, Any]:
+    prepared_example = copy.deepcopy(example)
+    prepared_example.setdefault("_feature_cache_key", build_sft_tensor_cache_key(example))
+    active_resolver = resolver or _FrameReferenceResolver()
+    prepared_example["messages"] = active_resolver.materialize_messages(prepared_example["messages"])
+    return prepared_example
+
+
+def materialize_example_messages(
+    example: Dict[str, Any],
+    *,
+    resolver: Optional["_FrameReferenceResolver"] = None,
+) -> Dict[str, Any]:
+    return materialize_example_for_training(example, resolver=resolver)
+
+
+def _build_batch_from_feature(
+    processor: Any,
+    feature: Dict[str, Any],
+    *,
+    max_image_side: int = 0,
+    max_image_pixels: int = 0,
+    keep_recent_tool_image_messages: int = 0,
+    max_total_images: int = 0,
+    max_seq_length: int = 0,
+    keep_recent_text_messages: int = 0,
+    cached_plan: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    if cached_plan is not None:
+        prompt_messages = _apply_cached_message_plan(
+            feature["messages"],
+            list(cached_plan.get("message_plan") or []),
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
+        )
+        target_message = {"role": "assistant", "content": [{"type": "text", "text": feature["target_response"]}]}
+        full_messages = prompt_messages + [target_message]
+        full_text = str(cached_plan.get("full_text") or "")
+        full_inputs = _tokenize_chat(
+            processor,
+            full_text,
+            full_messages,
+            max_length=max_seq_length,
+            truncation_side="left",
+        )
+        response_token_count = int(cached_plan.get("response_token_count") or 0)
+        next_cached_plan = None
+    else:
+        tagged_messages = _tag_messages_for_cache(feature["messages"])
+        prompt_messages = _prepare_messages(
+            tagged_messages,
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
+            keep_recent_tool_image_messages=keep_recent_tool_image_messages,
+            max_total_images=max_total_images,
+            keep_recent_text_messages=keep_recent_text_messages,
+        )
+        prompt_messages, full_messages, prompt_text, full_text, full_inputs = _fit_messages_to_budget(
+            processor,
+            prompt_messages,
+            target_response=feature["target_response"],
+            max_seq_length=max_seq_length,
+            truncation_side="left",
+        )
+        response_token_count = max(
+            0,
+            _count_text_tokens(processor, full_text) - _count_text_tokens(processor, prompt_text),
+        )
+        next_cached_plan = {
+            "message_plan": _capture_message_plan(prompt_messages),
+            "full_text": full_text,
+            "response_token_count": int(response_token_count),
+        }
+
+    labels = _build_response_labels(
+        full_inputs["input_ids"],
+        response_token_count=response_token_count,
+    )
+
+    batch = dict(full_inputs)
+    batch["labels"] = labels
+    batch["sample_weight"] = torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32)
+    if "advantage" in feature:
+        batch["advantage"] = torch.tensor([float(feature.get("advantage", 0.0))], dtype=torch.float32)
+    response_positions = labels.ne(-100)
+    response_token_count = int(response_positions.sum().item())
+    if response_token_count > 0:
+        token_advantages = _build_token_advantages_for_feature(
+            processor=processor,
+            feature=feature,
+            response_token_count=response_token_count,
+        )
+        full_token_advantages = labels.new_zeros(labels.shape, dtype=torch.float32)
+        full_token_advantages[response_positions] = torch.tensor(token_advantages, dtype=torch.float32)
+        batch["token_advantages"] = full_token_advantages
+    return batch, next_cached_plan
+
+
+def build_sft_tensor_cache_payload(
+    processor: Any,
+    feature: Dict[str, Any],
+    *,
+    max_image_side: int = 0,
+    max_image_pixels: int = 0,
+    keep_recent_tool_image_messages: int = 0,
+    max_total_images: int = 0,
+    max_seq_length: int = 0,
+    keep_recent_text_messages: int = 0,
+) -> Dict[str, Any]:
+    batch, _ = _build_batch_from_feature(
+        processor,
+        feature,
+        max_image_side=max_image_side,
+        max_image_pixels=max_image_pixels,
+        keep_recent_tool_image_messages=keep_recent_tool_image_messages,
+        max_total_images=max_total_images,
+        max_seq_length=max_seq_length,
+        keep_recent_text_messages=keep_recent_text_messages,
+        cached_plan=None,
+    )
+    payload: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            payload[key] = value.detach().cpu()
+        else:
+            payload[key] = copy.deepcopy(value)
+    return payload
+
+
 class _FrameReferenceResolver:
     def __init__(self, *, max_cached_videos: int = 2):
         self.max_cached_videos = max(0, int(max_cached_videos))
@@ -798,98 +1291,77 @@ class SingleExampleMultimodalCollator:
         while len(self._feature_plan_cache) > self.feature_plan_cache_size:
             self._feature_plan_cache.popitem(last=False)
 
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         if len(features) != 1:
             raise ValueError(
                 "SingleExampleMultimodalCollator currently requires per_device_train_batch_size=1 "
                 "for stable multimodal padding."
             )
-        feature = copy.deepcopy(features[0])
+        feature = features[0]
+        if bool(feature.get("_pretokenized", False)):
+            return {
+                key: value
+                for key, value in feature.items()
+                if not str(key).startswith("_")
+            }
+
+        feature = copy.deepcopy(feature)
         cached_plan = self._get_cached_plan(feature)
-        if cached_plan is not None:
-            prompt_messages = _apply_cached_message_plan(
-                feature["messages"],
-                list(cached_plan.get("message_plan") or []),
-                max_image_side=self.max_image_side,
-                max_image_pixels=self.max_image_pixels,
-            )
-            target_message = {"role": "assistant", "content": [{"type": "text", "text": feature["target_response"]}]}
-            full_messages = prompt_messages + [target_message]
-            full_text = str(cached_plan.get("full_text") or "")
-            full_inputs = _tokenize_chat(
-                self.processor,
-                full_text,
-                full_messages,
-                max_length=self.max_seq_length,
-                truncation_side="left",
-            )
-            response_token_count = int(cached_plan.get("response_token_count") or 0)
-        else:
-            tagged_messages = _tag_messages_for_cache(feature["messages"])
-            prompt_messages = _prepare_messages(
-                tagged_messages,
-                max_image_side=self.max_image_side,
-                max_image_pixels=self.max_image_pixels,
-                keep_recent_tool_image_messages=self.keep_recent_tool_image_messages,
-                max_total_images=self.max_total_images,
-                keep_recent_text_messages=self.keep_recent_text_messages,
-            )
-            prompt_messages, full_messages, prompt_text, full_text, full_inputs = _fit_messages_to_budget(
-                self.processor,
-                prompt_messages,
-                target_response=feature["target_response"],
-                max_seq_length=self.max_seq_length,
-                truncation_side="left",
-            )
-            response_token_count = max(
-                0,
-                _count_text_tokens(self.processor, full_text) - _count_text_tokens(self.processor, prompt_text),
-            )
-            self._store_cached_plan(
-                feature,
-                {
-                    "message_plan": _capture_message_plan(prompt_messages),
-                    "full_text": full_text,
-                    "response_token_count": int(response_token_count),
-                },
-            )
-
-        labels = _build_response_labels(
-            full_inputs["input_ids"],
-            response_token_count=response_token_count,
+        batch, plan_payload = _build_batch_from_feature(
+            self.processor,
+            feature,
+            max_image_side=self.max_image_side,
+            max_image_pixels=self.max_image_pixels,
+            keep_recent_tool_image_messages=self.keep_recent_tool_image_messages,
+            max_total_images=self.max_total_images,
+            max_seq_length=self.max_seq_length,
+            keep_recent_text_messages=self.keep_recent_text_messages,
+            cached_plan=cached_plan,
         )
-
-        batch = dict(full_inputs)
-        batch["labels"] = labels
-        batch["sample_weight"] = torch.tensor([float(feature.get("sample_weight", 1.0))], dtype=torch.float32)
-        if "advantage" in feature:
-            batch["advantage"] = torch.tensor([float(feature.get("advantage", 0.0))], dtype=torch.float32)
-        response_positions = labels.ne(-100)
-        response_token_count = int(response_positions.sum().item())
-        if response_token_count > 0:
-            token_advantages = _build_token_advantages_for_feature(
-                processor=self.processor,
-                feature=feature,
-                response_token_count=response_token_count,
-            )
-            full_token_advantages = labels.new_zeros(labels.shape, dtype=torch.float32)
-            full_token_advantages[response_positions] = torch.tensor(token_advantages, dtype=torch.float32)
-            batch["token_advantages"] = full_token_advantages
+        if plan_payload is not None:
+            self._store_cached_plan(feature, plan_payload)
         return batch
 
 
 class WeightedExampleDataset(torch.utils.data.Dataset):
-    def __init__(self, examples: Sequence[Dict[str, Any]]):
+    def __init__(
+        self,
+        examples: Sequence[Dict[str, Any]],
+        *,
+        tensor_cache_dir: str | Path = "",
+        tensor_cache_expected_config: Optional[Dict[str, Any]] = None,
+    ):
         self.examples = list(examples)
         self._frame_reference_resolver = _FrameReferenceResolver()
+        self._example_cache_keys = [build_sft_tensor_cache_key(example) for example in self.examples]
+        self._tensor_cache: Optional[PreparedSFTTensorCache] = None
+        if tensor_cache_dir:
+            self._tensor_cache = PreparedSFTTensorCache(
+                tensor_cache_dir,
+                expected_config=dict(tensor_cache_expected_config or {}),
+            )
+            self._tensor_cache.log_status()
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        example = copy.deepcopy(self.examples[idx])
-        example.setdefault("_feature_cache_key", str(idx))
-        example["messages"] = self._frame_reference_resolver.materialize_messages(example["messages"])
+        cache_key = self._example_cache_keys[idx]
+        if self._tensor_cache is not None:
+            cached_payload = self._tensor_cache.load(cache_key)
+            if cached_payload is not None:
+                batch = {
+                    key: value
+                    for key, value in cached_payload.items()
+                }
+                batch["_pretokenized"] = True
+                batch["_feature_cache_key"] = cache_key
+                return batch
+        example = materialize_example_for_training(
+            self.examples[idx],
+            resolver=self._frame_reference_resolver,
+        )
+        example["_feature_cache_key"] = cache_key
         return example
 
 
@@ -1880,6 +2352,7 @@ def run_weighted_sft(
     *,
     model_path: str | Path,
     output_dir: str | Path,
+    tensor_cache_dir: str | Path = "",
     training_objective: str = "weighted_sft",
     old_policy_model_path: str | Path | None = None,
     ppo_clip_epsilon: float = 0.2,
@@ -1925,7 +2398,8 @@ def run_weighted_sft(
     runtime_log(
         (
             f"SFT setup: num_examples={len(examples)} output_dir={output_dir} model_path={model_path} "
-            f"training_objective={training_objective}"
+            f"training_objective={training_objective} "
+            f"tensor_cache_dir={str(tensor_cache_dir) if tensor_cache_dir else 'off'}"
         ),
         runtime=runtime,
         main_process_only=True,
@@ -1970,6 +2444,7 @@ def run_weighted_sft(
         lora_dropout=lora_dropout,
         lora_target_modules=lora_target_modules,
     )
+    processor_signature = build_processor_signature(processor)
     old_policy_model = None
     resolved_old_policy_model_path = str(old_policy_model_path) if old_policy_model_path else ""
     if str(training_objective) == "grpo":
@@ -2022,7 +2497,19 @@ def run_weighted_sft(
     trainer = create_trainer(
         model=model,
         processor=processor,
-        train_dataset=WeightedExampleDataset(examples),
+        train_dataset=WeightedExampleDataset(
+            examples,
+            tensor_cache_dir=tensor_cache_dir,
+            tensor_cache_expected_config=normalize_sft_tensor_cache_config(
+                processor_signature=processor_signature,
+                max_image_side=max_image_side,
+                max_image_pixels=max_image_pixels,
+                keep_recent_tool_image_messages=keep_recent_tool_image_messages,
+                max_total_images=max_total_images,
+                max_seq_length=max_seq_length,
+                keep_recent_text_messages=keep_recent_text_messages,
+            ),
+        ),
         output_dir=output_dir,
         learning_rate=learning_rate,
         num_train_epochs=num_train_epochs,
@@ -2061,6 +2548,7 @@ def run_weighted_sft(
     return {
         "num_examples": len(examples),
         "output_dir": str(output_dir),
+        "tensor_cache_dir": str(tensor_cache_dir) if tensor_cache_dir else "",
         "train_loss": float(getattr(train_result, "training_loss", 0.0)),
         "training_objective": str(training_objective),
         "old_policy_model_path": resolved_old_policy_model_path,

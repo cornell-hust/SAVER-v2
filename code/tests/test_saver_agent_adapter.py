@@ -52,6 +52,18 @@ class SaverAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("severity", final_hint)
         self.assertNotIn("{", final_hint)
 
+    def test_parse_answer_text_prefers_terminal_answer_outside_think_block(self):
+        adapter = TimeSearchRolloutAdapter()
+
+        answer_text = adapter.parse_answer_text(
+            (
+                '<think>placeholder <answer>{"existence":"normal"}</answer></think>'
+                '<answer>{"existence":"anomaly","category":"fire"}</answer>'
+            )
+        )
+
+        self.assertEqual(answer_text, '{"existence":"anomaly","category":"fire"}')
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,9 @@ AGENT_TRAIN_JSONL="${AGENT_TRAIN_JSONL:-${ANNOTATION_DIR}/msad_saver_agent_train
 ORACLE_TRAIN_JSONL="${ORACLE_TRAIN_JSONL:-${ANNOTATION_DIR}/msad_saver_oracle_sft_train.jsonl}"
 ORACLE_EVAL_JSONL="${ORACLE_EVAL_JSONL:-${ANNOTATION_DIR}/msad_saver_oracle_sft_${EVAL_SPLIT}.jsonl}"
 PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL:-${ARTIFACT_DIR}/msad_saver_agent_train.prepared_sft.jsonl}"
+PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-}"
+PROPOSAL_TORCH_DTYPE="${PROPOSAL_TORCH_DTYPE:-auto}"
+PROPOSAL_DEVICE="${PROPOSAL_DEVICE:-}"
 
 PROGRESS_EVERY="${PROGRESS_EVERY:-25}"
 VALIDATE_MATERIALIZATION="${VALIDATE_MATERIALIZATION:-0}"
@@ -67,6 +70,15 @@ if [[ "${VALIDATE_MATERIALIZATION}" == "1" ]]; then
 fi
 if [[ "${VALIDATION_MAX_EXAMPLES}" != "0" ]]; then
   prepare_cmd+=(--validation-max-examples "${VALIDATION_MAX_EXAMPLES}")
+fi
+if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
+  prepare_cmd+=(
+    --proposal-model-path "${PROPOSAL_MODEL_PATH}"
+    --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"
+  )
+  if [[ -n "${PROPOSAL_DEVICE}" ]]; then
+    prepare_cmd+=(--proposal-device "${PROPOSAL_DEVICE}")
+  fi
 fi
 "${prepare_cmd[@]}"
 

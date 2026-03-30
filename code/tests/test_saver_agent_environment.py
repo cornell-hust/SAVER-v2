@@ -80,6 +80,42 @@ class SaverAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(contents[0]["function"]["arguments"]["start_sec"], 0.0)
         self.assertEqual(contents[0]["function"]["arguments"]["end_sec"], 7.0)
 
+    def test_parse_actions_prefers_terminal_answer_outside_think_block(self):
+        actions, contents = parse_actions_and_contents(
+            [
+                (
+                    '<think>first draft <answer>{"existence":"normal"}</answer></think>'
+                    '<answer>{"existence":"anomaly","category":"assault"}</answer>'
+                )
+            ]
+        )
+
+        self.assertEqual(actions, ["answer"])
+        self.assertEqual(contents[0], '{"existence":"anomaly","category":"assault"}')
+
+    def test_invalid_finalize_case_retry_message_mentions_required_schema_fields(self):
+        multimodal_cache = {
+            **self.multimodal_cache,
+            "tool_io": {"finalize_case_schema": {"type": "object", "required": ["existence", "summary"]}},
+        }
+
+        next_obs, dones, valid_actions, is_search, _ = self.env.execute_predictions(
+            [
+                '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly"}}</tool_call>'
+            ],
+            [multimodal_cache],
+            [SaverEnvironmentState()],
+            [True],
+        )
+
+        self.assertEqual(dones, [0])
+        self.assertEqual(valid_actions, [0])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(next_obs[0]["name"], "parse_error")
+        retry_text = next_obs[0]["content"][0]["text"]
+        self.assertIn("finalize_case", retry_text)
+        self.assertIn("summary", retry_text)
+
 
 if __name__ == "__main__":
     unittest.main()

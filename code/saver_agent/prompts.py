@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -9,6 +10,18 @@ from saver_agent.config import PromptConfig
 
 def _json_dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_public_case_id(record: Dict[str, Any]) -> str:
+    raw_identifier = (
+        str(record.get("video_id") or "").strip()
+        or str(record.get("video_path") or "").strip()
+        or str(record.get("file_name") or "").strip()
+    )
+    if not raw_identifier:
+        return "case_unknown"
+    digest = hashlib.sha1(raw_identifier.encode("utf-8")).hexdigest()[:10]
+    return f"case_{digest}"
 
 
 def _coerce_function_schemas(tool_schemas_or_names: Sequence[Any]) -> List[Dict[str, Any]]:
@@ -83,6 +96,16 @@ def build_tool_use_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
     return "Allowed tools: " + ", ".join(tool_names)
 
 
+def _extract_finalize_case_required_fields(function_schemas: Sequence[Dict[str, Any]]) -> List[str]:
+    for schema in function_schemas:
+        if str(schema.get("name") or "") != "finalize_case":
+            continue
+        parameters = schema.get("parameters") or {}
+        required = list(parameters.get("required") or [])
+        return [str(field_name) for field_name in required if str(field_name).strip()]
+    return []
+
+
 def build_system_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
     tool_contract = (
         'Valid tool format example: <think>inspect</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":4}}</tool_call>. '
@@ -91,7 +114,16 @@ def build_system_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
         "Do not output bare tool names. "
         "Do not invent tool names or argument keys."
     )
-    tool_use_prompt = build_tool_use_prompt(tool_schemas_or_names)
+    function_schemas = _coerce_function_schemas(tool_schemas_or_names)
+    tool_use_prompt = build_tool_use_prompt(function_schemas or tool_schemas_or_names)
+    finalize_required_fields = _extract_finalize_case_required_fields(function_schemas)
+    finalize_contract = ""
+    if finalize_required_fields:
+        finalize_contract = (
+            " When you call finalize_case, include every required field exactly once: "
+            + ", ".join(finalize_required_fields)
+            + "."
+        )
     return (
         "You are SAVER, an active video anomaly agent. "
         "Think carefully before each action. "
@@ -100,6 +132,7 @@ def build_system_prompt(tool_schemas_or_names: Sequence[Any]) -> str:
         "Only output <answer> after finalize_case has returned or the environment explicitly asks for the terminal answer. "
         "If you use a tool, respond as <think>...</think><tool_call>{...}</tool_call>. "
         "Do not skip finalize_case when the protocol requires a structured final decision. "
+        f"{finalize_contract}"
         f"{tool_contract}\n"
         f"{tool_use_prompt}"
     )
@@ -117,8 +150,11 @@ def build_user_prompt(
     task_prompt = record.get("agent_task", {}).get("task_prompt", "")
     criteria = record.get("agent_task", {}).get("success_criteria", [])
     criteria_text = "\n".join(f"- {item}" for item in criteria) or "- none provided"
+    public_case_id = build_public_case_id(record)
     prompt = prompt_config.initial_user_template.format(
-        video_id=record.get("video_id"),
+        video_id=public_case_id,
+        public_case_id=public_case_id,
+        raw_video_id=public_case_id,
         scene=scene,
         duration=duration,
         task_prompt=task_prompt,

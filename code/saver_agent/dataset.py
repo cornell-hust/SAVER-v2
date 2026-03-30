@@ -175,7 +175,9 @@ class SaverAgentDataset(torch.utils.data.Dataset):
         return message
 
     def _build_messages(self, record: Dict, multimodal_cache: Dict) -> List[Dict]:
-        system_prompt = build_system_prompt(self.tool_schemas)
+        tool_io = record.get("tool_io") or {}
+        tool_schemas = get_tool_schemas(finalize_case_schema=tool_io.get("finalize_case_schema"))
+        system_prompt = build_system_prompt(tool_schemas)
         user_prompt = build_user_prompt(
             record,
             preview_available=bool(multimodal_cache.get("preview_frames") is not None),

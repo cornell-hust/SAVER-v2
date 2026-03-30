@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 
 DEFAULT_INITIAL_USER_TEMPLATE = (
-    "Video ID: {video_id}\n"
+    "Case ID: {public_case_id}\n"
     "Scene: {scene}\n"
     "Duration (sec): {duration}\n"
     "Task: {task_prompt}\n"

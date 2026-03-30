@@ -18,9 +18,15 @@ INCLUDE_SPLITS="${INCLUDE_SPLITS:-train}"
 MODEL_PATH="${MODEL_PATH:-${CHECKPOINT_DIR}/saver_sft_qwen3vl_8b_eval_ddp}"
 REFERENCE_MODEL_PATH="${REFERENCE_MODEL_PATH:-${MODEL_PATH}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_DIR}/saver_cea_grpo_v1}"
+PROPOSAL_MODEL_PATH="${PROPOSAL_MODEL_PATH:-}"
+PROPOSAL_TORCH_DTYPE="${PROPOSAL_TORCH_DTYPE:-auto}"
+PROPOSAL_DEVICE="${PROPOSAL_DEVICE:-}"
 
 EVAL_DATA="${EVAL_DATA:-${ANNOTATION_DIR}/msad_saver_oracle_sft_test.jsonl}"
 EVAL_INCLUDE_SPLITS="${EVAL_INCLUDE_SPLITS:-}"
+EVAL_PROPOSAL_MODEL_PATH="${EVAL_PROPOSAL_MODEL_PATH:-${PROPOSAL_MODEL_PATH}}"
+EVAL_PROPOSAL_TORCH_DTYPE="${EVAL_PROPOSAL_TORCH_DTYPE:-${PROPOSAL_TORCH_DTYPE}}"
+EVAL_PROPOSAL_DEVICE="${EVAL_PROPOSAL_DEVICE:-${PROPOSAL_DEVICE}}"
 # 设为 0 表示评完整个 eval 数据，不传 --eval-max-records。
 EVAL_MAX_RECORDS="${EVAL_MAX_RECORDS:-0}"
 EVAL_ROLLOUT_MAX_TURNS="${EVAL_ROLLOUT_MAX_TURNS:-12}"
@@ -141,6 +147,24 @@ if [[ -n "${EVAL_INCLUDE_SPLITS}" ]]; then
 fi
 if [[ -n "${ATTN_IMPLEMENTATION}" ]]; then
   cmd+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
+fi
+if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
+  cmd+=(
+    --proposal-model-path "${PROPOSAL_MODEL_PATH}"
+    --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"
+  )
+  if [[ -n "${PROPOSAL_DEVICE}" ]]; then
+    cmd+=(--proposal-device "${PROPOSAL_DEVICE}")
+  fi
+fi
+if [[ -n "${EVAL_PROPOSAL_MODEL_PATH}" ]]; then
+  cmd+=(
+    --eval-proposal-model-path "${EVAL_PROPOSAL_MODEL_PATH}"
+    --eval-proposal-torch-dtype "${EVAL_PROPOSAL_TORCH_DTYPE}"
+  )
+  if [[ -n "${EVAL_PROPOSAL_DEVICE}" ]]; then
+    cmd+=(--eval-proposal-device "${EVAL_PROPOSAL_DEVICE}")
+  fi
 fi
 if [[ "${CEA_ENABLE_SEARCH_GROUP}" == "1" ]]; then
   cmd+=(--cea-enable-search-group)

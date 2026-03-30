@@ -17,6 +17,7 @@ from saver_agent.offline_scoring import (
     save_rollout_records,
     score_rollout_records,
 )
+from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_verifier import DEFAULT_VERIFIER_MODEL_PATH, QwenSelfVerifier
 from saver_agent.rollout import SaverRolloutRunner
 from saver_agent.runtime import (
@@ -38,6 +39,9 @@ class RolloutEvaluationConfig:
     include_splits: Optional[Sequence[str] | str] = None
     max_records: int = 0
     rollout_max_turns: int = 6
+    proposal_model_path: str | Path = ""
+    proposal_torch_dtype: str = "auto"
+    proposal_device: str = ""
     verifier_backend: str = "heuristic"
     verifier_model_path: str | Path = DEFAULT_VERIFIER_MODEL_PATH
     verifier_torch_dtype: str = "auto"
@@ -69,6 +73,31 @@ def _attach_verifier_context(
         cache["verifier_runtime"] = verifier_runtime
 
 
+def _attach_proposal_context(
+    item: Dict[str, Any],
+    *,
+    proposal_runtime: Any,
+) -> None:
+    if proposal_runtime is not None:
+        item["multimodal_cache"]["proposal_runtime"] = proposal_runtime
+
+
+def _resolve_proposal_device(
+    explicit_device: str | None,
+    *,
+    runtime: DistributedRuntime,
+) -> str:
+    if str(explicit_device or "").strip():
+        return str(explicit_device)
+    try:
+        import torch
+    except Exception:
+        return "cpu"
+    if torch.cuda.is_available():
+        return f"cuda:{int(runtime.local_rank)}"
+    return "cpu"
+
+
 def _load_verifier_runtime(
     *,
     eval_config: RolloutEvaluationConfig,
@@ -87,6 +116,25 @@ def _load_verifier_runtime(
         device_map=resolved_device_map,
         attn_implementation=eval_config.verifier_attn_implementation or None,
         max_new_tokens=eval_config.verifier_max_new_tokens,
+    )
+
+
+def _load_proposal_runtime(
+    *,
+    eval_config: RolloutEvaluationConfig,
+    runtime: DistributedRuntime,
+) -> Any:
+    if not str(eval_config.proposal_model_path or "").strip():
+        return None
+    resolved_device = _resolve_proposal_device(eval_config.proposal_device, runtime=runtime)
+    runtime_log(
+        f"loading eval proposal model from {eval_config.proposal_model_path} on device={resolved_device}",
+        runtime=runtime,
+    )
+    return SiglipFeatureEncoder.from_pretrained(
+        str(eval_config.proposal_model_path),
+        torch_dtype=eval_config.proposal_torch_dtype,
+        device=resolved_device,
     )
 
 
@@ -122,6 +170,7 @@ def run_rollout_evaluation(
     scored_shard_dir = eval_root / "scored_shards"
     scored_shard_dir.mkdir(parents=True, exist_ok=True)
 
+    proposal_runtime = _load_proposal_runtime(eval_config=eval_config, runtime=runtime) if local_indices else None
     verifier_runtime = _load_verifier_runtime(eval_config=eval_config, runtime=runtime) if local_indices else None
     verifier_kwargs = {
         "verifier_backend": eval_config.verifier_backend,
@@ -144,6 +193,7 @@ def run_rollout_evaluation(
     total_local = len(local_indices)
     for completed, dataset_index in enumerate(local_indices, start=1):
         item = dataset[int(dataset_index)]
+        _attach_proposal_context(item, proposal_runtime=proposal_runtime)
         _attach_verifier_context(
             item,
             eval_config=eval_config,

@@ -244,6 +244,66 @@ class TrainSaverSftTests(unittest.TestCase):
 
         self.assertTrue(config.attach_reference_diagnostics)
 
+    def test_build_rollout_eval_config_passes_proposal_runtime_fields(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--proposal-model-path",
+                "/models/siglip_base",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--eval-proposal-torch-dtype",
+                "bfloat16",
+                "--eval-proposal-device",
+                "cuda:1",
+            ]
+        )
+
+        config = train_saver_sft._build_rollout_eval_config(
+            args,
+            config=train_saver_sft._build_config(args),
+        )
+
+        self.assertEqual(str(config.proposal_model_path), "/models/siglip_base")
+        self.assertEqual(config.proposal_torch_dtype, "bfloat16")
+        self.assertEqual(config.proposal_device, "cuda:1")
+
+    def test_build_prepared_sft_examples_attaches_proposal_runtime_to_multimodal_cache(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        captured = {}
+
+        class DummyDataset:
+            def __init__(self, *args, **kwargs):
+                self.records = [{"video_id": "vid_1"}]
+
+            def format_frame_cache_status(self, *, prefix="frame cache", max_examples=5):
+                return f"{prefix}: ok"
+
+            def __getitem__(self, index):
+                return {"video_id": "vid_1", "multimodal_cache": {}}
+
+        def fake_build_oracle_sft_examples(item, record, **kwargs):
+            captured["proposal_runtime"] = item["multimodal_cache"].get("proposal_runtime")
+            return [{"video_id": record["video_id"], "target_response": "<answer>{}</answer>"}]
+
+        with patch("train_saver_sft.SaverAgentDataset", DummyDataset), patch(
+            "train_saver_sft.build_oracle_sft_examples",
+            side_effect=fake_build_oracle_sft_examples,
+        ):
+            examples = train_saver_sft.build_prepared_sft_examples_from_jsonl(
+                data_path="/tmp/data.jsonl",
+                proposal_runtime="siglip_runtime",
+            )
+
+        self.assertEqual(captured["proposal_runtime"], "siglip_runtime")
+        self.assertEqual(len(examples), 1)
+
     def test_parse_args_defaults_eval_rollout_max_turns_to_twelve(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
 
