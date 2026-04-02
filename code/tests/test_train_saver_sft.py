@@ -244,6 +244,23 @@ class TrainSaverSftTests(unittest.TestCase):
 
         self.assertTrue(config.attach_reference_diagnostics)
 
+    def test_parse_args_defaults_training_visual_budget_to_eval_budget(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+            ]
+        )
+
+        self.assertEqual(args.max_total_images, 24)
+        self.assertEqual(args.eval_max_new_tokens_per_turn, 256)
+        self.assertEqual(args.eval_max_total_images, 24)
+        self.assertEqual(args.eval_rollout_max_turns, 12)
+
     def test_build_rollout_eval_config_passes_proposal_runtime_fields(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
 
@@ -317,6 +334,262 @@ class TrainSaverSftTests(unittest.TestCase):
         )
 
         self.assertEqual(args.eval_rollout_max_turns, 12)
+        self.assertEqual(args.eval_max_new_tokens_per_turn, 256)
+
+    def test_parse_args_accepts_resume_recovery_flags(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--prepared-data",
+                "/tmp/prepared.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--resume-from-checkpoint",
+                "/tmp/sft_out/epoch_resume/epoch_001",
+                "--resume-rollout-eval-only",
+            ]
+        )
+
+        self.assertEqual(args.resume_from_checkpoint, "/tmp/sft_out/epoch_resume/epoch_001")
+        self.assertTrue(args.resume_rollout_eval_only)
+
+    def test_parse_args_accepts_inline_rollout_eval_flag(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--prepared-data",
+                "/tmp/prepared.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--inline-rollout-eval",
+            ]
+        )
+
+        self.assertTrue(args.inline_rollout_eval)
+
+    def test_resolve_resume_epoch_index_from_epoch_resume_dir_name(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir) / "epoch_resume" / "epoch_003"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+            epoch_index = train_saver_sft._resolve_resume_epoch_index(checkpoint_dir)
+
+        self.assertEqual(epoch_index, 3)
+
+    def test_main_passes_resume_checkpoint_into_run_weighted_sft(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        captured = {}
+
+        def fake_run_weighted_sft(examples, **kwargs):
+            captured["examples"] = list(examples)
+            captured["resume_from_checkpoint"] = kwargs.get("resume_from_checkpoint")
+            return {"num_examples": len(examples), "output_dir": kwargs.get("output_dir", "")}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prepared_path = Path(tmpdir) / "prepared.jsonl"
+            prepared_path.write_text("{}\n", encoding="utf-8")
+            output_dir = Path(tmpdir) / "sft_out"
+            resume_dir = output_dir / "checkpoint-120"
+            resume_dir.mkdir(parents=True, exist_ok=True)
+            argv = [
+                "train_saver_sft.py",
+                "--prepared-data",
+                str(prepared_path),
+                "--output-dir",
+                str(output_dir),
+                "--resume-from-checkpoint",
+                str(resume_dir),
+            ]
+            with patch.object(sys, "argv", argv), patch(
+                "train_saver_sft._load_jsonl",
+                return_value=[{"video_id": "v1", "target_response": "<answer>{}</answer>"}],
+            ), patch(
+                "train_saver_sft._maybe_annotate_examples_with_teacher_judge",
+                side_effect=lambda args, examples, runtime: (examples, {}),
+            ), patch(
+                "train_saver_sft._apply_teacher_judge_reweighting",
+                side_effect=lambda examples, runtime: (examples, {}),
+            ), patch(
+                "train_saver_sft._run_validation",
+                return_value={},
+            ), patch(
+                "train_saver_sft.run_weighted_sft",
+                side_effect=fake_run_weighted_sft,
+            ):
+                train_saver_sft.main()
+
+        self.assertEqual(captured["resume_from_checkpoint"], str(resume_dir))
+        self.assertEqual(len(captured["examples"]), 1)
+
+    def test_main_eval_only_recovery_runs_rollout_eval_without_trainer(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        captured = {}
+
+        def fake_eval_only(*, checkpoint_path, output_dir, rollout_eval_config, epoch_index, model_path, torch_dtype, attn_implementation, runtime):
+            captured["checkpoint_path"] = str(checkpoint_path)
+            captured["output_dir"] = str(output_dir)
+            captured["epoch_index"] = int(epoch_index)
+            captured["model_path"] = str(model_path)
+            captured["policy_max_new_tokens"] = int(rollout_eval_config.policy_max_new_tokens)
+            return {"epoch_index": int(epoch_index), "temporal_miou": 0.25}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prepared_path = Path(tmpdir) / "prepared.jsonl"
+            prepared_path.write_text("{}\n", encoding="utf-8")
+            output_dir = Path(tmpdir) / "sft_out"
+            resume_dir = output_dir / "epoch_resume" / "epoch_001"
+            resume_dir.mkdir(parents=True, exist_ok=True)
+            argv = [
+                "train_saver_sft.py",
+                "--prepared-data",
+                str(prepared_path),
+                "--output-dir",
+                str(output_dir),
+                "--eval-data",
+                str(Path(tmpdir) / "eval.jsonl"),
+                "--resume-from-checkpoint",
+                str(resume_dir),
+                "--resume-rollout-eval-only",
+            ]
+            with patch.object(sys, "argv", argv), patch(
+                "train_saver_sft._load_jsonl",
+                return_value=[{"video_id": "v1", "target_response": "<answer>{}</answer>"}],
+            ), patch(
+                "train_saver_sft._maybe_annotate_examples_with_teacher_judge",
+                side_effect=lambda args, examples, runtime: (examples, {}),
+            ), patch(
+                "train_saver_sft._apply_teacher_judge_reweighting",
+                side_effect=lambda examples, runtime: (examples, {}),
+            ), patch(
+                "train_saver_sft._run_validation",
+                return_value={},
+            ), patch(
+                "train_saver_sft.run_weighted_sft",
+                side_effect=AssertionError("run_weighted_sft should not run in eval-only recovery mode"),
+            ), patch(
+                "train_saver_sft.run_rollout_eval_from_checkpoint",
+                side_effect=fake_eval_only,
+            ):
+                train_saver_sft.main()
+
+        self.assertEqual(captured["checkpoint_path"], str(resume_dir))
+        self.assertEqual(captured["output_dir"], str(output_dir))
+        self.assertEqual(captured["epoch_index"], 1)
+        self.assertEqual(captured["policy_max_new_tokens"], 256)
+
+    def test_build_rollout_eval_config_resolves_eval_visual_budget_and_output_budget(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--eval-total-visual-budget",
+                "24",
+                "--eval-max-new-tokens-per-turn",
+                "256",
+            ]
+        )
+
+        config = train_saver_sft._build_rollout_eval_config(
+            args,
+            config=train_saver_sft._build_config(args),
+        )
+
+        self.assertEqual(config.policy_max_new_tokens, 256)
+        self.assertEqual(config.max_total_images, 24)
+
+    def test_build_rollout_eval_config_carries_inline_rollout_eval_flag(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--inline-rollout-eval",
+            ]
+        )
+
+        config = train_saver_sft._build_rollout_eval_config(
+            args,
+            config=train_saver_sft._build_config(args),
+        )
+
+        self.assertTrue(config.inline_rollout_eval)
+
+    def test_resolve_proposal_device_falls_back_to_cuda_zero_when_local_rank_exceeds_visible_devices(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        runtime = type(
+            "Runtime",
+            (),
+            {
+                "local_rank": 3,
+                "is_main_process": True,
+                "is_distributed": False,
+                "rank": 0,
+                "world_size": 1,
+            },
+        )()
+        with patch("torch.cuda.is_available", return_value=True), patch("torch.cuda.device_count", return_value=1):
+            resolved = train_saver_sft._resolve_proposal_device("", runtime=runtime)
+
+        self.assertEqual(resolved, "cuda:0")
+
+    def test_build_rollout_eval_config_prefers_eval_max_total_images_over_visual_budget_alias(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--eval-total-visual-budget",
+                "24",
+                "--eval-max-total-images",
+                "18",
+            ]
+        )
+
+        config = train_saver_sft._build_rollout_eval_config(
+            args,
+            config=train_saver_sft._build_config(args),
+        )
+
+        self.assertEqual(config.max_total_images, 18)
+
+    def test_parse_args_defaults_teacher_judge_input_mode_to_auto(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+            ]
+        )
+
+        self.assertEqual(args.teacher_judge_input_mode, "auto")
 
     def test_main_passes_dataloader_knobs_to_run_weighted_sft(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
@@ -358,6 +631,258 @@ class TrainSaverSftTests(unittest.TestCase):
         self.assertEqual(kwargs["dataloader_num_workers"], 3)
         self.assertEqual(kwargs["dataloader_prefetch_factor"], 4)
         self.assertTrue(kwargs["dataloader_persistent_workers"])
+
+    def test_main_writes_summary_and_run_config_logs_under_output_dir(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        prepared_example = {
+            "video_id": "prepared_case",
+            "split": "train",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                {"role": "user", "content": [{"type": "text", "text": "user"}]},
+            ],
+            "target_response": "<answer>{}</answer>",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prepared_path = root / "prepared.jsonl"
+            prepared_path.write_text(json.dumps(prepared_example) + "\n", encoding="utf-8")
+            output_dir = root / "sft_out"
+            argv = [
+                "train_saver_sft.py",
+                "--prepared-data",
+                str(prepared_path),
+                "--output-dir",
+                str(output_dir),
+            ]
+
+            with patch.object(sys, "argv", argv), patch.object(
+                train_saver_sft,
+                "run_weighted_sft",
+                return_value={"ok": True, "train_loss": 0.123},
+            ):
+                train_saver_sft.main()
+
+            log_dir = output_dir / "logs"
+            run_config_path = log_dir / "train_saver_sft_run_config.json"
+            summary_path = log_dir / "train_saver_sft_summary.json"
+
+            self.assertTrue(run_config_path.exists())
+            self.assertTrue(summary_path.exists())
+
+            run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(run_config["prepared_data"], str(prepared_path))
+        self.assertEqual(run_config["output_dir"], str(output_dir))
+        self.assertAlmostEqual(summary["train_loss"], 0.123, places=6)
+        self.assertEqual(summary["num_examples"], 1)
+
+    def test_main_can_annotate_verify_examples_with_teacher_judge_before_training(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        verify_example = {
+            "video_id": "prepared_case",
+            "split": "train",
+            "target_action": "tool_call",
+            "tool_name": "verify_hypothesis",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                {"role": "user", "content": [{"type": "text", "text": "user"}]},
+            ],
+            "target_response": (
+                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":'
+                '{"verification_mode":"full_keep_drop","claim":{"existence":"anomaly","category":"assault"},'
+                '"selected_window_ids":["w0001"],"verification_decision":"sufficient","recommended_action":"finalize"}}'
+                "</tool_call>"
+            ),
+        }
+        answer_example = {
+            "video_id": "prepared_case",
+            "split": "train",
+            "target_action": "answer",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                {"role": "user", "content": [{"type": "text", "text": "user"}]},
+            ],
+            "target_response": '<answer>{"existence":"anomaly","category":"assault"}</answer>',
+        }
+
+        class DummyTeacherJudge:
+            def annotate_example(self, example, *, input_mode=None):
+                updated = dict(example)
+                updated["teacher_judge_scores"] = {"sufficiency": 0.93, "necessity": 0.61}
+                updated["teacher_judge_decision"] = "sufficient"
+                updated["teacher_judge_rationale"] = "Teacher judge agrees."
+                return updated
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prepared_path = root / "prepared.jsonl"
+            prepared_path.write_text(
+                json.dumps(verify_example) + "\n" + json.dumps(answer_example) + "\n",
+                encoding="utf-8",
+            )
+            output_dir = root / "sft_out"
+            teacher_output = root / "prepared.teacher.jsonl"
+            argv = [
+                "train_saver_sft.py",
+                "--prepared-data",
+                str(prepared_path),
+                "--output-dir",
+                str(output_dir),
+                "--teacher-judge-model-path",
+                "/models/Qwen3-VL-32B-Instruct",
+                "--teacher-judge-output",
+                str(teacher_output),
+            ]
+
+            with patch.object(
+                sys,
+                "argv",
+                argv,
+            ), patch.object(
+                train_saver_sft,
+                "run_weighted_sft",
+                return_value={"ok": True},
+            ) as mocked_run_weighted_sft, patch.object(
+                train_saver_sft.QwenTeacherJudge,
+                "from_pretrained",
+                return_value=DummyTeacherJudge(),
+            ) as mocked_teacher_loader:
+                train_saver_sft.main()
+                persisted = [
+                    json.loads(line)
+                    for line in teacher_output.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+
+        mocked_teacher_loader.assert_called_once()
+        examples = mocked_run_weighted_sft.call_args.args[0]
+        self.assertEqual(examples[0]["teacher_judge_decision"], "sufficient")
+        self.assertIn("teacher_judge_scores", examples[0])
+        self.assertGreater(float(examples[0]["sample_weight"]), 1.0)
+        self.assertNotIn("teacher_judge_decision", examples[1])
+        self.assertEqual(persisted[0]["teacher_judge_decision"], "sufficient")
+        self.assertGreater(float(persisted[0]["sample_weight"]), 1.0)
+        self.assertNotIn("teacher_judge_decision", persisted[1])
+
+    def test_main_passes_teacher_judge_topk_frames_per_view(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        verify_example = {
+            "video_id": "prepared_case",
+            "split": "train",
+            "target_action": "tool_call",
+            "tool_name": "verify_hypothesis",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                {"role": "user", "content": [{"type": "text", "text": "user"}]},
+            ],
+            "target_response": (
+                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":'
+                '{"verification_mode":"full_keep_drop","claim":{"existence":"anomaly","category":"assault"},'
+                '"selected_window_ids":["w0001"],"verification_decision":"sufficient","recommended_action":"finalize"}}'
+                "</tool_call>"
+            ),
+        }
+
+        class DummyTeacherJudge:
+            def annotate_example(self, example, *, input_mode=None):
+                updated = dict(example)
+                updated["teacher_judge_scores"] = {"sufficiency": 0.9, "necessity": 0.6}
+                updated["teacher_judge_decision"] = "sufficient"
+                return updated
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prepared_path = root / "prepared.jsonl"
+            prepared_path.write_text(json.dumps(verify_example) + "\n", encoding="utf-8")
+            output_dir = root / "sft_out"
+            argv = [
+                "train_saver_sft.py",
+                "--prepared-data",
+                str(prepared_path),
+                "--output-dir",
+                str(output_dir),
+                "--teacher-judge-model-path",
+                "/models/Qwen3-VL-32B-Instruct",
+                "--teacher-judge-topk-frames-per-view",
+                "3",
+            ]
+
+            with patch.object(sys, "argv", argv), patch.object(
+                train_saver_sft,
+                "run_weighted_sft",
+                return_value={"ok": True},
+            ), patch.object(
+                train_saver_sft.QwenTeacherJudge,
+                "from_pretrained",
+                return_value=DummyTeacherJudge(),
+            ) as mocked_teacher_loader:
+                train_saver_sft.main()
+
+        self.assertEqual(mocked_teacher_loader.call_args.kwargs["topk_frames_per_view"], 3)
+
+    def test_main_does_not_reweight_prepared_teacher_examples_twice(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        prepared_example = {
+            "video_id": "prepared_case",
+            "split": "train",
+            "target_action": "tool_call",
+            "tool_name": "verify_hypothesis",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                {"role": "user", "content": [{"type": "text", "text": "user"}]},
+            ],
+            "target_response": (
+                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":'
+                '{"verification_mode":"full_keep_drop","claim":{"existence":"anomaly","category":"assault"},'
+                '"selected_window_ids":["w0002"],"verification_decision":"insufficient","recommended_action":"continue_search"}}'
+                "</tool_call>"
+            ),
+            "teacher_judge_scores": {
+                "sufficiency": 0.92,
+                "necessity": 0.84,
+                "alertability": 0.61,
+                "counterfactual_faithfulness": 0.88,
+            },
+            "teacher_judge_decision": "insufficient",
+            "teacher_judge_rationale": "Need more evidence.",
+            "teacher_judge_weight_multiplier": 1.5,
+            "teacher_judge_effective_sample_weight": 1.5,
+            "sample_weight": 1.5,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prepared_path = root / "prepared.jsonl"
+            prepared_path.write_text(json.dumps(prepared_example) + "\n", encoding="utf-8")
+            output_dir = root / "sft_out"
+            argv = [
+                "train_saver_sft.py",
+                "--prepared-data",
+                str(prepared_path),
+                "--output-dir",
+                str(output_dir),
+            ]
+
+            with patch.object(
+                sys,
+                "argv",
+                argv,
+            ), patch.object(
+                train_saver_sft,
+                "run_weighted_sft",
+                return_value={"ok": True},
+            ) as mocked_run_weighted_sft:
+                train_saver_sft.main()
+
+        examples = mocked_run_weighted_sft.call_args.args[0]
+        self.assertEqual(float(examples[0]["sample_weight"]), 1.5)
 
     def test_load_jsonl_reports_invalid_line_number(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")

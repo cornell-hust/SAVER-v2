@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from convert_to_saver_agent import CanonicalSaverAdapter, ConverterConfig
 
@@ -10,6 +10,11 @@ from saver_agent.adapter import TimeSearchRolloutAdapter
 from saver_agent.config import SaverAgentConfig
 from saver_agent.environment import SaverEnvironmentState, SaverVideoInteraction
 from saver_agent.reward import ALERT_STATUS_REWARD, DEFAULT_COMPONENT_WEIGHTS, PRIMARY_STATUS_REWARD
+from saver_agent.self_verification import (
+    DECISION_TO_PRIMARY_STATUS,
+    build_policy_self_verification_payload,
+)
+from saver_agent.teacher_judge import compute_teacher_judge_signal
 from saver_agent.verifier import (
     score_alert_counterfactual_group,
     score_evidence_counterfactual_group,
@@ -123,19 +128,19 @@ def _tool_reasoning_text(
         claim = arguments.get("claim") or state.last_claim or {}
         claim_existence = str(claim.get("existence") or structured_target.get("existence") or "current")
         claim_category = str(claim.get("category") or category)
-        candidate_window_ids = list(arguments.get("candidate_window_ids") or [])
-        candidate_evidence_ids = list(arguments.get("candidate_evidence_ids") or arguments.get("evidence_ids") or [])
-        candidate_evidence_moment_ids = list(arguments.get("evidence_moment_ids") or [])
-        if candidate_window_ids:
-            candidate_count = len(candidate_window_ids)
-        elif candidate_evidence_ids:
-            candidate_count = len(candidate_evidence_ids)
-        else:
-            candidate_count = len(candidate_evidence_moment_ids)
-        candidate_phrase = f"{candidate_count} selected evidence item(s)" if candidate_count > 0 else "the currently gathered evidence"
-        return _clip_text(
-            f"I should verify whether {candidate_phrase} are sufficient to support the {claim_existence} claim about {claim_category}, or whether I still need more evidence."
+        selected_window_ids = list(arguments.get("selected_window_ids") or [])
+        selected_evidence_moment_ids = list(
+            arguments.get("selected_evidence_moment_ids")
+            or arguments.get("candidate_evidence_moment_ids")
+            or arguments.get("evidence_moment_ids")
+            or []
         )
+        if selected_window_ids:
+            candidate_count = len(selected_window_ids)
+        else:
+            candidate_count = len(selected_evidence_moment_ids)
+        candidate_phrase = f"{candidate_count} selected evidence item(s)" if candidate_count > 0 else "the currently gathered evidence"
+        return _clip_text(f"I should verify whether {candidate_phrase} are enough for the {claim_existence} claim about {claim_category}.")
 
     if tool_name == "finalize_case":
         existence = str(arguments.get("existence") or structured_target.get("existence") or "unknown")
@@ -181,6 +186,25 @@ def _assistant_answer_response(answer_payload: Dict[str, Any], *, record: Dict[s
     return f"<think>{think_text}</think><answer>{_json_dumps(answer_payload)}</answer>"
 
 
+def _extract_teacher_judge_labels(payload: Dict[str, Any]) -> Dict[str, Any]:
+    labels: Dict[str, Any] = {}
+    for key in ("teacher_judge_scores", "teacher_judge_decision", "teacher_judge_rationale"):
+        if key in payload:
+            labels[key] = copy.deepcopy(payload[key])
+    return labels
+
+
+def _merge_verify_arguments_with_oracle_feedback(
+    arguments: Dict[str, Any],
+    oracle_feedback: Any,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    if not isinstance(oracle_feedback, dict):
+        return build_policy_self_verification_payload(arguments), {}
+    merged_source = copy.deepcopy(arguments)
+    merged_source.update(copy.deepcopy(oracle_feedback))
+    return build_policy_self_verification_payload(merged_source), _extract_teacher_judge_labels(oracle_feedback)
+
+
 def _apply_oracle_verifier_feedback(
     tool_message: Dict[str, Any],
     *,
@@ -193,17 +217,10 @@ def _apply_oracle_verifier_feedback(
         return tool_message
 
     arguments = dict(step.get("arguments") or {})
-    payload = copy.deepcopy(oracle_feedback)
-    payload.setdefault("verification_mode", str(arguments.get("verification_mode") or "reward_only"))
-    payload.setdefault("candidate_window_ids", list(arguments.get("candidate_window_ids") or []))
-    payload.setdefault(
-        "candidate_evidence_ids",
-        list(arguments.get("candidate_evidence_ids") or arguments.get("evidence_ids") or []),
-    )
-    payload.setdefault("candidate_evidence_moment_ids", list(arguments.get("evidence_moment_ids") or []))
-    payload.setdefault("claim", copy.deepcopy(arguments.get("claim") or {}))
-    payload.setdefault("alert", copy.deepcopy(arguments.get("alert") or {}))
-    payload.setdefault("query", str(arguments.get("query") or ""))
+    merged_source = copy.deepcopy(arguments)
+    merged_source.update(copy.deepcopy(oracle_feedback))
+    payload = build_policy_self_verification_payload(merged_source)
+    payload.update(_extract_teacher_judge_labels(oracle_feedback))
     return {
         "role": "tool",
         "name": "verify_hypothesis",
@@ -307,11 +324,15 @@ def _compute_turn_credit(
     evidence_bonus: float,
     finalize_bonus: float,
     invalid_penalty: float,
+    invalid_attempt_count: int = 0,
 ) -> float:
     valid_action = bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"}))
     tool_name = str(turn.get("tool_name") or "")
     step_index = int(turn.get("step_index") or 0)
     turn_credit = 0.0
+
+    if int(invalid_attempt_count) > 0:
+        turn_credit -= abs(float(invalid_penalty)) * float(int(invalid_attempt_count))
 
     if not valid_action:
         turn_credit -= abs(float(invalid_penalty))
@@ -350,6 +371,16 @@ def _compute_turn_level_advantages(
     if not turns:
         return []
 
+    invalid_attempts_by_step: Dict[int, int] = {}
+    for invalid_attempt in list(rollout.get("invalid_attempts") or []):
+        try:
+            step_index = int(invalid_attempt.get("step_index") or 0)
+        except Exception:
+            step_index = 0
+        if step_index <= 0:
+            continue
+        invalid_attempts_by_step[step_index] = invalid_attempts_by_step.get(step_index, 0) + 1
+
     rollout_advantage = float(
         rollout.get("group_advantage", (rollout.get("reward_summary") or {}).get("total_reward", 0.0)) or 0.0
     )
@@ -360,6 +391,7 @@ def _compute_turn_level_advantages(
             evidence_bonus=evidence_bonus,
             finalize_bonus=finalize_bonus,
             invalid_penalty=invalid_penalty,
+            invalid_attempt_count=invalid_attempts_by_step.get(int(turn.get("step_index") or 0), 0),
         )
         for turn in turns
     ]
@@ -440,34 +472,42 @@ def build_oracle_sft_examples(
     for step_index, step in enumerate(trajectory, start=1):
         tool_name = str(step.get("tool") or "")
         arguments = copy.deepcopy(step.get("arguments") or {})
+        response_arguments = copy.deepcopy(arguments)
+        teacher_judge_labels: Dict[str, Any] = {}
+        if tool_name == "verify_hypothesis":
+            response_arguments, teacher_judge_labels = _merge_verify_arguments_with_oracle_feedback(
+                arguments,
+                step.get("oracle_verifier_feedback"),
+            )
         response_text = _assistant_tool_response(
             tool_name,
-            arguments,
+            response_arguments,
             record=record,
             state=state,
         )
-        examples.append(
-            {
-                "video_id": item.get("video_id"),
-                "split": item.get("split"),
-                "step_index": step_index,
-                "source": "oracle_sft",
-                "target_action": "tool_call",
-                "target_response": response_text,
-                "messages": (
-                    _serialize_messages(messages, multimodal_cache=multimodal_cache)
-                    if serialize_messages
-                    else copy.deepcopy(messages)
-                ),
-                "sample_weight": normalized_sample_weight,
-                "tool_name": tool_name,
-                "proposal_supervision": (
-                    _proposal_supervision_for_query(record, arguments.get("query", ""))
-                    if tool_name == "seek_evidence"
-                    else {}
-                ),
-            }
-        )
+        example = {
+            "video_id": item.get("video_id"),
+            "split": item.get("split"),
+            "step_index": step_index,
+            "source": "oracle_sft",
+            "target_action": "tool_call",
+            "target_response": response_text,
+            "messages": (
+                _serialize_messages(messages, multimodal_cache=multimodal_cache)
+                if serialize_messages
+                else copy.deepcopy(messages)
+            ),
+            "sample_weight": normalized_sample_weight,
+            "tool_name": tool_name,
+            "proposal_supervision": (
+                _proposal_supervision_for_query(record, arguments.get("query", ""))
+                if tool_name == "seek_evidence"
+                else {}
+            ),
+        }
+        if teacher_judge_labels:
+            example.update(teacher_judge_labels)
+        examples.append(example)
 
         next_obs, _, _, _, next_states = environment.execute_predictions(
             [response_text],
@@ -504,7 +544,7 @@ def build_oracle_sft_examples(
 
 
 def _coerce_state_from_turn(turn: Dict[str, Any], key: str) -> SaverEnvironmentState:
-    payload = dict(turn.get(key) or {})
+    payload = _sanitize_state_selection_payload(dict(turn.get(key) or {}))
     return SaverEnvironmentState(
         visited_windows=list(payload.get("visited_windows") or []),
         evidence_ledger=list(payload.get("evidence_ledger") or []),
@@ -518,6 +558,55 @@ def _coerce_state_from_turn(turn: Dict[str, Any], key: str) -> SaverEnvironmentS
         next_window_id=int(payload.get("next_window_id") or 1),
         next_alert_id=int(payload.get("next_alert_id") or 1),
     )
+
+
+def _known_evidence_window_ids_from_state_payload(state_payload: Dict[str, Any] | SaverEnvironmentState) -> set[str]:
+    if isinstance(state_payload, SaverEnvironmentState):
+        entries = list(state_payload.evidence_ledger or [])
+    else:
+        entries = list((state_payload or {}).get("evidence_ledger") or [])
+    return {
+        str(entry.get("window_id")).strip()
+        for entry in entries
+        if str(entry.get("window_id") or "").strip()
+    }
+
+
+def _sanitize_window_ids_against_state(
+    window_ids: Sequence[str],
+    *,
+    state_payload: Dict[str, Any] | SaverEnvironmentState,
+) -> List[str]:
+    known_window_ids = _known_evidence_window_ids_from_state_payload(state_payload)
+    sanitized: List[str] = []
+    seen = set()
+    for value in window_ids or []:
+        window_id = str(value).strip()
+        if not window_id or window_id not in known_window_ids or window_id in seen:
+            continue
+        sanitized.append(window_id)
+        seen.add(window_id)
+    return sanitized
+
+
+def _sanitize_state_selection_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(payload or {})
+    sanitized["active_evidence_window_ids"] = _sanitize_window_ids_against_state(
+        sanitized.get("active_evidence_window_ids") or [],
+        state_payload=sanitized,
+    )
+    verification_records = []
+    for record in sanitized.get("verification_records") or []:
+        updated_record = dict(record or {})
+        for key in ("selected_window_ids", "verified_window_ids", "best_effort_window_ids"):
+            if key in updated_record:
+                updated_record[key] = _sanitize_window_ids_against_state(
+                    updated_record.get(key) or [],
+                    state_payload=sanitized,
+                )
+        verification_records.append(updated_record)
+    sanitized["verification_records"] = verification_records
+    return sanitized
 
 
 def _latest_claim_from_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
@@ -575,21 +664,22 @@ def _proposal_metadata_from_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _selected_window_ids_from_turn(turn: Dict[str, Any]) -> List[str]:
+    state_after = _sanitize_state_selection_payload(dict(turn.get("state_after") or {}))
     values = (
         turn.get("selected_window_ids_after")
         or turn.get("verifier_verified_window_ids")
         or turn.get("verifier_best_effort_window_ids")
-        or (turn.get("state_after") or {}).get("active_evidence_window_ids")
+        or state_after.get("active_evidence_window_ids")
         or []
     )
-    return [str(value) for value in values if value]
+    return _sanitize_window_ids_against_state(values, state_payload=state_after)
 
 
 def _selected_evidence_ids_from_turn(turn: Dict[str, Any]) -> List[str]:
     values = turn.get("selected_evidence_ids_after") or []
     if values:
         return [str(value) for value in values if value]
-    state_after = turn.get("state_after") or {}
+    state_after = _sanitize_state_selection_payload(dict(turn.get("state_after") or {}))
     selected_window_ids = set(_selected_window_ids_from_turn(turn))
     evidence_ids: List[str] = []
     for entry in state_after.get("evidence_ledger") or []:
@@ -598,6 +688,585 @@ def _selected_evidence_ids_from_turn(turn: Dict[str, Any]) -> List[str]:
         if window_id in selected_window_ids and evidence_id:
             evidence_ids.append(str(evidence_id))
     return evidence_ids
+
+
+def _clamp_unit_score(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0
+
+
+def _clamp_signed_score(value: Any) -> float:
+    try:
+        return max(-1.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0
+
+
+def _group_relative_advantages_local(records: List[Dict[str, Any]], *, eps: float = 1e-6) -> List[Dict[str, Any]]:
+    if not records:
+        return []
+    rewards = [float(record.get("branch_reward") or 0.0) for record in records]
+    mean_reward = sum(rewards) / float(len(rewards))
+    variance = sum((reward - mean_reward) ** 2 for reward in rewards) / float(len(rewards))
+    std_reward = variance ** 0.5
+    updated: List[Dict[str, Any]] = []
+    for record, reward in zip(records, rewards):
+        local_advantage = 0.0 if std_reward <= eps else (reward - mean_reward) / (std_reward + eps)
+        enriched = dict(record)
+        enriched["local_advantage"] = round(float(local_advantage), 6)
+        enriched["group_reward_mean"] = round(float(mean_reward), 6)
+        enriched["group_reward_std"] = round(float(std_reward), 6)
+        updated.append(enriched)
+    return updated
+
+
+def _selected_window_ids_from_state_payload(state_payload: Dict[str, Any]) -> List[str]:
+    if isinstance(state_payload, SaverEnvironmentState):
+        state_payload = {
+            "evidence_ledger": list(state_payload.evidence_ledger or []),
+            "active_evidence_window_ids": list(state_payload.active_evidence_window_ids or []),
+            "verification_records": list(state_payload.verification_records or []),
+        }
+    state_payload = _sanitize_state_selection_payload(dict(state_payload or {}))
+    active = state_payload.get("active_evidence_window_ids") or []
+    if active:
+        return [str(value) for value in active if value]
+    verification_records = state_payload.get("verification_records") or []
+    if verification_records:
+        latest = verification_records[-1]
+        values = latest.get("verified_window_ids") or latest.get("best_effort_window_ids") or []
+        return [str(value) for value in values if value]
+    return []
+
+
+def _selected_evidence_ids_for_state_payload(
+    state_payload: Dict[str, Any],
+    window_ids: Sequence[str],
+) -> List[str]:
+    if isinstance(state_payload, SaverEnvironmentState):
+        state_payload = {
+            "evidence_ledger": list(state_payload.evidence_ledger or []),
+        }
+    selected = {str(value) for value in window_ids or [] if str(value)}
+    if not selected:
+        return []
+    evidence_ids: List[str] = []
+    for entry in state_payload.get("evidence_ledger") or []:
+        window_id = str(entry.get("window_id") or "")
+        evidence_id = entry.get("evidence_id")
+        if window_id in selected and evidence_id:
+            evidence_ids.append(str(evidence_id))
+    return evidence_ids
+
+
+def _state_clip_ratio_local(state_payload: Dict[str, Any], *, duration_sec: float) -> float:
+    if isinstance(state_payload, SaverEnvironmentState):
+        state_payload = {
+            "visited_windows": list(state_payload.visited_windows or []),
+            "evidence_ledger": list(state_payload.evidence_ledger or []),
+        }
+    if duration_sec <= 1e-8:
+        return 0.0
+    intervals: List[tuple[float, float]] = []
+    entries = list(state_payload.get("visited_windows") or []) or list(state_payload.get("evidence_ledger") or [])
+    for entry in entries:
+        try:
+            start_sec = float(entry.get("start_sec") or 0.0)
+            end_sec = float(entry.get("end_sec") or start_sec)
+        except Exception:
+            continue
+        if end_sec < start_sec:
+            start_sec, end_sec = end_sec, start_sec
+        if end_sec <= start_sec:
+            continue
+        intervals.append((start_sec, end_sec))
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    merged: List[tuple[float, float]] = []
+    current_start, current_end = intervals[0]
+    for start_sec, end_sec in intervals[1:]:
+        if start_sec <= current_end:
+            current_end = max(current_end, end_sec)
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start_sec, end_sec
+    merged.append((current_start, current_end))
+    covered = sum(max(0.0, end_sec - start_sec) for start_sec, end_sec in merged)
+    return min(1.0, max(0.0, covered / float(duration_sec)))
+
+
+def _policy_verification_signal_from_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
+    state_after = turn.get("state_after") or {}
+    latest_record = {}
+    verification_records = state_after.get("verification_records") or []
+    if verification_records:
+        latest_record = dict(verification_records[-1] or {})
+
+    score_payload = (
+        turn.get("self_verification_scores")
+        or latest_record.get("self_verification_scores")
+        or latest_record.get("derived_scores")
+        or turn.get("verifier_derived_scores")
+        or {}
+    )
+    sufficiency = _clamp_unit_score(score_payload.get("sufficiency"))
+    necessity = _clamp_unit_score(score_payload.get("necessity"))
+    alertability = _clamp_unit_score(score_payload.get("alertability"))
+    counterfactual_faithfulness = _clamp_unit_score(score_payload.get("counterfactual_faithfulness"))
+    decision = str(
+        turn.get("self_verification_decision")
+        or latest_record.get("verification_decision")
+        or turn.get("verification_decision")
+        or ""
+    ).strip().lower()
+    primary_status = str(
+        turn.get("verifier_primary_status")
+        or latest_record.get("primary_status")
+        or DECISION_TO_PRIMARY_STATUS.get(decision, "")
+    ).strip().lower()
+    alert_status = str(
+        turn.get("verifier_alert_status")
+        or latest_record.get("alert_status")
+        or "not_applicable"
+    ).strip().lower()
+    teacher_source = dict(turn)
+    teacher_source["self_verification_decision"] = decision
+    teacher_source["self_verification_scores"] = {
+        "sufficiency": sufficiency,
+        "necessity": necessity,
+        "alertability": alertability,
+        "counterfactual_faithfulness": counterfactual_faithfulness,
+    }
+    if latest_record.get("teacher_judge_scores") is not None and teacher_source.get("teacher_judge_scores") is None:
+        teacher_source["teacher_judge_scores"] = copy.deepcopy(latest_record.get("teacher_judge_scores") or {})
+    if latest_record.get("teacher_judge_decision") is not None and teacher_source.get("teacher_judge_decision") is None:
+        teacher_source["teacher_judge_decision"] = latest_record.get("teacher_judge_decision")
+    teacher_signal = compute_teacher_judge_signal(teacher_source)
+    verification_quality = _clamp_signed_score(
+        0.35 * float(PRIMARY_STATUS_REWARD.get(primary_status, 0.0))
+        + 0.20 * (2.0 * sufficiency - 1.0)
+        + 0.15 * (2.0 * necessity - 1.0)
+        + 0.15 * (2.0 * counterfactual_faithfulness - 1.0)
+        + 0.15 * (2.0 * alertability - 1.0)
+    )
+    return {
+        "has_signal": bool(decision or primary_status or score_payload),
+        "decision": decision,
+        "primary_status": primary_status,
+        "alert_status": alert_status,
+        "scores": {
+            "sufficiency": sufficiency,
+            "necessity": necessity,
+            "alertability": alertability,
+            "counterfactual_faithfulness": counterfactual_faithfulness,
+        },
+        "verification_quality": verification_quality,
+        "teacher_signal": teacher_signal,
+        "teacher_reward": _clamp_signed_score(teacher_signal.get("teacher_judge_reward") or 0.0),
+    }
+
+
+def _find_future_verification_turn(turns: List[Dict[str, Any]], *, start_index: int) -> Optional[Dict[str, Any]]:
+    for turn in turns:
+        step_index = int(turn.get("step_index") or 0)
+        if step_index <= int(start_index):
+            continue
+        signal = _policy_verification_signal_from_turn(turn)
+        if signal.get("has_signal"):
+            return turn
+    return None
+
+
+def _alert_timeliness_reward(claim: Dict[str, Any], alert: Dict[str, Any], *, delay_penalty: float) -> float:
+    try:
+        alert_sec = float(alert.get("alert_sec", alert.get("earliest_alert_sec")))
+        earliest_alert_sec = float(claim.get("earliest_alert_sec"))
+    except Exception:
+        return 0.0
+    if alert_sec <= earliest_alert_sec + 0.5:
+        return 1.0
+    return _clamp_signed_score(1.0 - abs(float(delay_penalty)) * max(0.0, alert_sec - earliest_alert_sec))
+
+
+def _build_self_teacher_search_counterfactual_group(
+    rollout: Dict[str, Any],
+    anchor_turn: Dict[str, Any],
+    *,
+    multimodal_cache: Dict[str, Any],
+    search_cost_penalty: float = 0.10,
+) -> List[Dict[str, Any]]:
+    state_before = dict(anchor_turn.get("state_before") or {})
+    state_after = dict(anchor_turn.get("state_after") or {})
+    current_signal = _policy_verification_signal_from_turn(anchor_turn)
+    duration_sec = float(multimodal_cache.get("duration") or 0.0)
+    state_delta = anchor_turn.get("state_delta") or {}
+    new_evidence_windows = list(state_delta.get("new_evidence_windows") or [])
+    new_visited_windows = list(state_delta.get("new_visited_windows") or [])
+    new_window_ids = {
+        str(entry.get("window_id") or "")
+        for entry in (new_evidence_windows or new_visited_windows)
+        if entry.get("window_id")
+    }
+    current_selected_window_ids = set(_selected_window_ids_from_turn(anchor_turn)) or set(new_window_ids)
+    before_selected_window_ids = set(anchor_turn.get("selected_window_ids_before") or [])
+    selected_overlap_den = len(current_selected_window_ids) or len(new_window_ids) or 1
+    selected_overlap = float(len(new_window_ids & current_selected_window_ids)) / float(selected_overlap_den)
+    new_evidence_gain = min(1.0, float(len(anchor_turn.get("new_evidence_ids") or [])))
+    current_support = 1.0 if current_selected_window_ids else 0.0
+    preexisting_support = 1.0 if before_selected_window_ids else 0.0
+    proposal_backend = str(anchor_turn.get("proposal_backend") or "")
+    proposal_quality_bonus = 0.10 if proposal_backend == "feature_topk" else 0.0
+    coverage_gain = max(
+        0.0,
+        _state_clip_ratio_local(state_after, duration_sec=duration_sec)
+        - _state_clip_ratio_local(state_before, duration_sec=duration_sec),
+    )
+    use_search_reward = _clamp_signed_score(
+        0.35 * float(current_support)
+        + 0.25 * float(new_evidence_gain)
+        + 0.15 * float(selected_overlap)
+        + 0.10 * float(current_signal.get("verification_quality") or 0.0)
+        + 0.05 * float(current_signal.get("teacher_reward") or 0.0)
+        + proposal_quality_bonus
+        - abs(float(search_cost_penalty)) * float(coverage_gain)
+    )
+    skip_search_reward = _clamp_signed_score(
+        0.55 * float(preexisting_support)
+        - 0.20 * float(current_support)
+        - 0.15 * float(new_evidence_gain)
+        - 0.15 * float(selected_overlap)
+        - 0.05 * proposal_quality_bonus
+    )
+    delta_only_reward = _clamp_signed_score(
+        0.30 * float(current_support)
+        + 0.35 * float(new_evidence_gain)
+        + 0.20 * float(selected_overlap)
+        + 0.05 * float(current_signal.get("teacher_reward") or 0.0)
+        - 0.05 * abs(float(search_cost_penalty)) * float(coverage_gain)
+    )
+    records = [
+        {
+            "group_kind": "search",
+            "branch_type": "skip_search",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(before_selected_window_ids),
+            "selected_evidence_ids": _selected_evidence_ids_for_state_payload(state_before, list(before_selected_window_ids)),
+            "branch_reward": skip_search_reward,
+            "branch_reward_components": {
+                "preexisting_support": round(float(preexisting_support), 6),
+                "current_support_penalty": round(-float(current_support), 6),
+                "new_evidence_penalty": round(-float(new_evidence_gain), 6),
+                "selected_overlap_penalty": round(-float(selected_overlap), 6),
+            },
+        },
+        {
+            "group_kind": "search",
+            "branch_type": "use_search",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(current_selected_window_ids or new_window_ids),
+            "selected_evidence_ids": _selected_evidence_ids_from_turn(anchor_turn) or list(anchor_turn.get("new_evidence_ids") or []),
+            "branch_reward": use_search_reward,
+            "branch_reward_components": {
+                "current_support": round(float(current_support), 6),
+                "selected_overlap": round(float(selected_overlap), 6),
+                "new_evidence_gain": round(float(new_evidence_gain), 6),
+                "coverage_gain": round(float(coverage_gain), 6),
+                "verification_quality": round(float(current_signal.get("verification_quality") or 0.0), 6),
+                "teacher_reward": round(float(current_signal.get("teacher_reward") or 0.0), 6),
+                "proposal_quality_bonus": round(float(proposal_quality_bonus), 6),
+            },
+        },
+        {
+            "group_kind": "search",
+            "branch_type": "delta_only",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(new_window_ids),
+            "selected_evidence_ids": list(anchor_turn.get("new_evidence_ids") or []),
+            "branch_reward": delta_only_reward,
+            "branch_reward_components": {
+                "current_support": round(float(current_support), 6),
+                "marginal_overlap": round(max(float(selected_overlap), float(new_evidence_gain)), 6),
+                "coverage_gain": round(float(coverage_gain), 6),
+                "teacher_reward": round(float(current_signal.get("teacher_reward") or 0.0), 6),
+            },
+        },
+    ]
+    return _group_relative_advantages_local(records)
+
+
+def _alert_claim_consistency_reward_local(claim: Dict[str, Any], alert: Dict[str, Any]) -> float:
+    claim_existence = str(claim.get("existence") or "").strip().lower()
+    decision = str(alert.get("decision") or "").strip().lower()
+    if claim_existence == "anomaly":
+        if decision in {"soft_alert", "hard_alert"}:
+            return 1.0
+        if decision == "declare_normal":
+            return -1.0
+        return -0.25
+    if claim_existence == "normal":
+        if decision == "declare_normal":
+            return 1.0
+        if decision in {"soft_alert", "hard_alert"}:
+            return -1.0
+        return 0.25
+    return 0.0
+
+
+def _build_self_teacher_alert_counterfactual_group(
+    anchor_turn: Dict[str, Any],
+    *,
+    delay_penalty: float = 0.10,
+) -> List[Dict[str, Any]]:
+    if str(anchor_turn.get("tool_name") or "") != "emit_alert":
+        return []
+    signal = _policy_verification_signal_from_turn(anchor_turn)
+    claim = _latest_claim_from_turn(anchor_turn)
+    alert = _latest_alert_from_turn(anchor_turn)
+    if not claim or not alert:
+        return []
+
+    state_before = dict(anchor_turn.get("state_before") or {})
+    state_after = dict(anchor_turn.get("state_after") or {})
+    before_selected_window_ids = _selected_window_ids_from_state_payload(state_before)
+    selected_window_ids = _selected_window_ids_from_turn(anchor_turn) or _selected_window_ids_from_state_payload(state_after)
+    selected_evidence_ids = _selected_evidence_ids_from_turn(anchor_turn) or _selected_evidence_ids_for_state_payload(
+        state_after,
+        selected_window_ids,
+    )
+    alertability = float((signal.get("scores") or {}).get("alertability") or 0.0)
+    timeliness_reward = _alert_timeliness_reward(claim, alert, delay_penalty=delay_penalty)
+    consistency_reward = _alert_claim_consistency_reward_local(claim, alert)
+    claim_existence = str(claim.get("existence") or "").strip().lower()
+    hold_reward = 0.75 if claim_existence == "normal" else (-0.65 if claim_existence == "anomaly" else 0.0)
+
+    alert_now_reward = _clamp_signed_score(
+        0.40 * float(consistency_reward)
+        + 0.25 * float(timeliness_reward)
+        + 0.15 * float(signal.get("verification_quality") or 0.0)
+        + 0.10 * (2.0 * alertability - 1.0)
+        + 0.10 * float(signal.get("teacher_reward") or 0.0)
+    )
+    hold_alert_reward = _clamp_signed_score(
+        0.55 * float(hold_reward)
+        - 0.20 * float(consistency_reward)
+        - 0.15 * float(timeliness_reward if claim_existence == "anomaly" else 0.0)
+        - 0.10 * float(signal.get("verification_quality") or 0.0)
+    )
+    records = [
+        {
+            "group_kind": "alert",
+            "branch_type": "alert_now",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(selected_window_ids),
+            "selected_evidence_ids": list(selected_evidence_ids),
+            "synthetic_alert": dict(alert),
+            "branch_reward": alert_now_reward,
+            "branch_reward_components": {
+                "claim_alert_consistency": round(float(consistency_reward), 6),
+                "timeliness_reward": round(float(timeliness_reward), 6),
+                "verification_quality": round(float(signal.get("verification_quality") or 0.0), 6),
+                "alertability": round(float(alertability), 6),
+                "teacher_reward": round(float(signal.get("teacher_reward") or 0.0), 6),
+            },
+            "primary_status": signal.get("primary_status"),
+            "alert_status": signal.get("alert_status"),
+        },
+        {
+            "group_kind": "alert",
+            "branch_type": "hold_alert",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(before_selected_window_ids),
+            "selected_evidence_ids": _selected_evidence_ids_for_state_payload(state_before, before_selected_window_ids),
+            "synthetic_alert": {},
+            "branch_reward": hold_alert_reward,
+            "branch_reward_components": {
+                "hold_reward": round(float(hold_reward), 6),
+                "consistency_penalty": round(-float(consistency_reward), 6),
+                "timeliness_penalty": round(-float(timeliness_reward if claim_existence == "anomaly" else 0.0), 6),
+                "verification_quality_penalty": round(-float(signal.get("verification_quality") or 0.0), 6),
+            },
+            "primary_status": signal.get("primary_status"),
+            "alert_status": signal.get("alert_status"),
+        },
+    ]
+    return _group_relative_advantages_local(records)
+
+
+def _choose_minimal_subset_window_ids_local(
+    state_payload: Dict[str, Any],
+    selected_window_ids: Sequence[str],
+    *,
+    subset_size: int = 2,
+) -> List[str]:
+    entries = [
+        entry
+        for entry in state_payload.get("evidence_ledger") or []
+        if str(entry.get("window_id") or "") in {str(value) for value in selected_window_ids or []}
+    ]
+    if not entries:
+        return []
+    role_priority = {
+        "trigger": 0,
+        "peak_action": 1,
+        "peak": 1,
+        "precursor": 2,
+        "confirmation": 3,
+        "aftermath": 3,
+        "": 4,
+        "none": 4,
+        None: 4,
+    }
+    ordered = sorted(
+        entries,
+        key=lambda entry: (
+            role_priority.get(str(entry.get("role") or "").lower(), 4),
+            -float(entry.get("end_sec") or 0.0),
+            str(entry.get("window_id") or ""),
+        ),
+    )
+    keep = max(1, min(int(subset_size), len(ordered)))
+    return [str(entry.get("window_id")) for entry in ordered[:keep] if entry.get("window_id")]
+
+
+def _build_self_teacher_evidence_counterfactual_group(
+    rollout: Dict[str, Any],
+    anchor_turn: Dict[str, Any],
+    *,
+    subset_size_penalty: float = 0.10,
+) -> List[Dict[str, Any]]:
+    signal_turn = anchor_turn
+    signal = _policy_verification_signal_from_turn(signal_turn)
+    if not signal.get("has_signal"):
+        return []
+    state_payload = dict(anchor_turn.get("state_after") or {})
+    full_window_ids = [str(entry.get("window_id") or "") for entry in state_payload.get("evidence_ledger") or [] if entry.get("window_id")]
+    keep_window_ids = [str(value) for value in _selected_window_ids_from_turn(anchor_turn) if value]
+    drop_window_ids = [window_id for window_id in full_window_ids if window_id not in set(keep_window_ids)]
+    minimal_window_ids = _choose_minimal_subset_window_ids_local(state_payload, keep_window_ids)
+    full_ledger_size = max(1, len(full_window_ids))
+    keep_ratio = float(len(keep_window_ids)) / float(full_ledger_size)
+    minimal_ratio = float(len(minimal_window_ids)) / float(full_ledger_size) if minimal_window_ids else 0.0
+    scores = signal.get("scores") or {}
+    sufficiency = float(scores.get("sufficiency") or 0.0)
+    necessity = float(scores.get("necessity") or 0.0)
+    counterfactual_faithfulness = float(scores.get("counterfactual_faithfulness") or 0.0)
+    signed_sufficiency = 2.0 * sufficiency - 1.0
+    signed_necessity = 2.0 * necessity - 1.0
+    signed_counterfactual = 2.0 * counterfactual_faithfulness - 1.0
+    decision = str(signal.get("decision") or "")
+    keep_reward = _clamp_signed_score(
+        0.45 * float(signal.get("verification_quality") or 0.0)
+        + 0.20 * signed_sufficiency
+        + 0.20 * signed_necessity
+        + 0.10 * signed_counterfactual
+        + 0.05 * float(signal.get("teacher_reward") or 0.0)
+        - 0.25 * abs(float(subset_size_penalty)) * keep_ratio
+    )
+    full_reward = _clamp_signed_score(
+        0.35 * float(signal.get("verification_quality") or 0.0)
+        + 0.20 * signed_sufficiency
+        - 0.20 * signed_necessity
+        + 0.10 * signed_counterfactual
+        - abs(float(subset_size_penalty))
+    )
+    drop_reward = _clamp_signed_score(
+        -0.45 * signed_sufficiency
+        - 0.20 * float(signal.get("verification_quality") or 0.0)
+        + 0.20 * (1.0 if decision in {"misaligned", "redundant"} else -0.5)
+        - 0.05 * float(signal.get("teacher_reward") or 0.0)
+    )
+    minimal_reward = _clamp_signed_score(
+        0.35 * float(signal.get("verification_quality") or 0.0)
+        + 0.20 * signed_sufficiency
+        + 0.30 * signed_necessity
+        + 0.10 * signed_counterfactual
+        + 0.05 * float(signal.get("teacher_reward") or 0.0)
+        - abs(float(subset_size_penalty)) * minimal_ratio
+    )
+    if not keep_window_ids:
+        full_reward = _clamp_signed_score(full_reward + 0.35)
+        keep_reward = _clamp_signed_score(keep_reward - 0.35)
+        minimal_reward = _clamp_signed_score(minimal_reward - 0.25)
+    elif decision == "redundant":
+        minimal_reward = _clamp_signed_score(minimal_reward + 0.15)
+        full_reward = _clamp_signed_score(full_reward - 0.15)
+    records = [
+        {
+            "group_kind": "evidence",
+            "branch_type": "full_ledger",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(signal_turn.get("step_index") or anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(full_window_ids),
+            "selected_evidence_ids": _selected_evidence_ids_for_state_payload(state_payload, full_window_ids),
+            "branch_reward": full_reward,
+            "branch_reward_components": {
+                "verification_quality": round(float(signal.get("verification_quality") or 0.0), 6),
+                "sufficiency": round(sufficiency, 6),
+                "necessity_penalty": round(-signed_necessity, 6),
+            },
+            "primary_status": signal.get("primary_status"),
+            "alert_status": signal.get("alert_status"),
+        },
+        {
+            "group_kind": "evidence",
+            "branch_type": "keep_selected",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(signal_turn.get("step_index") or anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(keep_window_ids),
+            "selected_evidence_ids": _selected_evidence_ids_for_state_payload(state_payload, keep_window_ids),
+            "branch_reward": keep_reward,
+            "branch_reward_components": {
+                "verification_quality": round(float(signal.get("verification_quality") or 0.0), 6),
+                "sufficiency": round(sufficiency, 6),
+                "necessity": round(necessity, 6),
+                "teacher_reward": round(float(signal.get("teacher_reward") or 0.0), 6),
+            },
+            "primary_status": signal.get("primary_status"),
+            "alert_status": signal.get("alert_status"),
+        },
+        {
+            "group_kind": "evidence",
+            "branch_type": "drop_selected",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(signal_turn.get("step_index") or anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(drop_window_ids),
+            "selected_evidence_ids": _selected_evidence_ids_for_state_payload(state_payload, drop_window_ids),
+            "branch_reward": drop_reward,
+            "branch_reward_components": {
+                "drop_bonus": round(1.0 if decision in {"misaligned", "redundant"} else -0.5, 6),
+                "sufficiency_penalty": round(-signed_sufficiency, 6),
+                "verification_quality": round(float(signal.get("verification_quality") or 0.0), 6),
+            },
+            "primary_status": signal.get("primary_status"),
+            "alert_status": signal.get("alert_status"),
+        },
+        {
+            "group_kind": "evidence",
+            "branch_type": "minimal_subset",
+            "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn_index": int(signal_turn.get("step_index") or anchor_turn.get("step_index") or 0),
+            "selected_window_ids": list(minimal_window_ids),
+            "selected_evidence_ids": _selected_evidence_ids_for_state_payload(state_payload, minimal_window_ids),
+            "branch_reward": minimal_reward,
+            "branch_reward_components": {
+                "verification_quality": round(float(signal.get("verification_quality") or 0.0), 6),
+                "sufficiency": round(sufficiency, 6),
+                "necessity": round(necessity, 6),
+                "compactness_bonus": round(signed_necessity, 6),
+            },
+            "primary_status": signal.get("primary_status"),
+            "alert_status": signal.get("alert_status"),
+        },
+    ]
+    return _group_relative_advantages_local(records)
 
 
 def _extract_alert_anchors(turns: List[Dict[str, Any]], *, max_anchors: int) -> List[Dict[str, Any]]:
@@ -634,13 +1303,12 @@ def _extract_search_anchors(turns: List[Dict[str, Any]], *, max_anchors: int) ->
     anchors: List[Dict[str, Any]] = []
     for turn in turns:
         tool_name = str(turn.get("tool_name") or "")
-        tags = set(turn.get("counterfactual_anchor_tags") or [])
-        new_visited_windows = ((turn.get("state_delta") or {}).get("new_visited_windows") or [])
-        if (
-            "search_anchor" in tags
-            or tool_name in {"scan_timeline", "seek_evidence"}
-        ) and (
+        state_delta = turn.get("state_delta") or {}
+        new_evidence_windows = list(state_delta.get("new_evidence_windows") or [])
+        new_visited_windows = list(state_delta.get("new_visited_windows") or [])
+        if tool_name == "seek_evidence" and (
             turn.get("new_evidence_ids")
+            or new_evidence_windows
             or new_visited_windows
         ):
             anchors.append(turn)
@@ -680,6 +1348,16 @@ def _build_search_counterfactual_group(
     local_verifier_backend: str,
     local_use_reference_supervision: bool,
 ) -> List[Dict[str, Any]]:
+    if str(local_verifier_backend or "").strip().lower() == "self_teacher":
+        records = _build_self_teacher_search_counterfactual_group(
+            rollout,
+            anchor_turn,
+            multimodal_cache=multimodal_cache,
+        )
+        group_id = f"{rollout.get('video_id', 'unknown')}:search:{int(anchor_turn.get('step_index') or 0)}"
+        for record in records:
+            record["group_id"] = group_id
+        return records
     turns = list(rollout.get("turns") or [])
     target_turn = _find_future_claim_turn(turns, int(anchor_turn.get("step_index") or 0)) or anchor_turn
     claim = _latest_claim_from_turn(target_turn) or _latest_claim_from_turn(anchor_turn)
@@ -708,6 +1386,12 @@ def _build_alert_counterfactual_group(
     local_verifier_backend: str,
     local_use_reference_supervision: bool,
 ) -> List[Dict[str, Any]]:
+    if str(local_verifier_backend or "").strip().lower() == "self_teacher":
+        records = _build_self_teacher_alert_counterfactual_group(anchor_turn)
+        group_id = f"{rollout.get('video_id', 'unknown')}:alert:{int(anchor_turn.get('step_index') or 0)}"
+        for record in records:
+            record["group_id"] = group_id
+        return records
     turns = list(rollout.get("turns") or [])
     next_decision_turn = _find_next_decision_turn(turns, int(anchor_turn.get("step_index") or 0))
     final_turn = turns[-1] if turns else anchor_turn
@@ -725,6 +1409,7 @@ def _build_alert_counterfactual_group(
             "branch_type": "alert_now",
             "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
             "source_turn_index": int(anchor_turn.get("step_index") or 0),
+            "source_turn": anchor_turn,
             "state": _coerce_state_from_turn(anchor_turn, "state_after"),
             "claim": claim_now,
             "alert": latest_alert_now,
@@ -736,6 +1421,7 @@ def _build_alert_counterfactual_group(
                 "branch_type": "defer_to_next_decision",
                 "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
                 "source_turn_index": int(next_decision_turn.get("step_index") or 0),
+                "source_turn": next_decision_turn,
                 "state": _coerce_state_from_turn(next_decision_turn, "state_after"),
                 "claim": _latest_claim_from_turn(next_decision_turn) or claim_now,
                 "alert": _latest_alert_from_turn(next_decision_turn)
@@ -753,6 +1439,7 @@ def _build_alert_counterfactual_group(
                 "branch_type": "defer_to_next_decision",
                 "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
                 "source_turn_index": int(anchor_turn.get("step_index") or 0),
+                "source_turn": anchor_turn,
                 "state": _coerce_state_from_turn(anchor_turn, "state_after"),
                 "claim": claim_now,
                 "alert": latest_alert_now,
@@ -763,6 +1450,7 @@ def _build_alert_counterfactual_group(
             "branch_type": "defer_to_final",
             "anchor_turn_index": int(anchor_turn.get("step_index") or 0),
             "source_turn_index": int(final_turn.get("step_index") or 0),
+            "source_turn": final_turn,
             "state": _coerce_state_from_turn(final_turn, "state_after"),
             "claim": _latest_claim_from_turn(final_turn) or claim_now,
             "alert": _latest_alert_from_turn(final_turn)
@@ -794,6 +1482,15 @@ def _build_evidence_counterfactual_group(
     local_verifier_backend: str,
     local_use_reference_supervision: bool,
 ) -> List[Dict[str, Any]]:
+    if str(local_verifier_backend or "").strip().lower() == "self_teacher":
+        records = _build_self_teacher_evidence_counterfactual_group(
+            rollout,
+            anchor_turn,
+        )
+        group_id = f"{rollout.get('video_id', 'unknown')}:evidence:{int(anchor_turn.get('step_index') or 0)}"
+        for record in records:
+            record["group_id"] = group_id
+        return records
     selected_window_ids = _selected_window_ids_from_turn(anchor_turn)
     records = score_evidence_counterfactual_group(
         state=_coerce_state_from_turn(anchor_turn, "state_after"),
@@ -818,14 +1515,15 @@ def _turn_component_weights(
     alert_local_alpha: float,
     evidence_local_alpha: float,
     evidence_hit: bool = False,
+    teacher_present: bool = False,
 ) -> Dict[str, float]:
     del search_local_alpha
     del alert_local_alpha
     del evidence_local_alpha
     tool_name = str(turn.get("tool_name") or "")
     action = str(turn.get("action") or "")
-    weights = {"global": 1.0, "search_local": 0.0, "alert_local": 0.0, "evidence_local": 0.0}
-    if tool_name in {"scan_timeline", "seek_evidence"}:
+    weights = {"global": 1.0, "search_local": 0.0, "alert_local": 0.0, "evidence_local": 0.0, "teacher_local": 0.0}
+    if tool_name == "seek_evidence":
         weights["search_local"] = 1.0
     if tool_name == "emit_alert":
         weights["alert_local"] = 1.0
@@ -833,6 +1531,8 @@ def _turn_component_weights(
     elif tool_name == "verify_hypothesis":
         weights["alert_local"] = 0.5
         weights["evidence_local"] = 1.0
+        if teacher_present:
+            weights["teacher_local"] = 1.0
     elif tool_name == "finalize_case":
         weights["alert_local"] = 0.25
         weights["evidence_local"] = 1.0
@@ -857,11 +1557,12 @@ def build_counterfactual_grpo_examples(
     turn_evidence_bonus: float = 0.1,
     turn_finalize_bonus: float = 0.2,
     turn_invalid_penalty: float = 0.75,
-    local_verifier_backend: str = "heuristic",
+    local_verifier_backend: str = "self_teacher",
     local_use_reference_supervision: bool = False,
     search_local_alpha: float = 0.5,
     alert_local_alpha: float = 0.5,
     evidence_local_alpha: float = 0.5,
+    teacher_local_alpha: float = 0.5,
     max_search_anchors: int = 2,
     max_alert_anchors: int = 2,
     max_evidence_anchors: int = 2,
@@ -893,7 +1594,18 @@ def build_counterfactual_grpo_examples(
     search_local_by_turn = {int(turn.get("step_index") or 0): 0.0 for turn in turns}
     alert_local_by_turn = {int(turn.get("step_index") or 0): 0.0 for turn in turns}
     evidence_local_by_turn = {int(turn.get("step_index") or 0): 0.0 for turn in turns}
+    teacher_local_by_turn = {int(turn.get("step_index") or 0): 0.0 for turn in turns}
     group_ids_by_turn = {int(turn.get("step_index") or 0): [] for turn in turns}
+    teacher_signal_by_turn: Dict[int, Dict[str, Any]] = {}
+
+    for turn in turns:
+        turn_index = int(turn.get("step_index") or 0)
+        teacher_signal = compute_teacher_judge_signal(turn)
+        teacher_signal_by_turn[turn_index] = teacher_signal
+        if teacher_signal.get("teacher_judge_present"):
+            teacher_local_by_turn[turn_index] = float(teacher_local_alpha) * float(
+                teacher_signal.get("teacher_judge_reward") or 0.0
+            )
 
     if enable_search_group:
         for anchor_turn in _extract_search_anchors(turns, max_anchors=max_search_anchors):
@@ -985,6 +1697,8 @@ def build_counterfactual_grpo_examples(
         search_local = float(search_local_by_turn.get(step_index, 0.0))
         alert_local = float(alert_local_by_turn.get(step_index, 0.0))
         evidence_local = float(evidence_local_by_turn.get(step_index, 0.0))
+        teacher_local = float(teacher_local_by_turn.get(step_index, 0.0))
+        teacher_signal = teacher_signal_by_turn.get(step_index, {})
         evidence_hit = bool(turn.get("new_evidence_ids")) and evidence_local != 0.0
         turn_component_weights = _turn_component_weights(
             turn,
@@ -992,50 +1706,63 @@ def build_counterfactual_grpo_examples(
             alert_local_alpha=alert_local_alpha,
             evidence_local_alpha=evidence_local_alpha,
             evidence_hit=evidence_hit,
+            teacher_present=bool(teacher_signal.get("teacher_judge_present")),
         )
         total_advantage = (
             float(turn_component_weights["global"]) * global_advantage
             + float(turn_component_weights["search_local"]) * search_local
             + float(turn_component_weights["alert_local"]) * alert_local
             + float(turn_component_weights["evidence_local"]) * evidence_local
+            + float(turn_component_weights["teacher_local"]) * teacher_local
         )
-        examples.append(
-            {
-                "video_id": item.get("video_id"),
-                "split": item.get("split"),
-                "step_index": step_index,
-                "source": "counterfactual_grpo_rollout",
-                "target_action": turn.get("action"),
-                "target_response": response_text,
-                "messages": (
-                    _serialize_messages(messages, multimodal_cache=multimodal_cache)
-                    if serialize_messages
-                    else copy.deepcopy(messages)
-                ),
-                "sample_weight": max(float(total_advantage), 0.0),
-                "advantage": float(total_advantage),
-                "rollout_advantage": float(global_advantage),
-                "advantage_components": {
-                    "global": float(global_advantage),
-                    "search_local": float(search_local),
-                    "alert_local": float(alert_local),
-                    "evidence_local": float(evidence_local),
-                },
-                "turn_component_weights": turn_component_weights,
-                "counterfactual_group_ids": [group_id for group_id in group_ids_by_turn.get(step_index, []) if group_id],
-                "counterfactual_anchor_kind": list(turn.get("counterfactual_anchor_tags") or []),
-                "counterfactual_anchor_turn_index": int(step_index),
-                "counterfactual_metadata": {
-                    "actual_search_branch": turn.get("counterfactual_actual_search_branch"),
-                    "actual_alert_branch": turn.get("counterfactual_actual_alert_branch"),
-                    "actual_evidence_branch": turn.get("counterfactual_actual_evidence_branch"),
-                    "selected_window_ids": _selected_window_ids_from_turn(turn),
-                    "selected_evidence_ids": _selected_evidence_ids_from_turn(turn),
-                },
-                "tool_name": turn.get("tool_name"),
-                "proposal_metadata": _proposal_metadata_from_turn(turn),
-            }
-        )
+        example = {
+            "video_id": item.get("video_id"),
+            "split": item.get("split"),
+            "step_index": step_index,
+            "source": "counterfactual_grpo_rollout",
+            "target_action": turn.get("action"),
+            "target_response": response_text,
+            "messages": (
+                _serialize_messages(messages, multimodal_cache=multimodal_cache)
+                if serialize_messages
+                else copy.deepcopy(messages)
+            ),
+            "sample_weight": max(float(total_advantage), 0.0),
+            "advantage": float(total_advantage),
+            "rollout_advantage": float(global_advantage),
+            "advantage_components": {
+                "global": float(global_advantage),
+                "search_local": float(search_local),
+                "alert_local": float(alert_local),
+                "evidence_local": float(evidence_local),
+                "teacher_local": float(teacher_local),
+            },
+            "turn_component_weights": turn_component_weights,
+            "counterfactual_group_ids": [group_id for group_id in group_ids_by_turn.get(step_index, []) if group_id],
+            "counterfactual_anchor_kind": list(turn.get("counterfactual_anchor_tags") or []),
+            "counterfactual_anchor_turn_index": int(step_index),
+            "counterfactual_metadata": {
+                "actual_search_branch": turn.get("counterfactual_actual_search_branch"),
+                "actual_alert_branch": turn.get("counterfactual_actual_alert_branch"),
+                "actual_evidence_branch": turn.get("counterfactual_actual_evidence_branch"),
+                "selected_window_ids": _selected_window_ids_from_turn(turn),
+                "selected_evidence_ids": _selected_evidence_ids_from_turn(turn),
+            },
+            "tool_name": turn.get("tool_name"),
+            "proposal_metadata": _proposal_metadata_from_turn(turn),
+            "teacher_judge_present": bool(teacher_signal.get("teacher_judge_present")),
+            "teacher_judge_alignment": teacher_signal.get("teacher_judge_alignment"),
+            "teacher_judge_score_agreement": float(teacher_signal.get("teacher_judge_score_agreement") or 0.0),
+            "teacher_judge_confidence": float(teacher_signal.get("teacher_judge_confidence") or 0.0),
+            "teacher_judge_reward": float(teacher_signal.get("teacher_judge_reward") or 0.0),
+        }
+        if "teacher_judge_scores" in turn:
+            example["teacher_judge_scores"] = copy.deepcopy(turn.get("teacher_judge_scores") or {})
+        if turn.get("teacher_judge_decision") is not None:
+            example["teacher_judge_decision"] = turn.get("teacher_judge_decision")
+        if turn.get("teacher_judge_rationale") is not None:
+            example["teacher_judge_rationale"] = turn.get("teacher_judge_rationale")
+        examples.append(example)
 
         next_obs, _, _, _, next_states = environment.execute_predictions(
             [response_text],
@@ -1088,6 +1815,7 @@ def build_reward_weighted_examples(
         if not response_text:
             continue
         valid_action = bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"}))
+        teacher_signal = compute_teacher_judge_signal(turn)
         turn_advantage_info = (
             turn_advantages[step_index - 1]
             if step_index - 1 < len(turn_advantages)
@@ -1099,32 +1827,44 @@ def build_reward_weighted_examples(
             }
         )
         if include_invalid or valid_action:
-            examples.append(
-                {
-                    "video_id": item.get("video_id"),
-                    "split": item.get("split"),
-                    "step_index": step_index,
-                    "source": "reward_weighted_rollout",
-                    "target_action": turn.get("action"),
-                    "target_response": response_text,
-                    "messages": (
-                        _serialize_messages(messages, multimodal_cache=multimodal_cache)
-                        if serialize_messages
-                        else copy.deepcopy(messages)
-                    ),
-                    "sample_weight": float(turn_advantage_info["advantage"]),
-                    "advantage": float(turn_advantage_info["advantage"]),
-                    "rollout_advantage": float(turn_advantage_info["rollout_advantage"]),
-                    "advantage_metadata": {
-                        "turn_credit": float(turn_advantage_info["turn_credit"]),
-                        "discounted_return": float(turn_advantage_info["discounted_return"]),
-                        "gamma": float(turn_advantage_gamma),
-                        "alpha": float(turn_advantage_alpha),
-                    },
-                    "tool_name": turn.get("tool_name"),
-                    "proposal_metadata": _proposal_metadata_from_turn(turn),
-                }
-            )
+            example = {
+                "video_id": item.get("video_id"),
+                "split": item.get("split"),
+                "step_index": step_index,
+                "source": "reward_weighted_rollout",
+                "target_action": turn.get("action"),
+                "target_response": response_text,
+                "messages": (
+                    _serialize_messages(messages, multimodal_cache=multimodal_cache)
+                    if serialize_messages
+                    else copy.deepcopy(messages)
+                ),
+                "sample_weight": float(turn_advantage_info["advantage"]),
+                "advantage": float(turn_advantage_info["advantage"]),
+                "rollout_advantage": float(turn_advantage_info["rollout_advantage"]),
+                "advantage_metadata": {
+                    "turn_credit": float(turn_advantage_info["turn_credit"]),
+                    "discounted_return": float(turn_advantage_info["discounted_return"]),
+                    "gamma": float(turn_advantage_gamma),
+                    "alpha": float(turn_advantage_alpha),
+                    "teacher_judge_reward": float(teacher_signal.get("teacher_judge_reward") or 0.0),
+                    "teacher_judge_alignment": teacher_signal.get("teacher_judge_alignment"),
+                },
+                "tool_name": turn.get("tool_name"),
+                "proposal_metadata": _proposal_metadata_from_turn(turn),
+                "teacher_judge_present": bool(teacher_signal.get("teacher_judge_present")),
+                "teacher_judge_alignment": teacher_signal.get("teacher_judge_alignment"),
+                "teacher_judge_score_agreement": float(teacher_signal.get("teacher_judge_score_agreement") or 0.0),
+                "teacher_judge_confidence": float(teacher_signal.get("teacher_judge_confidence") or 0.0),
+                "teacher_judge_reward": float(teacher_signal.get("teacher_judge_reward") or 0.0),
+            }
+            if "teacher_judge_scores" in turn:
+                example["teacher_judge_scores"] = copy.deepcopy(turn.get("teacher_judge_scores") or {})
+            if turn.get("teacher_judge_decision") is not None:
+                example["teacher_judge_decision"] = turn.get("teacher_judge_decision")
+            if turn.get("teacher_judge_rationale") is not None:
+                example["teacher_judge_rationale"] = turn.get("teacher_judge_rationale")
+            examples.append(example)
 
         next_obs, _, _, _, next_states = environment.execute_predictions(
             [response_text],

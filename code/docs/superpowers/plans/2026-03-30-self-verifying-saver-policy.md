@@ -4,9 +4,9 @@
 
 **Goal:** Train SAVER as a single self-verifying policy that learns counterfactual evidence and alert verification during SFT and RL, so inference no longer depends on an external verifier model.
 
-**Architecture:** Replace the current external `verify_hypothesis -> verifier backend -> recommended_action` control loop with an internalized self-verification loop. The policy still emits a `verify_hypothesis` tool call, but the tool becomes a lightweight recorder/executor of the policy's own structured verification output instead of calling an external heuristic/Qwen verifier. Training uses oracle verifier supervision in SFT and optional teacher-judge distillation / reward calibration in RL.
+**Architecture:** Replace the current external `verify_hypothesis -> verifier backend -> recommended_action` control loop with an internalized self-verification loop. The policy still emits a `verify_hypothesis` tool call, but the tool becomes a lightweight recorder/executor of the policy's own structured verification output instead of calling an external heuristic/Qwen verifier. Training uses oracle verifier supervision in SFT and a single teacher judge based on `Qwen3-VL-32B-Instruct`, which supports both text-structured judging and multimodal frame-aware judging for reward calibration and distillation in RL/SFT.
 
-**Tech Stack:** Python, Transformers/Qwen3-VL, current SAVER rollout stack, existing CEA-GRPO pipeline, optional teacher judge via VLLM/OpenAI-compatible endpoint.
+**Tech Stack:** Python, Transformers/Qwen3-VL, current SAVER rollout stack, existing CEA-GRPO pipeline, single multimodal teacher judge via `Qwen3-VL-32B-Instruct` and VLLM/OpenAI-compatible endpoint.
 
 ---
 
@@ -32,11 +32,11 @@
 - `saver_agent/rollout.py`
   Purpose: record policy self-verification fields in trace and expose them to RL credit assignment.
 - `saver_agent/reward.py`
-  Purpose: split reward into task reward and self-verification reward; optionally add teacher-judge calibration reward.
+  Purpose: split reward into task reward and self-verification reward; add unified teacher-judge calibration reward from one Qwen3-VL backend.
 - `train_saver_sft.py`
-  Purpose: add switches for self-verification SFT and optional teacher-judge distillation targets.
+  Purpose: add switches for self-verification SFT and optional Qwen3-VL teacher-judge distillation targets.
 - `train_saver_rl.py`
-  Purpose: add same-policy self-verification mode, teacher-judge endpoint hooks, and GRPO-style self-verification reward mixing.
+  Purpose: add same-policy self-verification mode, `Qwen3-VL-32B-Instruct` teacher-judge endpoint hooks, teacher input-mode controls, and GRPO-style self-verification reward mixing.
 - `README.md`
   Purpose: update training/eval instructions to "single policy inference, optional teacher judge during training".
 
@@ -44,7 +44,7 @@
 - `saver_agent/verifier.py`
   Purpose: keep as diagnostic / fallback / ablation backend, not as default online verifier.
 - `saver_agent/qwen_verifier.py`
-  Purpose: optional frozen teacher verifier or offline judge bootstrap, not inference-time dependency.
+  Purpose: optional frozen Qwen-VL teacher verifier bootstrap with both text-only and multimodal judging modes, not inference-time dependency.
 
 ---
 
@@ -244,7 +244,7 @@ Expected: PASS
 Add tests asserting RL examples receive reward from:
 - self-verification sufficiency/necessity correctness
 - self-verification action calibration
-- agreement with optional teacher judge
+- agreement with Qwen3-VL teacher judge in both `text_only` and `multimodal_visual` modes
 
 - [ ] **Step 2: Redefine CEA-GRPO local scoring inputs**
 
@@ -279,9 +279,12 @@ Recommended default mixing:
 
 In `train_saver_rl.py`, add:
 - `--online-verifier-mode {self_report,fallback_external}`
-- `--teacher-judge-backend {none,openai_compatible,qwen_verifier}`
+- `--teacher-judge-backend {none,qwen3_vl_teacher,openai_compatible_vl}`
 - `--teacher-judge-model`
 - `--teacher-judge-url`
+- `--teacher-judge-input-mode {text_only,multimodal_visual,auto}`
+- `--teacher-judge-anchor-policy {verify_only,verify_and_finalize,hard_examples}`
+- `--teacher-judge-topk-frames-per-view`
 - `--teacher-judge-weight`
 - `--self-verification-reward-weight`
 - `--disable-external-online-verifier`
@@ -289,6 +292,7 @@ In `train_saver_rl.py`, add:
 Default target behavior:
 - online inference / rollout collection uses `self_report`
 - external verifier only used for fallback or diagnostics
+- teacher judge defaults to `text_only` on most anchors and upgrades to `multimodal_visual` for hard cases when `auto` is enabled
 
 - [ ] **Step 5: Run focused tests**
 
@@ -299,7 +303,7 @@ Run:
 Expected: PASS
 
 
-### Task 5: Add Training-Time Teacher Judge Support
+### Task 5: Add Training-Time Qwen3-VL Teacher Judge Support
 
 **Files:**
 - Create: `saver_agent/self_verification.py`
@@ -313,6 +317,8 @@ Expected: PASS
 Implement minimal helpers:
 - `score_self_verification_with_teacher(...)`
 - `build_teacher_judge_prompt(...)`
+- `build_teacher_judge_package(...)`
+- `select_teacher_judge_input_mode(...)`
 - parser for structured teacher outputs:
   - `sufficiency_score`
   - `necessity_score`
@@ -329,18 +335,37 @@ SFT:
 RL:
 - optional teacher score at sampled verification turns
 - optional sparse teacher calls only at anchors to save compute
+- optional mixed teacher usage:
+  - `text_only`: judge structured claim + summaries + timestamps + self-verification output
+  - `multimodal_visual`: judge the same package plus sampled raw frames for `full / keep / drop / alert_prefix`
+  - `auto`: default to `text_only`, escalate to `multimodal_visual` on hard/ambiguous anchors
 
 - [ ] **Step 3: Document recommended teacher setup**
 
-Document `Qwen2.5-72B-Instruct` as recommended training-time judge for text-only structured verdicts.
-Document that it is not a vision-language model, so it should judge:
-- policy-produced claim
-- selected timestamps / window summaries
-- structured evidence summaries
-not raw frames directly.
+Document `Qwen3-VL-32B-Instruct` as the default single training-time teacher judge.
+Document two supported input modes from the same model:
+- `text_only`
+- `multimodal_visual`
 
-Also document stronger alternative:
-- multimodal teacher judge if raw-image verification is required.
+Document that the base teacher input package includes:
+- policy-produced claim
+- `full / keep / drop / alert_prefix` view summaries
+- selected timestamps
+- policy self-verification output
+
+Document that `multimodal_visual` additionally includes:
+- sampled raw frames from each view
+- optional preview frames for broader context
+
+Document sparse-calling defaults to control cost:
+- only verification anchor turns
+- only top-K frames per view
+- optional hard-example-only relabeling
+- `auto` mode escalation triggers:
+  - low policy self-verification confidence
+  - keep/drop scores too close
+  - alert decision near threshold
+  - disagreement with oracle/teacher history on similar anchors
 
 - [ ] **Step 4: Run parser/client tests**
 
@@ -400,12 +425,13 @@ Expected: PASS
 Explain:
 - old mode: external verifier tool judges policy
 - new mode: policy emits self-verification, training may use teacher judge
+- teacher judge is a single `Qwen3-VL-32B-Instruct` backend with two input modes, not two separate models
 
 - [ ] **Step 2: Add recommended staged rollout**
 
 Document three phases:
 - Phase A: self-verification SFT warm start
-- Phase B: CEA-GRPO with self-verification reward + optional teacher judge
+- Phase B: CEA-GRPO with self-verification reward + `Qwen3-VL-32B-Instruct` teacher judge
 - Phase C: inference with single policy only
 
 - [ ] **Step 3: Add command templates**
@@ -413,7 +439,11 @@ Document three phases:
 Include:
 - SFT with self-verification labels
 - RL with `--online-verifier-mode self_report`
-- optional teacher judge endpoint using Qwen2.5-72B-Instruct
+- optional teacher judge endpoint using `Qwen3-VL-32B-Instruct`
+- examples for:
+  - `--teacher-judge-input-mode text_only`
+  - `--teacher-judge-input-mode multimodal_visual`
+  - `--teacher-judge-input-mode auto`
 
 - [ ] **Step 4: Final regression sweep**
 

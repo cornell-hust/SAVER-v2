@@ -4,6 +4,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
 
 
+DEFAULT_POLICY_MAX_NEW_TOKENS = 256
+DEFAULT_TOTAL_VISUAL_BUDGET = 24
+
 DEFAULT_INITIAL_USER_TEMPLATE = (
     "Case ID: {public_case_id}\n"
     "Scene: {scene}\n"
@@ -49,6 +52,7 @@ class PromptConfig:
 class RolloutTraceConfig:
     record_observation_content: bool = False
     record_state_deltas: bool = True
+    record_counterfactual_trace: bool = True
     record_message_history: bool = True
 
 

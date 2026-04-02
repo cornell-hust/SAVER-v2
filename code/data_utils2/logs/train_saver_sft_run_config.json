@@ -1,0 +1,26 @@
+{
+  "timestamp_utc": "2026-04-01T16:52:36.857781+00:00",
+  "data": "data_utils2/msad_saver_agent_all.jsonl",
+  "prepared_data": "",
+  "data_root": "/mnt/shared-storage-user/mineru2-shared/zengweijun",
+  "include_splits": [
+    "train"
+  ],
+  "output_dir": "",
+  "log_dir": "data_utils2/logs",
+  "resume_from_checkpoint": "",
+  "resume_rollout_eval_only": false,
+  "inline_rollout_eval": false,
+  "model_path": "/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct",
+  "tensor_cache_dir": "",
+  "prepare_output": "data_utils2/msad_saver_agent_train.prepared_sft.jsonl",
+  "teacher_judge_output": "",
+  "prepare_only": true,
+  "teacher_judge_only": false,
+  "dry_run": false,
+  "eval_data": "",
+  "eval_rollout_max_turns": 12,
+  "eval_attach_reference_diagnostics": false,
+  "teacher_judge_model_path": "",
+  "teacher_judge_input_mode": "auto"
+}

@@ -5,6 +5,8 @@
 - 不使用 `scripts/*.sh`
 - 预处理产生的 `json/jsonl` 统一放在 [`data_utils`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code/data_utils)
 - 训练和 rollout 输出放在 `code/ckpt/<EXP_NAME>/...`
+- 默认主路径是 `self-verifying policy + 单 teacher judge`
+- legacy external verifier 只保留给 diagnostic，不再作为主训练/主评估路径
 
 以下命令默认在 [`/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code) 目录执行。
 
@@ -32,9 +34,13 @@ export AGENT_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_agent_train.jsonl
 export ORACLE_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_oracle_sft_train.jsonl
 export ORACLE_TEST_JSONL=${DATA_UTILS_DIR}/msad_saver_oracle_sft_test.jsonl
 export PREPARED_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.jsonl
+export PREPARED_TRAIN_TEACHER_JSONL=${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.teacher.jsonl
 
 export MODEL_PATH=${MODEL_ROOT}/qwen3-vl-8b-Instruct
 export VERIFIER_MODEL_PATH=${MODEL_ROOT}/qwen3-vl-8b-Instruct
+export TEACHER_JUDGE_MODEL_PATH=${MODEL_ROOT}/Qwen3-VL-32B-Instruct
+export TEACHER_JUDGE_INPUT_MODE=auto
+export TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW=4
 export PROPOSAL_MODEL_PATH=${MODEL_ROOT}/siglip
 
 export TRAIN_SPLIT=train
@@ -46,7 +52,10 @@ export EVAL_SPLIT=test
 - `EXP_NAME`: 实验名，决定 `ckpt/<EXP_NAME>` 输出目录
 - `DATA_UTILS_DIR`: 预处理 `json/jsonl` 输出目录
 - `MODEL_PATH`: policy 初始模型
-- `VERIFIER_MODEL_PATH`: verifier 模型
+- `VERIFIER_MODEL_PATH`: 仅 diagnostic 路径使用的 legacy verifier 模型
+- `TEACHER_JUDGE_MODEL_PATH`: 训练期 teacher judge 模型，离线用于 SFT 标注和 RL verify turn 校准
+- `TEACHER_JUDGE_INPUT_MODE`: 推荐 `auto`，困难样本再升级到视觉 judge
+- `TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW`: 每个 `full / keep / drop / alert_prefix` 视角最多取多少帧
 - `PROPOSAL_MODEL_PATH`: proposal encoder，通常是 SigLIP
 
 ## 2. 数据预处理
@@ -95,9 +104,47 @@ python train_saver_sft.py \
   --progress-every 25
 ```
 
+### 2.4 prepared_sft -> teacher_judge prepared_sft
+
+```bash
+python annotate_teacher_judge_sft.py \
+  --input data_utils/msad_saver_agent_train.prepared_sft.jsonl \
+  --output data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
+  --include-splits "train" \
+  --model-path "${TEACHER_JUDGE_MODEL_PATH}" \
+  --input-mode "${TEACHER_JUDGE_INPUT_MODE}" \
+  --torch-dtype auto \
+  --device-map auto \
+  --attn-implementation flash_attention_3 \
+  --max-new-tokens 384 \
+  --max-images 8 \
+  --topk-frames-per-view 4 \
+  --progress-every 25
+```
+
+```bash
+torchrun --standalone --nproc_per_node=4 annotate_teacher_judge_sft.py \
+  --input data_utils/msad_saver_agent_train.prepared_sft.jsonl \
+  --output data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
+  --include-splits "train" \
+  --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/Qwen3-VL-32B-Instruct \
+  --input-mode auto \
+  --torch-dtype auto \
+  --device-map auto \
+  --attn-implementation flash_attention_3 \
+  --max-new-tokens 384 \
+  --max-images 8 \
+  --topk-frames-per-view 4 \
+  --batch-size 2 \
+  --progress-every 25
+
+```
+
+### 2.5 teacher prepared_sft -> tensor cache
+
 ```bash
 python prepare_sft_tensor_cache.py \
-  --prepared-data data_utils/msad_saver_agent_train.prepared_sft.jsonl \
+  --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
   --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct \
   --include-splits train \
   --max-seq-length 4096 \
@@ -108,12 +155,57 @@ python prepare_sft_tensor_cache.py \
   --max-total-images 0
 ```
 
+  python prepare_sft_tensor_cache.py \
+    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
+    --include-splits train \
+    --num-shards 4 \
+    --shard-index 0 &
+
+  python prepare_sft_tensor_cache.py \
+    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
+    --include-splits train \
+    --num-shards 4 \
+    --shard-index 1 &
+
+  python prepare_sft_tensor_cache.py \
+    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
+    --include-splits train \
+    --num-shards 4 \
+    --shard-index 2 &
+
+  python prepare_sft_tensor_cache.py \
+    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
+    --include-splits train \
+    --num-shards 4 \
+    --shard-index 3 &
+
+  wait
+
+  for i in $(seq 0 3); do
+    python prepare_sft_tensor_cache.py \
+      --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
+      --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct \
+      --include-splits train \
+      --max-seq-length 4096 \
+      --keep-recent-text-messages 12 \
+      --max-image-side 0 \
+      --max-image-pixels 0 \
+      --keep-recent-tool-image-messages 0 \
+      --max-total-images 0 \
+      --frame-cache-max-cached-videos 128 \
+      --num-shards 4 \
+      --shard-index $i \
+      --progress-every 50 &
+  done
+  wait  
+
 这一阶段产物都在 [`data_utils`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code/data_utils)：
 
 - `msad_saver_agent_train.jsonl`
 - `msad_saver_oracle_sft_train.jsonl`
 - `msad_saver_oracle_sft_test.jsonl`
 - `msad_saver_agent_train.prepared_sft.jsonl`
+- `msad_saver_agent_train.prepared_sft.teacher.jsonl`
 
 相关变量：
 
@@ -122,6 +214,7 @@ python prepare_sft_tensor_cache.py \
 - `ORACLE_TRAIN_JSONL`
 - `ORACLE_TEST_JSONL`
 - `PREPARED_TRAIN_JSONL`
+- `PREPARED_TRAIN_TEACHER_JSONL`
 - `TRAIN_SPLIT`
 - `EVAL_SPLIT`
 
@@ -221,14 +314,13 @@ export SFT_DATALOADER_NUM_WORKERS=4
 export SFT_DATALOADER_PREFETCH_FACTOR=2
 
 torchrun --nproc_per_node=${SFT_NPROC_PER_NODE} train_saver_sft.py \
-  --prepared-data "${PREPARED_TRAIN_JSONL}" \
+  --prepared-data "${PREPARED_TRAIN_TEACHER_JSONL}" \
   --include-splits "${TRAIN_SPLIT}" \
   --model-path "${MODEL_PATH}" \
   --output-dir "${SFT_OUTPUT_DIR}" \
   --eval-data "${ORACLE_TEST_JSONL}" \
   --eval-data-root "${DATA_ROOT}" \
   --eval-rollout-max-turns "${SFT_EVAL_ROLLOUT_MAX_TURNS}" \
-  --eval-verifier-backend heuristic \
   --eval-progress-every 1 \
   --lora \
   --bf16 \
@@ -248,6 +340,13 @@ torchrun --nproc_per_node=${SFT_NPROC_PER_NODE} train_saver_sft.py \
   --dataloader-persistent-workers \
   --attn-implementation flash_attention_3 \
   --logging-steps 5
+```
+
+如果你要给 epoch-end eval 显式附加 reference-conditioned diagnostic，再额外加：
+
+```bash
+  --eval-attach-reference-diagnostics \
+  --eval-verifier-backend heuristic
 ```
 
 相关变量：
@@ -294,12 +393,14 @@ python batch_run_saver_rollout.py \
   --attn-implementation flash_attention_3 \
   --max-new-tokens 512 \
   --output "${RAW_ROLLOUT_JSONL}" \
-  --progress-every 5 \
-  --verifier-backend heuristic \
-  --verifier-model-path "${VERIFIER_MODEL_PATH}" \
-  --verifier-device-map auto \
-  --verifier-torch-dtype auto \
-  --verifier-hybrid-alpha 0.7
+  --progress-every 5
+```
+
+如果你要显式跑 legacy diagnostic 在线 verifier fallback，再额外加：
+
+```bash
+  --diagnostic-online-verifier-fallback \
+  --verifier-backend heuristic
 ```
 
 相关变量：
@@ -326,26 +427,38 @@ python score_saver_rollout.py \
   --output "${SCORED_ROLLOUT_JSONL}" \
   --data "${ORACLE_TEST_JSONL}" \
   --data-root "${DATA_ROOT}" \
-  --verifier-backend hybrid \
-  --force-reverify \
-  --verifier-model-path "${VERIFIER_MODEL_PATH}" \
-  --verifier-device-map auto \
-  --verifier-torch-dtype auto \
-  --verifier-attn-implementation flash_attention_3 \
-  --verifier-hybrid-alpha 0.7 \
+  --teacher-judge-model-path "${TEACHER_JUDGE_MODEL_PATH}" \
+  --teacher-judge-input-mode "${TEACHER_JUDGE_INPUT_MODE}" \
+  --teacher-judge-torch-dtype auto \
+  --teacher-judge-device-map auto \
+  --teacher-judge-attn-implementation flash_attention_3 \
+  --teacher-judge-topk-frames-per-view "${TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW}" \
   --progress-every 5
+```
+
+如果你要附加 legacy reference-conditioned offline verifier 作为 diagnostic，再额外加：
+
+```bash
+  --attach-reference-offline-verifier \
+  --force-reverify \
+  --verifier-backend heuristic \
+  --verifier-model-path "${VERIFIER_MODEL_PATH}"
 ```
 
 相关变量：
 
 - `SCORED_ROLLOUT_JSONL`
-- `--verifier-backend`
-- `--force-reverify`
+- `--attach-reference-offline-verifier`: 只在 diagnostic 评估里打开
+- `--force-reverify`: 只和 `--attach-reference-offline-verifier` 一起用
+- `--verifier-backend`: 只在 diagnostic 评估里使用
 - `--verifier-model-path`
 - `--verifier-device-map`
 - `--verifier-torch-dtype`
 - `--verifier-attn-implementation`
 - `--verifier-hybrid-alpha`
+- `--teacher-judge-model-path`
+- `--teacher-judge-input-mode`
+- `--teacher-judge-device-map`
 
 ## 8. Summarize
 
@@ -356,7 +469,8 @@ python summarize_saver_scores.py \
   --input "${SCORED_ROLLOUT_JSONL}" \
   --output "${SUMMARY_JSON}" \
   --data "${ORACLE_TEST_JSONL}" \
-  --data-root "${DATA_ROOT}"
+  --data-root "${DATA_ROOT}" \
+  --max-teacher-disagreement-cases 50
 ```
 
 输出文件：
@@ -364,6 +478,16 @@ python summarize_saver_scores.py \
 - `RAW_ROLLOUT_JSONL`
 - `SCORED_ROLLOUT_JSONL`
 - `SUMMARY_JSON`
+
+`summary.json` 现在除了 `complete / incomplete / redundant / misaligned` 和 reward 均值外，还会给出 teacher 诊断统计：
+
+- `teacher_judge_decision_counts`
+- `teacher_judge_alignment_counts`
+- `mean_teacher_judge_alignment`
+- `mean_teacher_judge_reward`
+- `verify_turn_coverage`
+- `teacher_disagreement_cases`
+- `teacher_reward_by_label_group`
 
 ## 9. RL
 
@@ -389,6 +513,7 @@ export RL_GRPO_VARIANT=cea_grpo
 export RL_CEA_SEARCH_LOCAL_ALPHA=0.5
 export RL_CEA_ALERT_LOCAL_ALPHA=0.5
 export RL_CEA_EVIDENCE_LOCAL_ALPHA=0.5
+export RL_TEACHER_JUDGE_LOCAL_ALPHA=0.5
 
 export RL_MAX_IMAGE_SIDE=640
 export RL_MAX_IMAGE_PIXELS=0
@@ -396,6 +521,7 @@ export RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES=0
 export RL_MAX_TOTAL_IMAGES=44
 export RL_MAX_SEQ_LENGTH=4096
 export RL_KEEP_RECENT_TEXT_MESSAGES=12
+export RL_TENSOR_CACHE_DIR="${RL_OUTPUT_DIR}/tensor_cache"
 
 torchrun --nproc_per_node=${RL_NPROC_PER_NODE} train_saver_rl.py \
   --data "${AGENT_TRAIN_JSONL}" \
@@ -407,7 +533,6 @@ torchrun --nproc_per_node=${RL_NPROC_PER_NODE} train_saver_rl.py \
   --eval-data "${ORACLE_TEST_JSONL}" \
   --eval-data-root "${DATA_ROOT}" \
   --eval-rollout-max-turns 12 \
-  --eval-verifier-backend heuristic \
   --num-iterations "${RL_NUM_ITERATIONS}" \
   --rollout-count "${RL_ROLLOUT_COUNT}" \
   --num-generations "${RL_NUM_GENERATIONS}" \
@@ -419,14 +544,15 @@ torchrun --nproc_per_node=${RL_NPROC_PER_NODE} train_saver_rl.py \
   --cea-search-local-alpha "${RL_CEA_SEARCH_LOCAL_ALPHA}" \
   --cea-alert-local-alpha "${RL_CEA_ALERT_LOCAL_ALPHA}" \
   --cea-evidence-local-alpha "${RL_CEA_EVIDENCE_LOCAL_ALPHA}" \
-  --cea-local-verifier-backend heuristic \
+  --teacher-judge-model-path "${TEACHER_JUDGE_MODEL_PATH}" \
+  --teacher-judge-input-mode "${TEACHER_JUDGE_INPUT_MODE}" \
+  --teacher-judge-torch-dtype auto \
+  --teacher-judge-device-map auto \
+  --teacher-judge-attn-implementation flash_attention_3 \
+  --teacher-judge-topk-frames-per-view "${TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW}" \
+  --teacher-judge-local-alpha "${RL_TEACHER_JUDGE_LOCAL_ALPHA}" \
+  --cea-local-verifier-backend self_teacher \
   --kl-beta "${RL_KL_BETA}" \
-  --verifier-backend hybrid \
-  --verifier-model-path "${VERIFIER_MODEL_PATH}" \
-  --verifier-torch-dtype auto \
-  --verifier-device-map auto \
-  --verifier-attn-implementation flash_attention_3 \
-  --verifier-hybrid-alpha 0.7 \
   --policy-do-sample \
   --policy-temperature 0.7 \
   --policy-top-p 0.9 \
@@ -443,11 +569,38 @@ torchrun --nproc_per_node=${RL_NPROC_PER_NODE} train_saver_rl.py \
   --max-total-images "${RL_MAX_TOTAL_IMAGES}" \
   --max-seq-length "${RL_MAX_SEQ_LENGTH}" \
   --keep-recent-text-messages "${RL_KEEP_RECENT_TEXT_MESSAGES}" \
+  --tensor-cache-dir "${RL_TENSOR_CACHE_DIR}" \
+  --tensor-cache-progress-every 25 \
   --dataloader-num-workers 4 \
   --dataloader-prefetch-factor 2 \
   --dataloader-persistent-workers \
   --attn-implementation flash_attention_3 \
   --logging-steps 10
+```
+
+如果你要为 RL 显式打开 legacy diagnostic 路线，再额外加：
+
+```bash
+  --diagnostic-online-verifier-fallback \
+  --diagnostic-attach-reference-offline-verifier \
+  --eval-attach-reference-diagnostics \
+  --eval-verifier-backend heuristic \
+  --verifier-backend heuristic \
+  --verifier-model-path "${VERIFIER_MODEL_PATH}"
+```
+
+默认 RL 主路径是：
+
+- 单 policy 自验证
+- 单 teacher judge
+- 不附加 reference-conditioned offline verifier
+
+如果你只想做 diagnostic ablation，再额外加：
+
+```bash
+  --diagnostic-online-verifier-fallback \
+  --diagnostic-attach-reference-offline-verifier \
+  --diagnostic-force-reverify
 ```
 
 相关变量：
@@ -467,12 +620,14 @@ torchrun --nproc_per_node=${RL_NPROC_PER_NODE} train_saver_rl.py \
 - `RL_CEA_SEARCH_LOCAL_ALPHA`
 - `RL_CEA_ALERT_LOCAL_ALPHA`
 - `RL_CEA_EVIDENCE_LOCAL_ALPHA`
+- `RL_TEACHER_JUDGE_LOCAL_ALPHA`
 - `RL_MAX_IMAGE_SIDE`
 - `RL_MAX_IMAGE_PIXELS`
 - `RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES`
 - `RL_MAX_TOTAL_IMAGES`
 - `RL_MAX_SEQ_LENGTH`
 - `RL_KEEP_RECENT_TEXT_MESSAGES`
+- `RL_TENSOR_CACHE_DIR`
 
 ## 10. 最短顺序
 
@@ -483,6 +638,8 @@ python convert_to_saver_agent.py   # agent_train
 python convert_to_saver_agent.py   # oracle_sft_train
 python convert_to_saver_agent.py   # oracle_sft_test
 python train_saver_sft.py --prepare-only
+python annotate_teacher_judge_sft.py
+python prepare_sft_tensor_cache.py
 python build_frame_cache.py        # train
 python build_frame_cache.py        # test
 python build_feature_cache.py      # train

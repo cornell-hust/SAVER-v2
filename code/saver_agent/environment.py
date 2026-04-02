@@ -11,8 +11,14 @@ from saver_agent.tool_registry import execute_tool_call
 INVALID_TOOL_CALL_PROMPT = (
     "The previous response is invalid. Retry immediately with exactly one of these formats: "
     '<tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0}}</tool_call> '
+    'or <tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"final_check","claim":{"existence":"anomaly","category":"assault"},"selected_window_ids":["w0001"],"verification_decision":"insufficient","recommended_action":"continue_search","sufficiency_score":0.2,"necessity_score":0.1,"alertability_score":0.0,"counterfactual_faithfulness":0.3}}</tool_call> '
     'or <answer>{"existence":"normal"}</answer>. '
     "Do not describe the intended tool call in plain English. Do not output bare tool names."
+)
+INVALID_ANSWER_PROMPT = (
+    "The previous <answer> payload is invalid. Retry immediately with exactly one structured JSON object "
+    'inside <answer></answer>, for example <answer>{"existence":"normal"}</answer>. '
+    "Do not output plain text inside <answer>. Do not describe the answer in prose."
 )
 
 
@@ -47,6 +53,14 @@ def invalid_tool_call_message(
         "role": "tool",
         "name": "parse_error",
         "content": [{"type": "text", "text": prompt_text}],
+    }
+
+
+def invalid_answer_message() -> Dict[str, Any]:
+    return {
+        "role": "tool",
+        "name": "parse_error",
+        "content": [{"type": "text", "text": INVALID_ANSWER_PROMPT}],
     }
 
 
@@ -145,6 +159,16 @@ def _parse_tool_payload(content: str) -> Dict[str, Any] | None:
     return {"name": name, "arguments": _normalize_tool_arguments(name, arguments)}
 
 
+def _parse_answer_payload(content: str) -> Dict[str, Any] | None:
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def parse_actions_and_contents(predictions: List[Any]) -> Tuple[List[str | None], List[Any]]:
     actions: List[str | None] = []
     contents: List[Any] = []
@@ -169,8 +193,13 @@ def parse_actions_and_contents(predictions: List[Any]) -> Tuple[List[str | None]
                 actions.append("tool_call")
                 contents.append({"type": "function", "function": func})
         else:
-            actions.append("answer")
-            contents.append(content)
+            payload = _parse_answer_payload(content)
+            if payload is None:
+                actions.append("invalid_answer")
+                contents.append(content)
+            else:
+                actions.append("answer")
+                contents.append(content)
     return actions, contents
 
 
@@ -212,6 +241,14 @@ class SaverVideoInteraction:
                 next_states.append(state)
                 continue
 
+            if action == "invalid_answer":
+                next_obs.append(invalid_answer_message())
+                dones.append(0)
+                valid_actions.append(0)
+                is_search.append(0)
+                next_states.append(state)
+                continue
+
             if action == "tool_call":
                 try:
                     message, next_state = execute_tool_call(content, multimodal_cache, state)
@@ -220,7 +257,7 @@ class SaverVideoInteraction:
                     valid_actions.append(1)
                     is_search.append(1)
                     next_states.append(next_state)
-                except Exception:
+                except ValueError:
                     next_obs.append(
                         invalid_tool_call_message(
                             tool_name=content["function"]["name"],

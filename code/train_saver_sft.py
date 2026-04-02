@@ -3,18 +3,38 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from split_utils import parse_include_splits
 
-from saver_agent.config import PromptConfig, PreviewConfig, RolloutTraceConfig, SaverAgentConfig
+from saver_agent.config import (
+    DEFAULT_POLICY_MAX_NEW_TOKENS,
+    DEFAULT_TOTAL_VISUAL_BUDGET,
+    PromptConfig,
+    PreviewConfig,
+    RolloutTraceConfig,
+    SaverAgentConfig,
+)
 from saver_agent.dataset import SaverAgentDataset
 from saver_agent.evaluation import RolloutEvaluationConfig
+from saver_agent.experiment_logging import resolve_experiment_log_dir, utc_timestamp, write_json
 from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH
 from saver_agent.runtime import distributed_runtime_from_env, runtime_log, should_log_progress
-from saver_agent.training import default_sft_tensor_cache_dir, run_weighted_sft, validate_prepared_examples
+from saver_agent.teacher_judge import (
+    QwenTeacherJudge,
+    annotate_teacher_judge_examples,
+    reweight_teacher_judge_examples,
+)
+from saver_agent.training import (
+    _FrameReferenceResolver,
+    default_sft_tensor_cache_dir,
+    run_rollout_eval_from_checkpoint,
+    run_weighted_sft,
+    validate_prepared_examples,
+)
 from saver_agent.training_data import build_oracle_sft_examples
 
 
@@ -29,9 +49,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--prepare-output", default="", help="Optional path to write lightweight prepared SFT JSONL.")
     parser.add_argument("--prepare-only", action="store_true", help="Prepare lightweight SFT JSONL and exit before training.")
+    parser.add_argument("--teacher-judge-output", default="", help="Optional path to write teacher-annotated prepared SFT JSONL.")
+    parser.add_argument("--teacher-judge-only", action="store_true", help="Annotate prepared SFT examples with the teacher judge and exit before training.")
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data/--prepared-data, e.g. train or train,val.")
     parser.add_argument("--output-dir", default="", help="Training output directory.")
+    parser.add_argument("--log-dir", default="", help="Optional directory for SFT logs. Defaults to <output-dir>/logs.")
+    parser.add_argument("--resume-from-checkpoint", default="", help="Optional Trainer/model checkpoint used to resume SFT or replay a missing epoch-end rollout eval.")
+    parser.add_argument("--resume-rollout-eval-only", action="store_true", help="Only replay the missing epoch-end rollout eval for --resume-from-checkpoint, then exit.")
+    parser.add_argument("--inline-rollout-eval", action="store_true", help="Run epoch-end rollout eval inline before the next epoch instead of deferring it to an external recovery process.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Local Qwen model path.")
     parser.add_argument("--proposal-model-path", default="", help="Optional local SigLIP/CLIP path for query-conditioned proposal during SFT example preparation.")
     parser.add_argument("--proposal-torch-dtype", default="auto", help="Torch dtype for the proposal encoder used during SFT example preparation.")
@@ -45,6 +71,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--validation-max-examples", type=int, default=0, help="Optional cap on how many prepared examples to materialize during validation.")
     parser.add_argument("--progress-every", type=int, default=25, help="Log data preparation or validation progress every N items. First and last items are always logged.")
     parser.add_argument("--skip-invalid-jsonl-lines", action="store_true", help="Skip malformed JSONL lines instead of failing immediately. Prefer regenerating the source file when possible.")
+    parser.add_argument("--teacher-judge-model-path", default="", help="Optional Qwen teacher judge model path used to annotate verify_hypothesis SFT examples.")
+    parser.add_argument(
+        "--teacher-judge-input-mode",
+        choices=["text_only", "multimodal_visual", "auto"],
+        default="auto",
+        help="Teacher judge input mode used during prepared-data annotation.",
+    )
+    parser.add_argument("--teacher-judge-torch-dtype", default="auto", help="Torch dtype for the teacher judge.")
+    parser.add_argument("--teacher-judge-device-map", default="auto", help="device_map for the teacher judge.")
+    parser.add_argument("--teacher-judge-attn-implementation", default="", help="Optional attention backend for the teacher judge.")
+    parser.add_argument("--teacher-judge-max-new-tokens", type=int, default=384, help="Generation length for the teacher judge.")
+    parser.add_argument("--teacher-judge-max-images", type=int, default=8, help="Maximum images passed to the teacher judge per example.")
+    parser.add_argument(
+        "--teacher-judge-topk-frames-per-view",
+        type=int,
+        default=4,
+        help="Maximum number of frames sampled into each teacher-judge view package.",
+    )
+    parser.add_argument("--teacher-judge-overwrite-existing", action="store_true", help="Overwrite existing teacher judge labels when annotating prepared SFT examples.")
+    parser.add_argument("--teacher-judge-frame-cache-max-cached-videos", type=int, default=64, help="How many frame_cache tensors/video readers to keep open while resolving image_ref payloads for teacher judging.")
     parser.add_argument("--torch-dtype", default="auto", help="Torch dtype passed to from_pretrained.")
     parser.add_argument("--attn-implementation", default="", help="Optional attention backend for Qwen.")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable model gradient checkpointing.")
@@ -100,7 +146,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-total-images",
         type=int,
-        default=0,
+        default=DEFAULT_TOTAL_VISUAL_BUDGET,
         help="Optional hard cap on total images kept in each SFT example after pruning. 0 keeps all images.",
     )
     parser.add_argument("--num-preview-frames", type=int, default=8, help="Preview frames for initial prompt.")
@@ -114,10 +160,28 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on how many eval records to use per epoch.")
     parser.add_argument("--eval-rollout-max-turns", type=int, default=12, help="Maximum rollout turns for epoch-end eval.")
     parser.add_argument(
+        "--eval-max-new-tokens-per-turn",
+        type=int,
+        default=DEFAULT_POLICY_MAX_NEW_TOKENS,
+        help="Generation length budget for each epoch-end rollout eval turn.",
+    )
+    parser.add_argument(
+        "--eval-total-visual-budget",
+        type=int,
+        default=0,
+        help="Alias for a coarse epoch-end rollout visual budget. Currently resolved as a total-image cap when --eval-max-total-images is unset.",
+    )
+    parser.add_argument(
+        "--eval-max-total-images",
+        type=int,
+        default=DEFAULT_TOTAL_VISUAL_BUDGET,
+        help="Optional hard cap on total images preserved in each epoch-end rollout eval prompt. 0 keeps all images.",
+    )
+    parser.add_argument(
         "--eval-verifier-backend",
         choices=["heuristic", "qwen_self_verifier", "hybrid"],
         default="heuristic",
-        help="Offline verifier backend used for epoch-end rollout metrics.",
+        help="Diagnostic offline verifier backend used only when --eval-attach-reference-diagnostics is enabled.",
     )
     parser.add_argument("--eval-verifier-model-path", default="", help="Optional verifier model path for epoch-end rollout eval.")
     parser.add_argument("--eval-proposal-model-path", default="", help="Optional proposal encoder path for epoch-end rollout eval. Defaults to --proposal-model-path.")
@@ -131,10 +195,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--eval-attach-reference-diagnostics",
         action="store_true",
-        help="Attach reference-conditioned offline verifier diagnostics during epoch-end rollout eval.",
+        help="Attach reference-conditioned offline verifier diagnostics during epoch-end rollout eval. Main metrics remain reference-free.",
     )
     parser.add_argument("--eval-progress-every", type=int, default=1, help="Log epoch-end rollout eval progress every N local items.")
     return parser.parse_args(argv)
+
+
+def _resolve_eval_max_total_images(args: argparse.Namespace) -> int:
+    explicit_max_total_images = int(getattr(args, "eval_max_total_images", 0) or 0)
+    if explicit_max_total_images > 0:
+        return explicit_max_total_images
+    return max(0, int(getattr(args, "eval_total_visual_budget", 0) or 0))
 
 
 def _jsonl_decode_error_message(path: str | Path, line_number: int, line: str, exc: Exception) -> str:
@@ -224,7 +295,10 @@ def _build_rollout_eval_config(
         data_root=args.eval_data_root or args.data_root,
         include_splits=parse_include_splits(args.eval_include_splits),
         max_records=args.eval_max_records,
+        inline_rollout_eval=bool(args.inline_rollout_eval),
         rollout_max_turns=args.eval_rollout_max_turns,
+        policy_max_new_tokens=args.eval_max_new_tokens_per_turn,
+        max_total_images=_resolve_eval_max_total_images(args),
         verifier_backend=args.eval_verifier_backend,
         verifier_model_path=args.eval_verifier_model_path or args.model_path,
         proposal_model_path=args.eval_proposal_model_path or args.proposal_model_path,
@@ -248,9 +322,59 @@ def _resolve_proposal_device(explicit_device: str, *, runtime: Any) -> str:
         import torch
     except Exception:
         return "cpu"
-    if torch.cuda.is_available():
-        return f"cuda:{int(getattr(runtime, 'local_rank', 0))}"
-    return "cpu"
+    if not torch.cuda.is_available():
+        return "cpu"
+    try:
+        visible_cuda_devices = int(torch.cuda.device_count())
+    except Exception:
+        visible_cuda_devices = 0
+    if visible_cuda_devices <= 0:
+        return "cpu"
+    local_rank = int(getattr(runtime, "local_rank", 0) or 0)
+    if 0 <= local_rank < visible_cuda_devices:
+        return f"cuda:{local_rank}"
+    runtime_log(
+        (
+            "SFT proposal device fallback: "
+            f"local_rank={local_rank} is outside visible_cuda_devices={visible_cuda_devices}; using cuda:0"
+        ),
+        runtime=runtime,
+        main_process_only=True,
+    )
+    return "cuda:0"
+
+
+def _read_json_file(path: str | Path) -> Dict[str, Any]:
+    candidate = Path(path)
+    if not candidate.exists():
+        return {}
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_resume_epoch_index(checkpoint_path: str | Path) -> int:
+    checkpoint_dir = Path(checkpoint_path)
+    match = re.fullmatch(r"epoch_(\d+)", checkpoint_dir.name)
+    if match:
+        return max(1, int(match.group(1)))
+
+    resume_metadata = _read_json_file(checkpoint_dir / "resume_metadata.json")
+    if int(resume_metadata.get("epoch_index", 0) or 0) > 0:
+        return int(resume_metadata["epoch_index"])
+
+    trainer_state = _read_json_file(checkpoint_dir / "trainer_state.json")
+    epoch_value = trainer_state.get("epoch")
+    try:
+        epoch_float = float(epoch_value)
+    except Exception as exc:
+        raise ValueError(f"Unable to infer resume epoch index from {checkpoint_dir}") from exc
+    epoch_index = int(round(epoch_float))
+    if epoch_index <= 0:
+        raise ValueError(f"Resolved non-positive epoch index from {checkpoint_dir}: epoch={epoch_float}")
+    return epoch_index
 
 
 def _build_proposal_runtime(args: argparse.Namespace, *, runtime: Any) -> SiglipFeatureEncoder | None:
@@ -396,11 +520,107 @@ def _run_validation(args: argparse.Namespace, examples: List[Dict[str, Any]]) ->
     return validation
 
 
+def _maybe_annotate_examples_with_teacher_judge(
+    args: argparse.Namespace,
+    examples: List[Dict[str, Any]],
+    *,
+    runtime: Any,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if not args.teacher_judge_model_path:
+        return examples, {}
+    if getattr(runtime, "is_distributed", False):
+        raise ValueError(
+            "Inline teacher-judge annotation inside distributed SFT is not supported. "
+            "Run annotate_teacher_judge_sft.py first to produce an annotated prepared JSONL, then train with --prepared-data."
+        )
+
+    image_resolver = None
+    if str(args.teacher_judge_input_mode or "").strip().lower() != "text_only":
+        resolver = _FrameReferenceResolver(max_cached_videos=args.teacher_judge_frame_cache_max_cached_videos)
+        image_resolver = resolver._resolve_image_ref
+
+    runtime_log(
+        f"loading teacher judge from {args.teacher_judge_model_path} with input_mode={args.teacher_judge_input_mode}",
+        runtime=runtime,
+        main_process_only=True,
+    )
+    teacher_judge = QwenTeacherJudge.from_pretrained(
+        args.teacher_judge_model_path,
+        torch_dtype=args.teacher_judge_torch_dtype,
+        device_map=args.teacher_judge_device_map,
+        attn_implementation=args.teacher_judge_attn_implementation or None,
+        input_mode=args.teacher_judge_input_mode,
+        max_new_tokens=args.teacher_judge_max_new_tokens,
+        max_images=args.teacher_judge_max_images,
+        topk_frames_per_view=args.teacher_judge_topk_frames_per_view,
+        image_resolver=image_resolver,
+    )
+    annotated_examples, summary = annotate_teacher_judge_examples(
+        examples,
+        judge=teacher_judge,
+        input_mode=args.teacher_judge_input_mode,
+        overwrite_existing=args.teacher_judge_overwrite_existing,
+        progress_every=args.progress_every,
+        log_fn=lambda message: runtime_log(message, runtime=runtime, main_process_only=True),
+    )
+    return annotated_examples, summary
+
+
+def _apply_teacher_judge_reweighting(
+    examples: List[Dict[str, Any]],
+    *,
+    runtime: Any,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    reweighted_examples, summary = reweight_teacher_judge_examples(examples)
+    if int(summary.get("num_teacher_judge_reweighted", 0)) > 0:
+        runtime_log(
+            f"teacher judge reweighting: reweighted={summary['num_teacher_judge_reweighted']}",
+            runtime=runtime,
+            main_process_only=True,
+        )
+    return reweighted_examples, summary
+
+
 def main() -> None:
     args = parse_args()
-    if not args.data and not args.prepared_data:
+    if not args.resume_rollout_eval_only and not args.data and not args.prepared_data:
         raise ValueError("Either --data or --prepared-data must be provided.")
+    if args.resume_rollout_eval_only and not args.resume_from_checkpoint:
+        raise ValueError("--resume-rollout-eval-only requires --resume-from-checkpoint.")
     runtime = distributed_runtime_from_env()
+    log_dir = resolve_experiment_log_dir(
+        args.log_dir,
+        output_dir=args.output_dir,
+        fallback_paths=[args.prepare_output, args.teacher_judge_output, args.dry_run_json],
+    )
+    if runtime.is_main_process and log_dir is not None:
+        write_json(
+            log_dir / "train_saver_sft_run_config.json",
+            {
+                "timestamp_utc": utc_timestamp(),
+                "data": args.data,
+                "prepared_data": args.prepared_data,
+                "data_root": args.data_root,
+                "include_splits": parse_include_splits(args.include_splits) or [],
+                "output_dir": args.output_dir,
+                "log_dir": str(log_dir),
+                "resume_from_checkpoint": args.resume_from_checkpoint,
+                "resume_rollout_eval_only": bool(args.resume_rollout_eval_only),
+                "inline_rollout_eval": bool(args.inline_rollout_eval),
+                "model_path": args.model_path,
+                "tensor_cache_dir": args.tensor_cache_dir,
+                "prepare_output": args.prepare_output,
+                "teacher_judge_output": args.teacher_judge_output,
+                "prepare_only": bool(args.prepare_only),
+                "teacher_judge_only": bool(args.teacher_judge_only),
+                "dry_run": bool(args.dry_run),
+                "eval_data": args.eval_data,
+                "eval_rollout_max_turns": int(args.eval_rollout_max_turns),
+                "eval_attach_reference_diagnostics": bool(args.eval_attach_reference_diagnostics),
+                "teacher_judge_model_path": args.teacher_judge_model_path,
+                "teacher_judge_input_mode": args.teacher_judge_input_mode,
+            },
+        )
     runtime_log(
         (
             f"SFT startup: data={args.data or '(none)'} prepared_data={args.prepared_data or '(none)'} "
@@ -412,6 +632,31 @@ def main() -> None:
     )
     config = _build_config(args)
     rollout_eval_config = _build_rollout_eval_config(args, config=config)
+    if args.resume_rollout_eval_only:
+        if rollout_eval_config is None:
+            raise ValueError("--resume-rollout-eval-only requires --eval-data so the missing rollout eval can be replayed.")
+        epoch_index = _resolve_resume_epoch_index(args.resume_from_checkpoint)
+        result = run_rollout_eval_from_checkpoint(
+            checkpoint_path=args.resume_from_checkpoint,
+            output_dir=args.output_dir,
+            rollout_eval_config=rollout_eval_config,
+            epoch_index=epoch_index,
+            model_path=args.model_path,
+            torch_dtype=args.torch_dtype,
+            attn_implementation=args.attn_implementation or None,
+            runtime=runtime,
+        )
+        final_summary = {
+            "resume_from_checkpoint": args.resume_from_checkpoint,
+            "resume_rollout_eval_only": True,
+            "resume_epoch_index": int(epoch_index),
+            **(result or {}),
+        }
+        if runtime.is_main_process and log_dir is not None:
+            write_json(log_dir / "train_saver_sft_summary.json", final_summary)
+        if runtime.is_main_process:
+            print(json.dumps(final_summary, ensure_ascii=False, indent=2))
+        return
     proposal_runtime = None
     if not args.prepared_data and args.proposal_model_path:
         runtime_log(
@@ -449,19 +694,37 @@ def main() -> None:
         )
     if args.max_train_examples > 0:
         examples = examples[: args.max_train_examples]
+    teacher_judge_summary: Dict[str, Any] = {}
+    examples, teacher_judge_summary = _maybe_annotate_examples_with_teacher_judge(
+        args,
+        examples,
+        runtime=runtime,
+    )
+    examples, teacher_judge_reweight_summary = _apply_teacher_judge_reweighting(examples, runtime=runtime)
 
     summary = _summarize_examples(examples)
     validation = _run_validation(args, examples)
     if args.prepare_output and runtime.is_main_process:
         _write_jsonl(args.prepare_output, examples)
+    if args.teacher_judge_output and runtime.is_main_process:
+        _write_jsonl(args.teacher_judge_output, examples)
     if args.dry_run_json:
         if runtime.is_main_process:
             output_path = Path(args.dry_run_json)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps(examples, ensure_ascii=False, indent=2), encoding="utf-8")
-    if args.prepare_only or args.dry_run or not args.output_dir:
+    if args.teacher_judge_only or args.prepare_only or args.dry_run or not args.output_dir:
+        final_summary = {**summary, **teacher_judge_summary, **teacher_judge_reweight_summary, **validation}
+        if runtime.is_main_process and log_dir is not None:
+            write_json(log_dir / "train_saver_sft_summary.json", final_summary)
         if runtime.is_main_process:
-            print(json.dumps({**summary, **validation}, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    final_summary,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         return
 
     tensor_cache_dir = args.tensor_cache_dir
@@ -473,6 +736,7 @@ def main() -> None:
         examples,
         model_path=args.model_path,
         output_dir=args.output_dir,
+        resume_from_checkpoint=args.resume_from_checkpoint,
         tensor_cache_dir=tensor_cache_dir,
         torch_dtype=args.torch_dtype,
         attn_implementation=args.attn_implementation or None,
@@ -505,8 +769,17 @@ def main() -> None:
         max_total_images=args.max_total_images,
         rollout_eval_config=rollout_eval_config,
     )
+    final_summary = {**summary, **teacher_judge_summary, **teacher_judge_reweight_summary, **validation, **result}
+    if runtime.is_main_process and log_dir is not None:
+        write_json(log_dir / "train_saver_sft_summary.json", final_summary)
     if runtime.is_main_process:
-        print(json.dumps({**summary, **validation, **result}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                final_summary,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from saver_agent.adapter import TimeSearchRolloutAdapter
 from saver_agent.config import RolloutTraceConfig, SaverAgentConfig
 from saver_agent.environment import SaverVideoInteraction, parse_actions_and_contents
 from saver_agent.schema import SaverEnvironmentState
+from saver_agent.self_verification import parse_self_verification_payload
 
 
 PolicyFn = Callable[[List[Dict[str, Any]], Dict[str, Any], SaverEnvironmentState, int], str]
@@ -43,7 +44,7 @@ class SaverRolloutRunner:
         *,
         environment: Optional[SaverVideoInteraction] = None,
         adapter: Optional[TimeSearchRolloutAdapter] = None,
-        max_turns: int = 4,
+        max_turns: int = 12,
         config: Optional[SaverAgentConfig] = None,
     ):
         self.config = copy.deepcopy(config) if config is not None else SaverAgentConfig()
@@ -62,18 +63,30 @@ class SaverRolloutRunner:
         multimodal_cache = item["multimodal_cache"]
         state = copy.deepcopy(initial_state or SaverEnvironmentState())
         turns: List[Dict[str, Any]] = []
+        invalid_attempts: List[Dict[str, Any]] = []
         final_answer = None
         final_answer_text = None
         terminated_reason = "max_turns"
         terminated_at_step = self.max_turns
+        needs_state_delta = bool(self.config.rollout_trace.record_state_deltas)
+        needs_counterfactual_trace = bool(self.config.rollout_trace.record_counterfactual_trace)
+        needs_state_snapshots = bool(needs_state_delta or needs_counterfactual_trace)
+        formal_step_index = 0
+        total_attempts = 0
+        max_total_attempts = max(self.max_turns * 4, self.max_turns)
 
-        for step_index in range(1, self.max_turns + 1):
-            state_before = asdict(copy.deepcopy(state))
+        while formal_step_index < self.max_turns:
+            total_attempts += 1
+            if total_attempts > max_total_attempts:
+                terminated_reason = "max_invalid_retries"
+                terminated_at_step = formal_step_index
+                break
+            step_index = formal_step_index + 1
+            state_before = asdict(copy.deepcopy(state)) if needs_state_snapshots else None
             response_text = policy(messages, multimodal_cache, state, step_index)
             actions, contents = parse_actions_and_contents([response_text])
             action = actions[0]
             parsed_content = contents[0]
-            messages.append(self.adapter.build_assistant_message(response_text))
 
             next_obs, dones, valid_actions, is_search, next_states = self.environment.execute_predictions(
                 [response_text],
@@ -81,8 +94,13 @@ class SaverRolloutRunner:
                 [state],
                 [True],
             )
-            state = next_states[0]
-            state_after = asdict(copy.deepcopy(state))
+            next_state = next_states[0]
+            is_valid_action = bool(valid_actions[0])
+            if is_valid_action:
+                messages.append(self.adapter.build_assistant_message(response_text))
+                formal_step_index += 1
+            state = next_state
+            state_after = asdict(copy.deepcopy(state)) if needs_state_snapshots else None
 
             turn_info = {
                 "step_index": step_index,
@@ -111,6 +129,14 @@ class SaverRolloutRunner:
                 "verifier_verified_window_ids": None,
                 "verifier_best_effort_window_ids": None,
                 "verifier_failure_reasons": None,
+                "verification_parse_mode": None,
+                "legacy_compatibility_used": None,
+                "invalid_selected_window_ids": [],
+                "selection_resolution_source": None,
+                "self_verification_decision": None,
+                "self_verification_scores": None,
+                "self_verification_selected_window_ids": None,
+                "self_verification_confidence": None,
                 "proposal_backend": None,
                 "feature_cache_used": None,
                 "proposal_query_raw": None,
@@ -135,23 +161,30 @@ class SaverRolloutRunner:
                 terminated_reason = "answered"
                 terminated_at_step = step_index
                 turn_info["parsed_answer"] = final_answer
-                if self.config.rollout_trace.record_state_deltas:
-                    state_delta = self._compute_state_delta(state_before, state_after)
-                    turn_info["state_before"] = state_before
-                    turn_info["state_after"] = state_after
-                    turn_info["state_delta"] = state_delta
-                    turn_info["new_evidence_ids"] = [entry["evidence_id"] for entry in state_delta["new_evidence_windows"]]
-                    turn_info["new_alerts"] = state_delta["new_alerts"]
-                    turn_info["new_verifications"] = state_delta["new_verifications"]
-                    turn_info["new_finalized_case"] = state_delta["new_finalized_case"]
-                    self._attach_search_turn_trace(turn_info, state_delta=state_delta)
-                self._attach_counterfactual_turn_trace(
-                    turn_info,
-                    state_before=state_before,
-                    state_after=state_after,
-                )
-                turns.append(turn_info)
-                break
+                if not is_valid_action:
+                    final_answer = None
+                    final_answer_text = None
+                    terminated_reason = "max_turns"
+                    terminated_at_step = self.max_turns
+                else:
+                    if needs_state_delta and state_before is not None and state_after is not None:
+                        state_delta = self._compute_state_delta(state_before, state_after)
+                        turn_info["state_before"] = state_before
+                        turn_info["state_after"] = state_after
+                        turn_info["state_delta"] = state_delta
+                        turn_info["new_evidence_ids"] = [entry["evidence_id"] for entry in state_delta["new_evidence_windows"]]
+                        turn_info["new_alerts"] = state_delta["new_alerts"]
+                        turn_info["new_verifications"] = state_delta["new_verifications"]
+                        turn_info["new_finalized_case"] = state_delta["new_finalized_case"]
+                        self._attach_search_turn_trace(turn_info, state_delta=state_delta)
+                    if needs_counterfactual_trace and state_before is not None and state_after is not None:
+                        self._attach_counterfactual_turn_trace(
+                            turn_info,
+                            state_before=state_before,
+                            state_after=state_after,
+                        )
+                    turns.append(turn_info)
+                    break
             if tool_message is not None:
                 adapted_tool_message = self.adapter.adapt_tool_observation(tool_message, multimodal_cache)
                 messages.append(adapted_tool_message)
@@ -159,7 +192,7 @@ class SaverRolloutRunner:
                     turn_info["tool_name"] = tool_message.get("name")
                 turn_info.update(self._summarize_tool_message(tool_message))
 
-            if self.config.rollout_trace.record_state_deltas:
+            if needs_state_delta and state_before is not None and state_after is not None:
                 state_delta = self._compute_state_delta(state_before, state_after)
                 turn_info["state_before"] = state_before
                 turn_info["state_after"] = state_after
@@ -171,20 +204,26 @@ class SaverRolloutRunner:
                 self._attach_search_turn_trace(turn_info, state_delta=state_delta)
             if action != "answer":
                 turn_info["parsed_answer"] = None
-            self._attach_counterfactual_turn_trace(
-                turn_info,
-                state_before=state_before,
-                state_after=state_after,
-            )
-            turns.append(turn_info)
+            if needs_counterfactual_trace and state_before is not None and state_after is not None:
+                self._attach_counterfactual_turn_trace(
+                    turn_info,
+                    state_before=state_before,
+                    state_after=state_after,
+                )
+            if is_valid_action:
+                turns.append(turn_info)
+            else:
+                invalid_attempts.append(turn_info)
 
         result = {
             "video_id": item.get("video_id"),
             "terminated_reason": terminated_reason,
             "num_turns": len(turns),
+            "num_invalid_attempts": len(invalid_attempts),
             "final_answer": final_answer,
             "final_answer_text": final_answer_text,
             "turns": turns,
+            "invalid_attempts": invalid_attempts,
             "state": asdict(state),
             "config_snapshot": self.config.to_dict(),
             "preview_trace": self._build_preview_trace(multimodal_cache),
@@ -214,9 +253,10 @@ class SaverRolloutRunner:
         if answer_text is None:
             return None
         try:
-            return json.loads(answer_text)
+            payload = json.loads(answer_text)
         except Exception:
-            return answer_text
+            return None
+        return payload if isinstance(payload, dict) else None
 
     @staticmethod
     def _compute_state_delta(state_before: Dict[str, Any], state_after: Dict[str, Any]) -> Dict[str, Any]:
@@ -295,6 +335,14 @@ class SaverRolloutRunner:
                 "verifier_verified_window_ids": None,
                 "verifier_best_effort_window_ids": None,
                 "verifier_failure_reasons": None,
+                "verification_parse_mode": None,
+                "legacy_compatibility_used": None,
+                "invalid_selected_window_ids": [],
+                "selection_resolution_source": None,
+                "self_verification_decision": None,
+                "self_verification_scores": None,
+                "self_verification_selected_window_ids": None,
+                "self_verification_confidence": None,
             }
 
         content = tool_message.get("content", [])
@@ -328,19 +376,39 @@ class SaverRolloutRunner:
             "verifier_verified_window_ids": None,
             "verifier_best_effort_window_ids": None,
             "verifier_failure_reasons": None,
+            "self_verification_decision": None,
+            "self_verification_scores": None,
+            "self_verification_selected_window_ids": None,
+            "self_verification_confidence": None,
         }
         if tool_message.get("name") == "verify_hypothesis" and isinstance(parsed_json_payload, dict):
+            normalized_payload = parsed_json_payload
+            if (
+                normalized_payload.get("primary_status") is None
+                and normalized_payload.get("verification_decision") is not None
+            ):
+                normalized_payload = parse_self_verification_payload(normalized_payload)
             summary.update(
                 {
-                    "verifier_mode": parsed_json_payload.get("verification_mode"),
-                    "verifier_backend": parsed_json_payload.get("verifier_backend"),
-                    "verifier_primary_status": parsed_json_payload.get("primary_status"),
-                    "verifier_alert_status": parsed_json_payload.get("alert_status"),
-                    "verifier_recommended_action": parsed_json_payload.get("recommended_action"),
-                    "verifier_derived_scores": parsed_json_payload.get("derived_scores"),
-                    "verifier_verified_window_ids": parsed_json_payload.get("verified_window_ids"),
-                    "verifier_best_effort_window_ids": parsed_json_payload.get("best_effort_window_ids"),
-                    "verifier_failure_reasons": parsed_json_payload.get("failure_reasons"),
+                    "verifier_mode": normalized_payload.get("verification_mode"),
+                    "verifier_backend": normalized_payload.get("verifier_backend"),
+                    "verifier_primary_status": normalized_payload.get("primary_status"),
+                    "verifier_alert_status": normalized_payload.get("alert_status"),
+                    "verifier_recommended_action": normalized_payload.get("recommended_action"),
+                    "verifier_derived_scores": normalized_payload.get("derived_scores"),
+                    "verifier_verified_window_ids": normalized_payload.get("verified_window_ids"),
+                    "verifier_best_effort_window_ids": normalized_payload.get("best_effort_window_ids"),
+                    "verifier_failure_reasons": normalized_payload.get("failure_reasons"),
+                    "verification_parse_mode": normalized_payload.get("verification_parse_mode"),
+                    "legacy_compatibility_used": normalized_payload.get("legacy_compatibility_used"),
+                    "invalid_selected_window_ids": list(normalized_payload.get("invalid_selected_window_ids") or []),
+                    "selection_resolution_source": normalized_payload.get("selection_resolution_source"),
+                    "self_verification_decision": normalized_payload.get("verification_decision"),
+                    "self_verification_scores": normalized_payload.get("self_verification_scores")
+                    or normalized_payload.get("derived_scores"),
+                    "self_verification_selected_window_ids": normalized_payload.get("selected_window_ids")
+                    or normalized_payload.get("verified_window_ids"),
+                    "self_verification_confidence": normalized_payload.get("self_verification_confidence"),
                 }
             )
         if self.config.rollout_trace.record_observation_content:

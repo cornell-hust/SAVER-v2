@@ -10,6 +10,7 @@ from saver_agent.dataset import SaverAgentDataset
 from saver_agent.runtime import DistributedRuntime, runtime_log, should_log_progress
 from saver_agent.reward import score_rollout_trace
 from saver_agent.schema import SaverEnvironmentState
+from saver_agent.teacher_judge import compute_teacher_judge_signal
 from saver_agent.verifier import run_counterfactual_verifier
 
 
@@ -128,6 +129,12 @@ class ReferenceDataProvider:
         cache.update({key: value for key, value in verifier_kwargs.items() if value is not None})
         return cache
 
+    def get_dataset_item(self, video_id: str) -> Dict[str, Any]:
+        dataset = self._ensure_dataset()
+        if video_id not in self.index_by_video_id:
+            raise KeyError(f"Video id {video_id!r} not found in reference data.")
+        return dataset[int(self.index_by_video_id[video_id])]
+
 
 def rollout_state_from_dict(payload: Dict[str, Any]) -> SaverEnvironmentState:
     valid_fields = {field.name for field in fields(SaverEnvironmentState)}
@@ -225,13 +232,85 @@ def attach_offline_verifier(
     return augmented
 
 
+def attach_teacher_judge_to_records(
+    records: Sequence[Dict[str, Any]],
+    *,
+    reference_data: ReferenceDataProvider,
+    judge: Any,
+    input_mode: str = "multimodal_visual",
+    progress_every: int = 0,
+    progress_label: str = "teacher judge",
+    runtime: Optional[DistributedRuntime] = None,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    from saver_agent.training_data import build_reward_weighted_examples
+
+    annotated_records: List[Dict[str, Any]] = []
+    total_records = len(records)
+    candidate_turns = 0
+    annotated_turns = 0
+
+    for completed, record in enumerate(records, start=1):
+        augmented = copy.deepcopy(record)
+        video_id = str(augmented.get("video_id") or "").strip()
+        if not video_id:
+            annotated_records.append(augmented)
+            continue
+        try:
+            item = reference_data.get_dataset_item(video_id)
+        except Exception:
+            annotated_records.append(augmented)
+            continue
+
+        per_turn_examples = build_reward_weighted_examples(
+            item,
+            augmented,
+            include_invalid=True,
+        )
+        verify_examples_by_step = {
+            int(example.get("step_index") or 0): example
+            for example in per_turn_examples
+            if str(example.get("tool_name") or "") == "verify_hypothesis"
+        }
+        for turn in augmented.get("turns") or []:
+            step_index = int(turn.get("step_index") or 0)
+            verify_example = verify_examples_by_step.get(step_index)
+            if verify_example is None:
+                continue
+            candidate_turns += 1
+            annotated_example = judge.annotate_example(verify_example, input_mode=input_mode)
+            if "teacher_judge_scores" in annotated_example:
+                turn["teacher_judge_scores"] = copy.deepcopy(annotated_example.get("teacher_judge_scores") or {})
+            if "teacher_judge_decision" in annotated_example:
+                turn["teacher_judge_decision"] = annotated_example.get("teacher_judge_decision")
+            if "teacher_judge_rationale" in annotated_example:
+                turn["teacher_judge_rationale"] = annotated_example.get("teacher_judge_rationale")
+            turn.update(compute_teacher_judge_signal(turn))
+            annotated_turns += 1
+
+        annotated_records.append(augmented)
+        if should_log_progress(completed, total_records, int(progress_every)):
+            runtime_log(
+                (
+                    f"{progress_label}: records={completed}/{total_records} "
+                    f"teacher_candidates={candidate_turns} teacher_annotated={annotated_turns}"
+                ),
+                runtime=runtime,
+            )
+
+    return annotated_records, {
+        "num_records": total_records,
+        "num_teacher_judge_candidates": candidate_turns,
+        "num_teacher_judge_annotated_turns": annotated_turns,
+    }
+
+
 def score_rollout_records(
     records: Sequence[Dict[str, Any]],
     *,
     reference_data: Optional[ReferenceDataProvider] = None,
     verifier_backend: str = "heuristic",
     force_reverify: bool = False,
-    attach_reference_offline_verifier: bool = True,
+    attach_reference_offline_verifier: bool = False,
     verifier_kwargs: Optional[Dict[str, Any]] = None,
     progress_every: int = 0,
     progress_label: str = "score",
@@ -256,7 +335,7 @@ def score_rollout_records(
                 augmented,
                 reference_data=reference_data,
                 verifier_backend=verifier_backend,
-                force_reverify=True,
+                force_reverify=bool(force_reverify),
                 verifier_kwargs=verifier_kwargs,
             )
         augmented["reward_summary"] = score_rollout_trace(augmented)
@@ -264,6 +343,9 @@ def score_rollout_records(
             "verifier_backend": verifier_backend,
             "force_reverify": bool(force_reverify),
             "attach_offline_verifier": bool(attach_reference_offline_verifier),
+            "teacher_judge_present": bool(
+                any(turn.get("teacher_judge_decision") or turn.get("teacher_judge_alignment") is not None for turn in augmented.get("turns") or [])
+            ),
         }
         scored_records.append(augmented)
         if should_log_progress(completed, total_records, int(progress_every)):

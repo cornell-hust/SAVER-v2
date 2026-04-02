@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path("/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code")
@@ -96,6 +97,15 @@ class SaverAgentRuntimeTests(unittest.TestCase):
         device_map = resolve_inference_device_map("auto", runtime=runtime)
 
         self.assertEqual(device_map, {"": 1})
+
+    def test_resolve_inference_device_map_falls_back_to_gpu_zero_when_local_rank_exceeds_visible_devices(self):
+        self.assertIsNotNone(resolve_inference_device_map, "resolve_inference_device_map is missing")
+
+        runtime = distributed_runtime_from_env({"RANK": "2", "WORLD_SIZE": "4", "LOCAL_RANK": "2"})
+        with patch("torch.cuda.is_available", return_value=True), patch("torch.cuda.device_count", return_value=2):
+            device_map = resolve_inference_device_map("auto", runtime=runtime)
+
+        self.assertEqual(device_map, {"": 0})
 
 
 if __name__ == "__main__":

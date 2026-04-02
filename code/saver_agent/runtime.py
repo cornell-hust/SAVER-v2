@@ -110,7 +110,22 @@ def sharded_output_path(output_path: str | Path, *, num_shards: int, shard_index
 def resolve_inference_device_map(device_map: Any, *, runtime: Optional[DistributedRuntime] = None) -> Any:
     runtime = runtime or distributed_runtime_from_env()
     if runtime.is_distributed and device_map == "auto":
-        return {"": int(runtime.local_rank)}
+        try:
+            import torch
+        except Exception:
+            return {"": int(runtime.local_rank)}
+        if not torch.cuda.is_available():
+            return {"": int(runtime.local_rank)}
+        try:
+            visible_cuda_devices = int(torch.cuda.device_count())
+        except Exception:
+            return {"": int(runtime.local_rank)}
+        if visible_cuda_devices <= 0:
+            return {"": int(runtime.local_rank)}
+        local_rank = int(runtime.local_rank)
+        if 0 <= local_rank < visible_cuda_devices:
+            return {"": local_rank}
+        return {"": 0}
     return device_map
 
 

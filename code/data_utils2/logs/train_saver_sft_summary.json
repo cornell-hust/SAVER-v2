@@ -1,0 +1,14 @@
+{
+  "num_examples": 4183,
+  "num_records": 480,
+  "num_answer_examples": 480,
+  "num_tool_examples": 3703,
+  "num_teacher_judge_reweighted": 0,
+  "num_examples_with_image_refs": 4183,
+  "num_image_refs": 119438,
+  "num_inline_images": 0,
+  "materialized_examples": 0,
+  "num_errors": 0,
+  "errors": [],
+  "num_invalid_examples": 0
+}

@@ -26,6 +26,8 @@ class BatchRunSaverRolloutTests(unittest.TestCase):
         )
 
         self.assertEqual(args.max_turns, 12)
+        self.assertEqual(args.max_new_tokens, 256)
+        self.assertEqual(args.max_total_images, 24)
 
     def test_resolve_dataset_indices_uses_remaining_tail_when_count_is_zero(self):
         args = argparse.Namespace(indices="", start_index=2, count=0)

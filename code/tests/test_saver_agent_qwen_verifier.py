@@ -59,6 +59,25 @@ class _FakeModel:
 
 
 class SaverAgentQwenVerifierTests(unittest.TestCase):
+    def test_generation_kwargs_omit_sampling_parameters_when_sampling_disabled(self):
+        verifier = QwenSelfVerifier(
+            model=_FakeModel(),
+            processor=_FakeProcessor("{}"),
+            do_sample=False,
+            temperature=0.7,
+            top_p=0.8,
+            top_k=16,
+            repetition_penalty=1.1,
+        )
+
+        kwargs = verifier._generation_kwargs()
+
+        self.assertFalse(kwargs["do_sample"])
+        self.assertNotIn("temperature", kwargs)
+        self.assertNotIn("top_p", kwargs)
+        self.assertNotIn("top_k", kwargs)
+        self.assertEqual(kwargs["repetition_penalty"], 1.1)
+
     def test_qwen_verifier_prompt_requires_plain_json_and_exact_keys(self):
         processor = _FakeProcessor(
             '{"full": {}, "keep": {}, "drop": {}, "alert_prefix": {}}'

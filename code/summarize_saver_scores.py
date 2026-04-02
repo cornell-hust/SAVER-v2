@@ -20,6 +20,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="", help="Optional summary JSON output path.")
     parser.add_argument("--data", default="", help="Optional raw saver_agent/oracle JSONL used to compute full SAVER metrics.")
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths for metric computation.")
+    parser.add_argument(
+        "--max-teacher-disagreement-cases",
+        type=int,
+        default=50,
+        help="Maximum number of teacher disagreement cases to keep in the diagnostic summary. 0 keeps all.",
+    )
     return parser.parse_args()
 
 
@@ -36,9 +42,16 @@ def main() -> None:
     except FileNotFoundError as exc:
         raise SystemExit(str(exc))
 
-    summary = summarize_scored_rollouts(records)
+    reference_data = None
     if args.data:
         reference_data = ReferenceDataProvider(data_path=args.data, data_root=args.data_root)
+
+    summary = summarize_scored_rollouts(
+        records,
+        reference_data=reference_data,
+        max_teacher_disagreement_cases=args.max_teacher_disagreement_cases,
+    )
+    if args.data:
         summary = {
             **summary,
             "saver_metrics": summarize_saver_metrics(

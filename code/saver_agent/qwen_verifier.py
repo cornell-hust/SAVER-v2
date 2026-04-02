@@ -8,7 +8,12 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from saver_agent.qwen_policy import DEFAULT_MODEL_PATH, _to_pil_image
+from saver_agent.qwen_policy import (
+    DEFAULT_MODEL_PATH,
+    _build_generation_kwargs,
+    _configure_qwen_processor,
+    _to_pil_image,
+)
 
 
 DEFAULT_VERIFIER_MODEL_PATH = os.environ.get("SAVER_QWEN_VERIFIER_MODEL_PATH", DEFAULT_MODEL_PATH)
@@ -168,7 +173,7 @@ class QwenSelfVerifier:
 
         model = Qwen3VLForConditionalGeneration.from_pretrained(str(model_path), **model_init_kwargs)
         model.eval()
-        processor = AutoProcessor.from_pretrained(str(model_path))
+        processor = _configure_qwen_processor(AutoProcessor.from_pretrained(str(model_path)))
         return cls(
             model=model,
             processor=processor,
@@ -304,16 +309,11 @@ class QwenSelfVerifier:
         return inputs.to(device)
 
     def _generation_kwargs(self) -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {
-            "max_new_tokens": self.max_new_tokens,
-            "do_sample": self.do_sample,
-        }
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
-        if self.top_p is not None:
-            kwargs["top_p"] = self.top_p
-        if self.top_k is not None:
-            kwargs["top_k"] = self.top_k
-        if self.repetition_penalty is not None:
-            kwargs["repetition_penalty"] = self.repetition_penalty
-        return kwargs
+        return _build_generation_kwargs(
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+        )

@@ -167,6 +167,33 @@ def _make_normal_state():
 
 
 class SaverAgentVerifierTests(unittest.TestCase):
+    def test_counterfactual_verifier_masks_precursor_weight_when_reference_has_no_precursor(self):
+        multimodal_cache = _make_multimodal_cache()
+        multimodal_cache["structured_target"] = {
+            **multimodal_cache["structured_target"],
+            "precursor_interval_sec": None,
+        }
+
+        verdict = run_counterfactual_verifier(
+            state=_make_state(),
+            multimodal_cache=multimodal_cache,
+            verification_mode="final_check",
+            claim={"existence": "anomaly", "category": "assault", "earliest_alert_sec": 1.0},
+            candidate_window_ids=["w0001", "w0002"],
+            alert={"decision": "hard_alert", "alert_sec": 1.2},
+            backend="heuristic",
+        )
+
+        full_scores = verdict["view_scores"]["full"]
+        expected_overall = (
+            0.20 * float(full_scores["exist_support"])
+            + 0.20 * float(full_scores["category_support"])
+            + 0.20 * float(full_scores["temporal_support"])
+            + 0.20 * float(full_scores["alert_support"])
+            + 0.10 * float(full_scores["counterfactual_support"])
+        ) / 0.90
+        self.assertAlmostEqual(full_scores["overall_support"], expected_overall, places=6)
+
     def test_counterfactual_verifier_resolves_candidate_evidence_moment_ids_to_runtime_subset(self):
         verdict = run_counterfactual_verifier(
             state=_make_state(),

@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import json
 import math
+import random
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
+from saver_agent.experiment_logging import append_jsonl, write_json
 from saver_agent.evaluation import RolloutEvaluationConfig, run_rollout_evaluation
 from saver_agent.qwen_policy import _to_pil_image
-from saver_agent.runtime import distributed_barrier, distributed_runtime_from_env, runtime_log, should_log_progress
+from saver_agent.runtime import (
+    distributed_barrier,
+    distributed_runtime_from_env,
+    resolve_inference_device_map,
+    runtime_log,
+    should_log_progress,
+)
 
 
 DEFAULT_LORA_TARGET_MODULES = [
@@ -27,6 +37,7 @@ DEFAULT_LORA_TARGET_MODULES = [
 ]
 
 SFT_TENSOR_CACHE_SCHEMA_VERSION = "saver_agent.sft_tensor_cache.v1"
+SFT_EPOCH_RESUME_DIRNAME = "epoch_resume"
 
 
 def _frame_cache_path(video_path: Path) -> Path:
@@ -35,13 +46,6 @@ def _frame_cache_path(video_path: Path) -> Path:
 
 def _print_cache_warning(message: str) -> None:
     print(f"[cache-warning] {message}", flush=True)
-
-
-def _append_jsonl(path: str | Path, payload: Dict[str, Any]) -> None:
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _iter_image_ref_video_paths(messages: Sequence[Dict[str, Any]]) -> Iterable[Path]:
@@ -1511,6 +1515,37 @@ def compute_masked_response_nll(
     return masked_nll.mean() if masked_nll.numel() else logits.new_zeros(())
 
 
+def compute_weighted_masked_response_nll(
+    *,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    token_weights: torch.Tensor,
+) -> torch.Tensor:
+    shift_logits, shift_labels, response_mask = _shift_logits_and_labels(logits, labels)
+    if not torch.any(response_mask):
+        return logits.new_zeros(())
+
+    if token_weights.shape != labels.shape:
+        raise ValueError(
+            f"token_weights must match labels shape for weighted SFT: got {tuple(token_weights.shape)} vs {tuple(labels.shape)}"
+        )
+
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    safe_labels = shift_labels.masked_fill(~response_mask, 0)
+    token_nll = -torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+
+    shifted_weights = token_weights[..., 1:].to(token_nll.device, dtype=torch.float32)
+    masked_nll = token_nll.masked_select(response_mask)
+    masked_weights = shifted_weights.masked_select(response_mask).clamp_min(0.0)
+    if masked_nll.numel() == 0:
+        return logits.new_zeros(())
+
+    normalizer = masked_weights.sum()
+    if float(normalizer.detach().item()) <= 1e-8:
+        return logits.new_zeros(())
+    return (masked_nll * masked_weights).sum() / normalizer
+
+
 def compute_masked_response_log_probs(
     *,
     logits: torch.Tensor,
@@ -1787,6 +1822,22 @@ def _build_component_response_char_weights(
             "window_id",
             "evidence_id",
         ],
+        "teacher_local": [
+            "verification_decision",
+            "recommended_action",
+            "sufficiency_score",
+            "necessity_score",
+            "alertability_score",
+            "counterfactual_faithfulness",
+            "selected_window_ids",
+            "selected_evidence_ids",
+            "selected_evidence_moment_ids",
+            "rationale",
+            "continue_search",
+            "revise_claim",
+            "refine_evidence",
+            "finalize",
+        ],
     }
     _apply_focus_term_weights(
         response_text,
@@ -1826,7 +1877,7 @@ def build_token_advantages_from_offsets(
         return []
     component_pairs: List[Tuple[str, float]] = []
     if advantage_components:
-        for component_name in ("global", "search_local", "alert_local", "evidence_local"):
+        for component_name in ("global", "search_local", "alert_local", "evidence_local", "teacher_local"):
             component_advantage = float(advantage_components.get(component_name, 0.0) or 0.0)
             component_weight = 1.0
             if turn_component_weights is not None:
@@ -1959,8 +2010,28 @@ def load_qwen_model_and_processor(
     if attn_implementation:
         model_init_kwargs["attn_implementation"] = attn_implementation
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained(str(model_path), **model_init_kwargs)
-    processor = AutoProcessor.from_pretrained(str(model_path))
+    resolved_model_path = Path(model_path)
+    adapter_config_path = resolved_model_path / "adapter_config.json"
+    base_model_path = str(resolved_model_path)
+    processor_path = str(resolved_model_path)
+    if adapter_config_path.exists():
+        try:
+            from peft import PeftConfig, PeftModel
+        except Exception as exc:
+            raise ImportError("Loading LoRA adapter checkpoints requires `peft` to be installed.") from exc
+        peft_config = PeftConfig.from_pretrained(str(resolved_model_path))
+        base_model_path = str(peft_config.base_model_name_or_path)
+        model = Qwen3VLForConditionalGeneration.from_pretrained(base_model_path, **model_init_kwargs)
+        try:
+            model = PeftModel.from_pretrained(model, str(resolved_model_path), is_trainable=bool(use_lora))
+        except TypeError:
+            model = PeftModel.from_pretrained(model, str(resolved_model_path))
+        if not any((resolved_model_path / filename).exists() for filename in ("preprocessor_config.json", "processor_config.json", "tokenizer_config.json", "tokenizer.json")):
+            processor_path = base_model_path
+    else:
+        model = Qwen3VLForConditionalGeneration.from_pretrained(str(resolved_model_path), **model_init_kwargs)
+
+    processor = AutoProcessor.from_pretrained(processor_path)
     if hasattr(model.config, "use_cache"):
         # KV cache is useful for autoregressive decoding, not for teacher-forced SFT.
         model.config.use_cache = False
@@ -2133,14 +2204,23 @@ def create_trainer(
                 else:
                     # The collator already masks prompt tokens with -100, so the model's
                     # native loss is the same objective without an extra full-vocab log_softmax.
-                    nll_loss = getattr(outputs, "loss", None)
+                    if token_advantages is not None:
+                        nll_loss = compute_weighted_masked_response_nll(
+                            logits=outputs.logits,
+                            labels=labels,
+                            token_weights=token_advantages,
+                        )
+                        weight_value = nll_loss.new_tensor(1.0)
+                    else:
+                        nll_loss = getattr(outputs, "loss", None)
                     if nll_loss is None:
                         nll_loss = compute_masked_response_nll(logits=outputs.logits, labels=labels)
-                    weight_value = (
-                        sample_weight.to(nll_loss.device).mean()
-                        if sample_weight is not None
-                        else nll_loss.new_tensor(1.0)
-                    )
+                    if token_advantages is None:
+                        weight_value = (
+                            sample_weight.to(nll_loss.device).mean()
+                            if sample_weight is not None
+                            else nll_loss.new_tensor(1.0)
+                        )
                     loss = nll_loss * weight_value
 
                 if self.reference_model is not None and self.kl_beta > 0.0:
@@ -2299,8 +2379,6 @@ def _build_rollout_eval_callback(
     except Exception as exc:
         raise ImportError("Rollout evaluation callbacks require the `transformers` package.") from exc
 
-    from saver_agent.qwen_policy import QwenGenerationPolicy
-
     class RolloutEvalCallback(TrainerCallback):
         def __init__(self):
             self.processor = processor
@@ -2315,31 +2393,61 @@ def _build_rollout_eval_callback(
             if hasattr(eval_model, "eval"):
                 eval_model.eval()
             try:
-                policy = QwenGenerationPolicy.from_components(
+                epoch_index = max(1, int(round(float(state.epoch or 0.0))))
+                resume_dir = save_sft_epoch_resume_checkpoint(
                     model=eval_model,
                     processor=self.processor,
-                    max_new_tokens=512,
-                    do_sample=False,
-                )
-                metrics = run_rollout_evaluation(
-                    policy,
-                    eval_config=self.rollout_eval_config,
                     output_dir=args.output_dir,
-                    epoch_index=max(1, int(round(float(state.epoch or 0.0)))),
+                    epoch_index=epoch_index,
+                    optimizer=kwargs.get("optimizer"),
+                    lr_scheduler=kwargs.get("lr_scheduler"),
+                    state=state,
                     runtime=self.runtime,
                 )
-                if self.runtime.is_main_process and metrics is not None:
-                    record = {"epoch": float(state.epoch or 0.0), **metrics}
-                    _append_jsonl(Path(args.output_dir) / "rollout_eval_metrics.jsonl", record)
+                runtime_log(
+                    f"saved epoch-resume checkpoint for rollout-eval recovery: {resume_dir}",
+                    runtime=self.runtime,
+                    main_process_only=True,
+                )
+                if bool(self.rollout_eval_config.inline_rollout_eval):
+                    from saver_agent.qwen_policy import QwenGenerationPolicy
+
                     runtime_log(
                         (
-                            f"epoch {float(state.epoch or 0.0):.2f} rollout eval: "
-                            f"{json.dumps(metrics, ensure_ascii=False)}"
+                            "running epoch-end rollout eval inline before the next epoch; "
+                            f"resume checkpoint remains available at {resume_dir}"
+                        ),
+                        runtime=self.runtime,
+                        main_process_only=True,
+                    )
+                    policy = QwenGenerationPolicy.from_components(
+                        model=eval_model,
+                        processor=self.processor,
+                        max_new_tokens=int(self.rollout_eval_config.policy_max_new_tokens),
+                        max_total_images=int(self.rollout_eval_config.max_total_images),
+                        do_sample=False,
+                    )
+                    run_rollout_eval_with_policy(
+                        policy,
+                        rollout_eval_config=self.rollout_eval_config,
+                        output_dir=args.output_dir,
+                        epoch_index=epoch_index,
+                        epoch_value=float(state.epoch or epoch_index),
+                        runtime=self.runtime,
+                    )
+                else:
+                    runtime_log(
+                        (
+                            "deferred epoch-end rollout eval to an external process; "
+                            f"resume checkpoint is ready at {resume_dir}"
                         ),
                         runtime=self.runtime,
                         main_process_only=True,
                     )
             finally:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 if was_training and hasattr(eval_model, "train"):
                     eval_model.train()
             return control
@@ -2347,11 +2455,181 @@ def _build_rollout_eval_callback(
     return RolloutEvalCallback()
 
 
+def sft_epoch_resume_dir(output_dir: str | Path, epoch_index: int) -> Path:
+    return Path(output_dir) / SFT_EPOCH_RESUME_DIRNAME / f"epoch_{int(epoch_index):03d}"
+
+
+def _write_rollout_eval_record(
+    *,
+    output_dir: str | Path,
+    metrics: Dict[str, Any],
+    epoch_value: float,
+    runtime: Any,
+) -> None:
+    if not runtime.is_main_process:
+        return
+    record = {"epoch": float(epoch_value), **metrics}
+    append_jsonl(Path(output_dir) / "rollout_eval_metrics.jsonl", record)
+    append_jsonl(Path(output_dir) / "logs" / "rollout_eval_metrics.jsonl", record)
+    runtime_log(
+        f"epoch {float(epoch_value):.2f} rollout eval: {json.dumps(metrics, ensure_ascii=False)}",
+        runtime=runtime,
+        main_process_only=True,
+    )
+
+
+def run_rollout_eval_with_policy(
+    policy: Any,
+    *,
+    rollout_eval_config: RolloutEvaluationConfig,
+    output_dir: str | Path,
+    epoch_index: int,
+    epoch_value: float | None = None,
+    runtime: Any = None,
+) -> Optional[Dict[str, Any]]:
+    runtime = runtime or distributed_runtime_from_env()
+    metrics = run_rollout_evaluation(
+        policy,
+        eval_config=rollout_eval_config,
+        output_dir=output_dir,
+        epoch_index=int(epoch_index),
+        runtime=runtime,
+    )
+    if metrics is not None:
+        _write_rollout_eval_record(
+            output_dir=output_dir,
+            metrics=metrics,
+            epoch_value=float(epoch_value if epoch_value is not None else epoch_index),
+            runtime=runtime,
+        )
+    return metrics
+
+
+def _save_epoch_resume_rng_state(
+    output_dir: str | Path,
+    *,
+    runtime: Any,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rng_states = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "cpu": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        if getattr(runtime, "world_size", 1) > 1:
+            rng_states["cuda"] = torch.cuda.random.get_rng_state_all()
+        else:
+            rng_states["cuda"] = torch.cuda.random.get_rng_state()
+    rng_filename = "rng_state.pth" if getattr(runtime, "world_size", 1) <= 1 else f"rng_state_{int(runtime.rank)}.pth"
+    torch.save(rng_states, output_dir / rng_filename)
+
+
+def save_sft_epoch_resume_checkpoint(
+    *,
+    model: Any,
+    processor: Any,
+    output_dir: str | Path,
+    epoch_index: int,
+    optimizer: Any = None,
+    lr_scheduler: Any = None,
+    state: Any = None,
+    runtime: Any = None,
+) -> Path:
+    runtime = runtime or distributed_runtime_from_env()
+    checkpoint_dir = sft_epoch_resume_dir(output_dir, epoch_index)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    model_to_save = _unwrap_model(model)
+    if runtime.is_main_process:
+        model_to_save.save_pretrained(str(checkpoint_dir))
+        if hasattr(processor, "save_pretrained"):
+            processor.save_pretrained(str(checkpoint_dir))
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+        if lr_scheduler is not None:
+            torch.save(lr_scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+        if state is not None and hasattr(state, "save_to_json"):
+            state.save_to_json(str(checkpoint_dir / "trainer_state.json"))
+        write_json(
+            checkpoint_dir / "resume_metadata.json",
+            {
+                "epoch_index": int(epoch_index),
+                "checkpoint_kind": "epoch_end_before_rollout_eval",
+                "world_size": int(getattr(runtime, "world_size", 1)),
+                "global_step": int(getattr(state, "global_step", 0) or 0) if state is not None else 0,
+                "epoch": float(getattr(state, "epoch", float(epoch_index)) or float(epoch_index)),
+            },
+        )
+    _save_epoch_resume_rng_state(checkpoint_dir, runtime=runtime)
+    distributed_barrier(runtime)
+    return checkpoint_dir
+
+
+def run_rollout_eval_from_checkpoint(
+    *,
+    checkpoint_path: str | Path,
+    output_dir: str | Path,
+    rollout_eval_config: RolloutEvaluationConfig,
+    epoch_index: int,
+    model_path: str | Path = "",
+    torch_dtype: str = "auto",
+    attn_implementation: Optional[str] = None,
+    runtime: Any = None,
+) -> Optional[Dict[str, Any]]:
+    from saver_agent.qwen_policy import QwenGenerationPolicy
+
+    runtime = runtime or distributed_runtime_from_env()
+    resolved_checkpoint_path = Path(checkpoint_path)
+    if not resolved_checkpoint_path.exists():
+        raise FileNotFoundError(f"resume checkpoint does not exist: {resolved_checkpoint_path}")
+
+    runtime_log(
+        (
+            f"loading rollout-eval recovery checkpoint from {resolved_checkpoint_path} "
+            f"(base_model_hint={model_path or resolved_checkpoint_path})"
+        ),
+        runtime=runtime,
+        main_process_only=True,
+    )
+    resolved_device_map = resolve_inference_device_map("auto", runtime=runtime)
+    runtime_log(
+        f"rollout-eval recovery policy device_map={resolved_device_map}",
+        runtime=runtime,
+        main_process_only=True,
+    )
+    policy = QwenGenerationPolicy.from_pretrained(
+        resolved_checkpoint_path,
+        torch_dtype=torch_dtype,
+        device_map=resolved_device_map,
+        attn_implementation=attn_implementation,
+        max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
+        max_total_images=int(rollout_eval_config.max_total_images),
+        do_sample=False,
+    )
+    try:
+        return run_rollout_eval_with_policy(
+            policy,
+            rollout_eval_config=rollout_eval_config,
+            output_dir=output_dir,
+            epoch_index=int(epoch_index),
+            epoch_value=float(epoch_index),
+            runtime=runtime,
+        )
+    finally:
+        del policy
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def run_weighted_sft(
     examples: Sequence[Dict[str, Any]],
     *,
     model_path: str | Path,
     output_dir: str | Path,
+    resume_from_checkpoint: str | Path = "",
     tensor_cache_dir: str | Path = "",
     training_objective: str = "weighted_sft",
     old_policy_model_path: str | Path | None = None,
@@ -2395,9 +2673,54 @@ def run_weighted_sft(
     runtime = distributed_runtime_from_env()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = output_dir / "logs"
+    if runtime.is_main_process:
+        write_json(
+            log_dir / "run_weighted_sft_config.json",
+            {
+                "model_path": str(model_path),
+                "output_dir": str(output_dir),
+                "resume_from_checkpoint": str(resume_from_checkpoint) if resume_from_checkpoint else "",
+                "tensor_cache_dir": str(tensor_cache_dir) if tensor_cache_dir else "",
+                "training_objective": str(training_objective),
+                "num_examples": len(examples),
+                "learning_rate": float(learning_rate),
+                "num_train_epochs": float(num_train_epochs),
+                "per_device_train_batch_size": int(per_device_train_batch_size),
+                "gradient_accumulation_steps": int(gradient_accumulation_steps),
+                "logging_steps": int(logging_steps),
+                "save_steps": int(save_steps),
+                "save_total_limit": int(save_total_limit),
+                "bf16": bool(bf16),
+                "fp16": bool(fp16),
+                "torch_dtype": str(torch_dtype),
+                "attn_implementation": str(attn_implementation or ""),
+                "gradient_checkpointing": bool(gradient_checkpointing),
+                "use_lora": bool(use_lora),
+                "lora_r": int(lora_r),
+                "lora_alpha": int(lora_alpha),
+                "lora_dropout": float(lora_dropout),
+                "lora_target_modules": list(lora_target_modules or []),
+                "max_image_side": int(max_image_side),
+                "max_image_pixels": int(max_image_pixels),
+                "keep_recent_tool_image_messages": int(keep_recent_tool_image_messages),
+                "max_total_images": int(max_total_images),
+                "max_seq_length": int(max_seq_length),
+                "keep_recent_text_messages": int(keep_recent_text_messages),
+                "dataloader_num_workers": int(dataloader_num_workers),
+                "dataloader_prefetch_factor": int(dataloader_prefetch_factor),
+                "dataloader_persistent_workers": bool(dataloader_persistent_workers),
+                "old_policy_model_path": str(old_policy_model_path or ""),
+                "reference_model_path": str(reference_model_path or ""),
+                "ppo_clip_epsilon": float(ppo_clip_epsilon),
+                "kl_beta": float(kl_beta),
+                "rollout_eval_enabled": rollout_eval_config is not None,
+            },
+        )
     runtime_log(
         (
             f"SFT setup: num_examples={len(examples)} output_dir={output_dir} model_path={model_path} "
+            f"resume_from_checkpoint={str(resume_from_checkpoint) if resume_from_checkpoint else 'off'} "
             f"training_objective={training_objective} "
             f"tensor_cache_dir={str(tensor_cache_dir) if tensor_cache_dir else 'off'}"
         ),
@@ -2479,11 +2802,20 @@ def run_weighted_sft(
         )
     callbacks = []
     if rollout_eval_config is not None:
+        diagnostic_status = (
+            f"on(backend={rollout_eval_config.verifier_backend})"
+            if bool(rollout_eval_config.attach_reference_diagnostics)
+            else "off"
+        )
         runtime_log(
             (
-                "epoch-end rollout evaluation enabled: "
+                "epoch-end rollout eval enabled: "
                 f"data={rollout_eval_config.data_path} max_records={rollout_eval_config.max_records or 'all'} "
-                f"backend={rollout_eval_config.verifier_backend}"
+                f"mode={'inline' if bool(rollout_eval_config.inline_rollout_eval) else 'deferred'} "
+                f"external_process_required={'no' if bool(rollout_eval_config.inline_rollout_eval) else 'yes'} "
+                f"main_eval=reference_free diagnostic_reference_eval={diagnostic_status} "
+                f"policy_max_new_tokens={int(rollout_eval_config.policy_max_new_tokens)} "
+                f"max_total_images={int(rollout_eval_config.max_total_images) if int(rollout_eval_config.max_total_images) > 0 else 'all'}"
             ),
             runtime=runtime,
             main_process_only=True,
@@ -2539,15 +2871,33 @@ def run_weighted_sft(
         kl_beta=kl_beta,
         callbacks=callbacks,
     )
+    resolved_resume_from_checkpoint = str(resume_from_checkpoint) if resume_from_checkpoint else None
+    if resolved_resume_from_checkpoint:
+        runtime_log(
+            f"resuming Trainer.train() from {resolved_resume_from_checkpoint}",
+            runtime=runtime,
+            main_process_only=True,
+        )
     runtime_log("starting Trainer.train()", runtime=runtime, main_process_only=True)
-    train_result = trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=resolved_resume_from_checkpoint)
     if trainer.is_world_process_zero():
         trainer.save_model(str(output_dir))
         processor.save_pretrained(str(output_dir))
+        write_json(
+            log_dir / "trainer_log_history.json",
+            {
+                "log_history": list(getattr(trainer.state, "log_history", []) or []),
+                "global_step": int(getattr(trainer.state, "global_step", 0) or 0),
+                "epoch": float(getattr(trainer.state, "epoch", 0.0) or 0.0),
+                "max_steps": int(getattr(trainer.state, "max_steps", 0) or 0),
+                "num_train_epochs": int(getattr(trainer.state, "num_train_epochs", 0) or 0),
+            },
+        )
     distributed_barrier(runtime)
-    return {
+    result = {
         "num_examples": len(examples),
         "output_dir": str(output_dir),
+        "log_dir": str(log_dir),
         "tensor_cache_dir": str(tensor_cache_dir) if tensor_cache_dir else "",
         "train_loss": float(getattr(train_result, "training_loss", 0.0)),
         "training_objective": str(training_objective),
@@ -2556,3 +2906,6 @@ def run_weighted_sft(
         "kl_beta": float(kl_beta),
         "reference_model_path": resolved_reference_model_path,
     }
+    if trainer.is_world_process_zero():
+        write_json(log_dir / "run_weighted_sft_result.json", result)
+    return result

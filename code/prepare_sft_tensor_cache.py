@@ -71,8 +71,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--frame-cache-max-cached-videos",
         type=int,
-        default=64,
+        default=128,
         help="How many frame_cache tensors/video readers to keep open while materializing image_ref payloads.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Split filtered examples into N deterministic shards. Use with --shard-index for parallel cache builds.",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Zero-based shard index to build when --num-shards > 1.",
     )
     return parser.parse_args(argv)
 
@@ -143,8 +155,41 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _normalize_shard_args(*, num_shards: int, shard_index: int) -> tuple[int, int]:
+    normalized_num_shards = int(num_shards)
+    normalized_shard_index = int(shard_index)
+    if normalized_num_shards <= 0:
+        raise ValueError(f"--num-shards must be >= 1, got {normalized_num_shards}")
+    if normalized_shard_index < 0 or normalized_shard_index >= normalized_num_shards:
+        raise ValueError(
+            f"--shard-index must be in [0, {normalized_num_shards - 1}], got {normalized_shard_index}"
+        )
+    return normalized_num_shards, normalized_shard_index
+
+
+def _select_examples_for_shard(
+    examples: List[Dict[str, Any]],
+    *,
+    num_shards: int,
+    shard_index: int,
+) -> List[Dict[str, Any]]:
+    if int(num_shards) <= 1:
+        return list(examples)
+    total_examples = len(examples)
+    start = (total_examples * int(shard_index)) // int(num_shards)
+    end = (total_examples * (int(shard_index) + 1)) // int(num_shards)
+    return list(examples[start:end])
+
+
+def _shard_file_suffix(*, num_shards: int, shard_index: int) -> str:
+    if int(num_shards) <= 1:
+        return ""
+    return f".shard-{int(shard_index)}-of-{int(num_shards)}"
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
+    num_shards, shard_index = _normalize_shard_args(num_shards=args.num_shards, shard_index=args.shard_index)
     runtime = distributed_runtime_from_env()
     prepared_data_path = Path(args.prepared_data)
     output_dir = Path(args.output_dir) if args.output_dir else default_sft_tensor_cache_dir(prepared_data_path)
@@ -152,7 +197,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         (
             f"SFT tensor cache startup: prepared_data={prepared_data_path} "
             f"output_dir={output_dir} model_path={args.model_path} "
-            f"include_splits={parse_include_splits(args.include_splits) or 'all'}"
+            f"include_splits={parse_include_splits(args.include_splits) or 'all'} "
+            f"shard={shard_index + 1}/{num_shards}"
         ),
         runtime=runtime,
         main_process_only=True,
@@ -167,6 +213,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         examples = examples[: int(args.max_examples)]
     if not examples:
         raise ValueError("No prepared SFT examples were loaded.")
+    total_examples = len(examples)
+    examples = _select_examples_for_shard(examples, num_shards=num_shards, shard_index=shard_index)
 
     processor = _load_processor(args.model_path)
     processor_signature = build_processor_signature(processor)
@@ -181,7 +229,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_seq_length=args.max_seq_length,
         keep_recent_text_messages=args.keep_recent_text_messages,
         prepared_data_path=prepared_data_path,
-        num_examples=len(examples),
+        num_examples=total_examples,
     )
     metadata_path = output_dir / "metadata.json"
     existing_metadata = _load_existing_metadata(metadata_path)
@@ -206,7 +254,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     built_count = 0
     skipped_existing = 0
     total_bytes = 0
-    total_examples = len(examples)
+    shard_examples = len(examples)
     for idx, example in enumerate(examples, start=1):
         cache_key = build_sft_tensor_cache_key(example)
         entry_path = sft_tensor_cache_entry_path(output_dir, cache_key)
@@ -243,11 +291,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "tool_name": example.get("tool_name"),
             }
         )
-        if should_log_progress(idx, total_examples, int(args.progress_every)):
+        if should_log_progress(idx, shard_examples, int(args.progress_every)):
             runtime_log(
                 (
                     "SFT tensor cache progress: "
-                    f"examples={idx}/{total_examples} built={built_count} skipped_existing={skipped_existing}"
+                    f"examples={idx}/{shard_examples} built={built_count} skipped_existing={skipped_existing} "
+                    f"shard={shard_index + 1}/{num_shards}"
                 ),
                 runtime=runtime,
                 main_process_only=True,
@@ -255,7 +304,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(metadata_path, metadata)
-    manifest_path = output_dir / "manifest.jsonl"
+    shard_suffix = _shard_file_suffix(num_shards=num_shards, shard_index=shard_index)
+    manifest_path = output_dir / f"manifest{shard_suffix}.jsonl"
     with manifest_path.open("w", encoding="utf-8") as f:
         for row in manifest_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -263,14 +313,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     summary = {
         "output_dir": str(output_dir),
         "prepared_data_path": str(prepared_data_path),
-        "num_examples": total_examples,
+        "num_examples": shard_examples,
+        "num_examples_total": total_examples,
         "num_built": built_count,
         "num_skipped_existing": skipped_existing,
         "total_bytes": int(total_bytes),
+        "num_shards": int(num_shards),
+        "shard_index": int(shard_index),
         "metadata_path": str(metadata_path),
         "manifest_path": str(manifest_path),
     }
-    _write_json(output_dir / "summary.json", summary)
+    _write_json(output_dir / f"summary{shard_suffix}.json", summary)
     if runtime.is_main_process:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 

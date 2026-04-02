@@ -32,6 +32,8 @@ class SaverAgentPromptTests(unittest.TestCase):
         self.assertIn("soft_alert_check", prompt)
         self.assertIn("hard_alert_check", prompt)
         self.assertIn("full_keep_drop", prompt)
+        self.assertNotIn("allow_external_verifier_fallback", prompt)
+        self.assertNotIn("verifier_backend", prompt)
 
     def test_build_system_prompt_requires_finalize_before_terminal_answer(self):
         prompt = build_system_prompt(get_tool_schemas())

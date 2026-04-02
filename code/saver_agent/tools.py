@@ -7,12 +7,32 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
 
+from saver_agent.categories import canonicalize_category_payload, validate_canonical_category_payload
 from saver_agent.proposal import coerce_feature_cache_payload, feature_guided_frame_proposal, normalize_query_text
 from saver_agent.schema import SaverEnvironmentState, validate_required_fields
+from saver_agent.self_verification import (
+    normalize_self_verification_mode,
+    parse_self_verification_payload,
+    validate_policy_self_verification_payload,
+)
 from saver_agent.verifier import run_counterfactual_verifier
 
 
 MAX_NUM_KEY_FRAMES = 8
+SELF_VERIFICATION_VERDICT_KEYS = (
+    "verification_decision",
+    "primary_status",
+    "alert_status",
+    "recommended_action",
+    "sufficiency_score",
+    "necessity_score",
+    "alertability_score",
+    "counterfactual_faithfulness",
+    "derived_scores",
+    "failure_reasons",
+    "rationale",
+    "explanation",
+)
 
 
 def _coerce_float(value: Any, default: float) -> float:
@@ -85,6 +105,20 @@ def _indices_to_timestamps(indices: List[int], fps: float) -> List[float]:
     return [round(float(idx) / fps, 6) for idx in indices]
 
 
+def _build_minimal_claim_from_alert_payload(alert_payload: Dict[str, Any]) -> Dict[str, Any]:
+    claim: Dict[str, Any] = {}
+    existence = str(alert_payload.get("existence") or "").strip()
+    category = str(alert_payload.get("category") or "").strip()
+    earliest_alert_sec = alert_payload.get("earliest_alert_sec", alert_payload.get("alert_sec"))
+    if existence:
+        claim["existence"] = existence
+    if category:
+        claim["category"] = category
+    if earliest_alert_sec is not None:
+        claim["earliest_alert_sec"] = float(earliest_alert_sec)
+    return claim
+
+
 def _build_visual_content(indices: List[int], multimodal_cache: Dict, footer: str) -> List[Dict[str, Any]]:
     fps = float(multimodal_cache.get("fps") or 1.0)
     frames = multimodal_cache.get("video")
@@ -105,6 +139,18 @@ def _build_visual_content(indices: List[int], multimodal_cache: Dict, footer: st
             content.append(image_item)
     content.append({"type": "text", "text": footer})
     return content
+
+
+def _dedupe_string_list(values: List[Any] | Tuple[Any, ...] | None) -> List[str]:
+    deduped: List[str] = []
+    seen = set()
+    for value in values or []:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        deduped.append(text)
+        seen.add(text)
+    return deduped
 
 
 def _append_window(
@@ -148,6 +194,196 @@ def _append_window(
     if record_as_evidence:
         state.evidence_ledger.append(entry)
     return entry
+
+
+def _has_self_verification_payload(arguments: Dict[str, Any]) -> bool:
+    return any(key in arguments for key in SELF_VERIFICATION_VERDICT_KEYS)
+
+
+def _looks_like_legacy_verification_request(arguments: Dict[str, Any]) -> bool:
+    for key in (
+        "claim",
+        "alert",
+        "query",
+        "candidate_window_ids",
+        "candidate_evidence_ids",
+        "candidate_evidence_moment_ids",
+        "evidence_ids",
+        "evidence_moment_ids",
+    ):
+        value = arguments.get(key)
+        if isinstance(value, dict) and value:
+            return True
+        if isinstance(value, (list, tuple, set)) and value:
+            return True
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _normalize_verification_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(arguments or {})
+    normalized["verification_mode"] = normalize_self_verification_mode(
+        normalized.get("verification_mode"),
+        default="reward_only",
+    )
+    if isinstance(normalized.get("claim"), dict):
+        normalized["claim"] = validate_canonical_category_payload(
+            normalized["claim"],
+            payload_name="claim",
+            require_category_for_anomaly=True,
+        )
+    if isinstance(normalized.get("alert"), dict):
+        normalized["alert"] = validate_canonical_category_payload(
+            normalized["alert"],
+            payload_name="alert",
+        )
+    return normalized
+
+
+def _resolve_selected_window_ids(
+    state: SaverEnvironmentState,
+    *,
+    selected_window_ids: List[str],
+    selected_evidence_ids: List[str],
+    selected_evidence_moment_ids: List[str],
+    candidate_window_ids: List[str],
+) -> Dict[str, Any]:
+    requested_selected_window_ids = _dedupe_string_list(selected_window_ids)
+    selected_evidence_ids = _dedupe_string_list(selected_evidence_ids)
+    selected_evidence_moment_ids = _dedupe_string_list(selected_evidence_moment_ids)
+    candidate_window_ids = _dedupe_string_list(candidate_window_ids)
+    raw_window_selector_ids = _dedupe_string_list(requested_selected_window_ids + candidate_window_ids)
+
+    resolved: List[str] = []
+    seen = set()
+    invalid_selected_window_ids: List[str] = []
+    resolution_sources: List[str] = []
+    valid_window_ids = {
+        str(entry.get("window_id")).strip()
+        for entry in state.evidence_ledger
+        if str(entry.get("window_id") or "").strip()
+    }
+    by_evidence_id = {
+        str(entry.get("evidence_id")): entry for entry in state.evidence_ledger if entry.get("evidence_id")
+    }
+    by_moment_id: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in state.evidence_ledger:
+        moment_id = entry.get("moment_id")
+        if moment_id is None:
+            continue
+        by_moment_id.setdefault(str(moment_id), []).append(entry)
+
+    selected_window_added = False
+    for window_id in requested_selected_window_ids:
+        if window_id not in valid_window_ids:
+            invalid_selected_window_ids.append(window_id)
+            continue
+        if window_id not in seen:
+            seen.add(window_id)
+            resolved.append(window_id)
+            selected_window_added = True
+    if selected_window_added:
+        resolution_sources.append("selected_window_ids")
+
+    evidence_added = False
+    for evidence_id in selected_evidence_ids:
+        entry = by_evidence_id.get(str(evidence_id))
+        if entry is None:
+            continue
+        window_id = str(entry.get("window_id") or "").strip()
+        if window_id and window_id not in seen:
+            seen.add(window_id)
+            resolved.append(window_id)
+            evidence_added = True
+    if evidence_added:
+        resolution_sources.append("selected_evidence_ids")
+
+    moment_added = False
+    for moment_id in selected_evidence_moment_ids:
+        for entry in by_moment_id.get(str(moment_id), []):
+            window_id = str(entry.get("window_id") or "").strip()
+            if window_id and window_id not in seen:
+                seen.add(window_id)
+                resolved.append(window_id)
+                moment_added = True
+    if moment_added:
+        resolution_sources.append("selected_evidence_moment_ids")
+
+    valid_candidate_window_ids: List[str] = []
+    candidate_added = False
+    candidate_fallback_allowed = not resolved
+    for window_id in candidate_window_ids:
+        if window_id not in valid_window_ids:
+            continue
+        if window_id not in valid_candidate_window_ids:
+            valid_candidate_window_ids.append(window_id)
+        if not candidate_fallback_allowed:
+            continue
+        if window_id not in seen:
+            seen.add(window_id)
+            resolved.append(window_id)
+            candidate_added = True
+    if candidate_added:
+        resolution_sources.append("candidate_window_ids")
+
+    selection_requested = bool(
+        requested_selected_window_ids or selected_evidence_ids or selected_evidence_moment_ids or candidate_window_ids
+    )
+    if resolution_sources:
+        selection_resolution_source = "+".join(resolution_sources)
+    elif selection_requested:
+        selection_resolution_source = "unresolved"
+    else:
+        selection_resolution_source = "none"
+
+    return {
+        "resolved_window_ids": resolved,
+        "requested_selected_window_ids": requested_selected_window_ids,
+        "invalid_selected_window_ids": invalid_selected_window_ids,
+        "selection_resolution_source": selection_resolution_source,
+        "selection_requested": selection_requested,
+        "selection_unresolved": bool(selection_requested and not resolved),
+        "selected_evidence_ids": selected_evidence_ids,
+        "selected_evidence_moment_ids": selected_evidence_moment_ids,
+        "valid_candidate_window_ids": valid_candidate_window_ids,
+        "window_selector_ids": raw_window_selector_ids,
+    }
+
+
+def _finalize_verification_payload(
+    verification: Dict[str, Any],
+    *,
+    selection_info: Dict[str, Any],
+    verification_parse_mode: str,
+    legacy_compatibility_used: bool,
+) -> Dict[str, Any]:
+    finalized = dict(verification or {})
+    finalized["verified_window_ids"] = _dedupe_string_list(finalized.get("verified_window_ids") or [])
+    finalized["best_effort_window_ids"] = _dedupe_string_list(finalized.get("best_effort_window_ids") or [])
+    if finalized.get("self_verification_selected_window_ids") is not None:
+        finalized["self_verification_selected_window_ids"] = _dedupe_string_list(
+            finalized.get("self_verification_selected_window_ids") or []
+        )
+
+    failure_reasons = _dedupe_string_list(finalized.get("failure_reasons") or [])
+    if bool(selection_info.get("selection_unresolved")):
+        failure_reasons = _dedupe_string_list(
+            failure_reasons + ["selected_evidence_not_resolved_to_known_windows"]
+        )
+        finalized["verified_window_ids"] = []
+        finalized["best_effort_window_ids"] = []
+        if finalized.get("self_verification_selected_window_ids") is not None:
+            finalized["self_verification_selected_window_ids"] = []
+    finalized["failure_reasons"] = failure_reasons
+    finalized["verification_parse_mode"] = str(verification_parse_mode)
+    finalized["requested_selected_window_ids"] = list(selection_info.get("requested_selected_window_ids") or [])
+    finalized["invalid_selected_window_ids"] = list(selection_info.get("invalid_selected_window_ids") or [])
+    finalized["selection_resolution_source"] = str(selection_info.get("selection_resolution_source") or "none")
+    finalized["legacy_compatibility_used"] = bool(legacy_compatibility_used)
+    if bool(legacy_compatibility_used):
+        finalized["legacy_request_compatibility_used"] = True
+    return finalized
 
 
 def scan_timeline(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
@@ -230,20 +466,24 @@ def seek_evidence(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
 
 
 def emit_alert(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
+    normalized_arguments = validate_canonical_category_payload(
+        arguments,
+        payload_name="alert",
+        require_category_for_anomaly=True,
+    )
     alert_id = f"a{state.next_alert_id:04d}"
     state.next_alert_id += 1
     alert = {
         "alert_id": alert_id,
-        "decision": arguments.get("decision"),
-        "existence": arguments.get("existence"),
-        "category": arguments.get("category"),
-        "earliest_alert_sec": arguments.get("earliest_alert_sec"),
-        "alert_sec": arguments.get("alert_sec", arguments.get("earliest_alert_sec")),
-        "reason": arguments.get("reason"),
+        "decision": normalized_arguments.get("decision"),
+        "existence": normalized_arguments.get("existence"),
+        "category": normalized_arguments.get("category"),
+        "earliest_alert_sec": normalized_arguments.get("earliest_alert_sec"),
+        "alert_sec": normalized_arguments.get("alert_sec", normalized_arguments.get("earliest_alert_sec")),
+        "reason": normalized_arguments.get("reason"),
     }
     state.alerts.append(alert)
-    if isinstance(arguments.get("claim"), dict):
-        state.last_claim = dict(arguments["claim"])
+    state.last_claim = _build_minimal_claim_from_alert_payload(alert)
     content = [
         {
             "type": "text",
@@ -261,21 +501,122 @@ def emit_alert(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEn
 
 
 def verify_hypothesis(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
-    verification = run_counterfactual_verifier(
-        state=state,
-        multimodal_cache=multimodal_cache,
-        verification_mode=str(arguments.get("verification_mode") or "reward_only"),
-        claim=arguments.get("claim") or state.last_claim or {},
-        candidate_window_ids=arguments.get("candidate_window_ids"),
-        candidate_evidence_ids=arguments.get("candidate_evidence_ids") or arguments.get("evidence_ids"),
-        candidate_evidence_moment_ids=arguments.get("evidence_moment_ids"),
-        alert=arguments.get("alert") or (state.alerts[-1] if state.alerts else None),
-        query=str(arguments.get("query") or ""),
-        backend=str(arguments.get("verifier_backend") or multimodal_cache.get("verifier_backend") or "heuristic"),
-        use_reference_supervision=False,
+    arguments = _normalize_verification_arguments(arguments)
+    selected_window_ids = [str(value) for value in (arguments.get("selected_window_ids") or []) if str(value).strip()]
+    selected_evidence_ids = [str(value) for value in (arguments.get("selected_evidence_ids") or []) if str(value).strip()]
+    selected_evidence_moment_ids = [
+        str(value)
+        for value in (
+            arguments.get("selected_evidence_moment_ids")
+            or arguments.get("evidence_moment_ids")
+            or []
+        )
+        if str(value).strip()
+    ]
+    candidate_window_ids = [str(value) for value in (arguments.get("candidate_window_ids") or []) if str(value).strip()]
+    candidate_evidence_ids = [
+        str(value)
+        for value in (arguments.get("candidate_evidence_ids") or arguments.get("evidence_ids") or [])
+        if str(value).strip()
+    ]
+    candidate_evidence_moment_ids = [
+        str(value)
+        for value in (
+            arguments.get("candidate_evidence_moment_ids")
+            or arguments.get("evidence_moment_ids")
+            or arguments.get("selected_evidence_moment_ids")
+            or []
+        )
+        if str(value).strip()
+    ]
+    selection_info = _resolve_selected_window_ids(
+        state,
+        selected_window_ids=selected_window_ids,
+        selected_evidence_ids=selected_evidence_ids,
+        selected_evidence_moment_ids=selected_evidence_moment_ids,
+        candidate_window_ids=candidate_window_ids,
     )
+
+    has_self_verification_payload = _has_self_verification_payload(arguments)
+    looks_like_legacy_request = _looks_like_legacy_verification_request(arguments)
+    allow_legacy_verify_compatibility = bool(multimodal_cache.get("allow_legacy_verify_compatibility"))
+    allow_external_verifier_fallback = bool(
+        arguments.get("allow_external_verifier_fallback")
+        or multimodal_cache.get("allow_external_verifier_fallback")
+    )
+    disable_external_verifier_fallback = bool(multimodal_cache.get("disable_external_verifier_fallback"))
+
+    if has_self_verification_payload:
+        payload = dict(arguments)
+        payload["selected_window_ids"] = list(selection_info["resolved_window_ids"])
+        payload["selected_evidence_ids"] = list(selection_info["selected_evidence_ids"])
+        payload["selected_evidence_moment_ids"] = list(selection_info["selected_evidence_moment_ids"])
+        payload["candidate_window_ids"] = list(selection_info["valid_candidate_window_ids"])
+        payload = validate_policy_self_verification_payload(payload)
+        verification = parse_self_verification_payload(
+            payload,
+            fallback_claim=arguments.get("claim") or state.last_claim or {},
+            fallback_alert=arguments.get("alert") or (state.alerts[-1] if state.alerts else None),
+            verification_mode=str(arguments.get("verification_mode") or "reward_only"),
+        )
+        verification = _finalize_verification_payload(
+            verification,
+            selection_info=selection_info,
+            verification_parse_mode="self_report",
+            legacy_compatibility_used=False,
+        )
+    elif looks_like_legacy_request:
+        if allow_legacy_verify_compatibility:
+            verification_parse_mode = "legacy_compatibility"
+            legacy_compatibility_used = True
+        elif disable_external_verifier_fallback:
+            raise ValueError(
+                "External verifier fallback is disabled for this rollout path. "
+                "verify_hypothesis must use the policy self-verification payload."
+            )
+        elif allow_external_verifier_fallback:
+            verification_parse_mode = "external_verifier_fallback"
+            legacy_compatibility_used = False
+        else:
+            raise ValueError(
+                "verify_hypothesis now requires a policy-produced self-verification payload. "
+                "External verifier fallback is diagnostic-only and must be enabled explicitly."
+            )
+        legacy_candidate_window_ids = (
+            list(selection_info["resolved_window_ids"])
+            if selection_info["resolved_window_ids"]
+            else list(selection_info["window_selector_ids"])
+        )
+        verification = run_counterfactual_verifier(
+            state=state,
+            multimodal_cache=multimodal_cache,
+            verification_mode=str(arguments.get("verification_mode") or "reward_only"),
+            claim=arguments.get("claim") or state.last_claim or {},
+            candidate_window_ids=legacy_candidate_window_ids,
+            candidate_evidence_ids=list(selection_info["selected_evidence_ids"] or candidate_evidence_ids),
+            candidate_evidence_moment_ids=list(
+                selection_info["selected_evidence_moment_ids"] or candidate_evidence_moment_ids
+            ),
+            alert=arguments.get("alert") or (state.alerts[-1] if state.alerts else None),
+            query=str(arguments.get("query") or ""),
+            backend=str(arguments.get("verifier_backend") or multimodal_cache.get("verifier_backend") or "heuristic"),
+            use_reference_supervision=False,
+        )
+        verification = _finalize_verification_payload(
+            verification,
+            selection_info=selection_info,
+            verification_parse_mode=verification_parse_mode,
+            legacy_compatibility_used=legacy_compatibility_used,
+        )
+    else:
+        raise ValueError(
+            "verify_hypothesis must provide either a verdict-bearing self-verification payload "
+            "or a legacy verifier request with explicit compatibility enabled."
+        )
     state.last_claim = dict(verification.get("claim") or {})
-    state.active_evidence_window_ids = list(verification.get("verified_window_ids") or [])
+    state.active_evidence_window_ids = list(
+        verification.get("verified_window_ids") or verification.get("best_effort_window_ids") or []
+    )
     state.verification_records.append(verification)
     state.verifier_cache.append(verification)
     content = [{"type": "text", "text": json.dumps(verification, ensure_ascii=False)}]
@@ -283,6 +624,11 @@ def verify_hypothesis(arguments: Dict[str, Any], multimodal_cache: Dict, state: 
 
 
 def finalize_case(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
+    arguments = validate_canonical_category_payload(
+        arguments,
+        payload_name="finalize_case",
+        require_category_for_anomaly=True,
+    )
     schema = multimodal_cache.get("tool_io", {}).get("finalize_case_schema")
     validate_required_fields(arguments, schema)
     state.finalized_case = dict(arguments)

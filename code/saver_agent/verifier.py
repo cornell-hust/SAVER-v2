@@ -13,6 +13,7 @@ DEFAULT_SUPPORT_WEIGHTS = {
     "alert_support": 0.20,
     "counterfactual_support": 0.10,
 }
+SUPPORT_COMPONENT_KEYS = tuple(DEFAULT_SUPPORT_WEIGHTS.keys())
 
 PRIMARY_STATUS_VALUES = {"complete", "incomplete", "redundant", "misaligned"}
 ALERT_STATUS_VALUES = {"justified", "premature", "late", "not_applicable"}
@@ -155,7 +156,11 @@ def _resolve_windows(
     candidate_evidence_ids: Optional[Sequence[str]] = None,
     candidate_evidence_moment_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
-    by_window_id = {entry.get("window_id"): entry for entry in state.visited_windows}
+    by_window_id = {
+        entry.get("window_id"): entry
+        for entry in state.evidence_ledger
+        if str(entry.get("window_id") or "").strip()
+    }
     by_evidence_id = {entry.get("evidence_id"): entry for entry in state.evidence_ledger}
     by_moment_id: Dict[str, List[Dict[str, Any]]] = {}
     for entry in state.evidence_ledger:
@@ -285,15 +290,57 @@ def _fallback_normal_view_scores(
         "alert_support": round(alert_support, 6),
         "counterfactual_support": round(counterfactual_support, 6),
     }
-    scores["overall_support"] = round(_weighted_support(scores), 6)
+    scores["overall_support"] = round(
+        _weighted_support(
+            scores,
+            weights=_support_weights(include_precursor=False),
+        ),
+        6,
+    )
     return scores
 
 
-def _weighted_support(scores: Dict[str, float]) -> float:
+def _support_weights(*, include_precursor: bool = True) -> Dict[str, float]:
+    weights = dict(DEFAULT_SUPPORT_WEIGHTS)
+    if not include_precursor:
+        weights.pop("precursor_support", None)
+    return weights
+
+
+def _weighted_support(scores: Dict[str, float], *, weights: Optional[Dict[str, float]] = None) -> float:
+    active_weights = dict(weights or DEFAULT_SUPPORT_WEIGHTS)
+    total_weight = float(sum(active_weights.values()))
+    if total_weight <= 0.0:
+        return 0.0
     total = 0.0
-    for key, weight in DEFAULT_SUPPORT_WEIGHTS.items():
+    for key, weight in active_weights.items():
         total += float(scores.get(key, 0.0)) * float(weight)
-    return max(0.0, min(1.0, total))
+    return max(0.0, min(1.0, total / total_weight))
+
+
+def _precursor_is_applicable(
+    *,
+    claim: Dict[str, Any],
+    target: Dict[str, Any],
+) -> bool:
+    precursor_interval = claim.get("precursor_interval_sec")
+    if precursor_interval is None:
+        precursor_interval = target.get("precursor_interval_sec")
+    return _normalize_interval(precursor_interval) is not None
+
+
+def _renormalize_view_scores(
+    view_scores: Dict[str, Dict[str, float]],
+    *,
+    include_precursor: bool,
+) -> Dict[str, Dict[str, float]]:
+    weights = _support_weights(include_precursor=include_precursor)
+    normalized: Dict[str, Dict[str, float]] = {}
+    for view_name, scores in (view_scores or {}).items():
+        normalized_scores = dict(scores or {})
+        normalized_scores["overall_support"] = round(_weighted_support(normalized_scores, weights=weights), 6)
+        normalized[view_name] = normalized_scores
+    return normalized
 
 
 def _score_view(
@@ -327,6 +374,7 @@ def _score_view(
     precursor_interval = claim.get("precursor_interval_sec") or target.get("precursor_interval_sec")
     anomaly_coverage = _coverage_ratio(view_windows, anomaly_interval)
     precursor_coverage = _coverage_ratio(view_windows, precursor_interval)
+    include_precursor = _precursor_is_applicable(claim=claim, target=target)
 
     if trigger_score >= 0.25 and (peak_score >= 0.25 or confirm_score >= 0.25):
         category_support = 0.92
@@ -371,7 +419,13 @@ def _score_view(
         "alert_support": round(alert_support, 6),
         "counterfactual_support": round(counterfactual_support, 6),
     }
-    scores["overall_support"] = round(_weighted_support(scores), 6)
+    scores["overall_support"] = round(
+        _weighted_support(
+            scores,
+            weights=_support_weights(include_precursor=include_precursor),
+        ),
+        6,
+    )
     return scores
 
 
@@ -658,6 +712,7 @@ def run_counterfactual_verifier(
             use_reference_supervision=use_reference_supervision,
         ),
     }
+    include_precursor = _precursor_is_applicable(claim=merged_claim, target=target)
     view_scores = heuristic_view_scores
     if requested_backend in {"qwen_self_verifier", "hybrid"}:
         runtime = _resolve_qwen_verifier_runtime(multimodal_cache)
@@ -676,12 +731,20 @@ def run_counterfactual_verifier(
                 verification_mode=verification_mode,
                 question=str(multimodal_cache.get("question") or query),
             )
+            qwen_view_scores = _renormalize_view_scores(
+                qwen_view_scores,
+                include_precursor=include_precursor,
+            )
             if requested_backend == "qwen_self_verifier":
                 view_scores = qwen_view_scores
                 actual_backend = "qwen_self_verifier"
             else:
                 alpha = float(multimodal_cache.get("verifier_hybrid_alpha") or 0.7)
                 view_scores = _blend_view_scores(heuristic_view_scores, qwen_view_scores, alpha=alpha)
+                view_scores = _renormalize_view_scores(
+                    view_scores,
+                    include_precursor=include_precursor,
+                )
                 actual_backend = "hybrid"
     derived_scores = _derive_scores(view_scores)
     primary_status = _reduce_primary_status(view_scores=view_scores, derived_scores=derived_scores)

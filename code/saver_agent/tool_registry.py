@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List, Tuple
 
+from saver_agent.categories import CANONICAL_POLICY_CATEGORIES
 from saver_agent.schema import SaverEnvironmentState
+from saver_agent.self_verification import build_self_verification_tool_schema
 from saver_agent import tools as saver_tools
 
 
@@ -52,7 +54,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "emit_alert",
-            "description": "Record a soft alert, hard alert, or normal declaration proposal.",
+            "description": "Record a soft alert, hard alert, or normal declaration proposal using canonical SAVER category labels.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -61,11 +63,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "enum": ["soft_alert", "hard_alert", "declare_normal"],
                     },
                     "existence": {"type": "string", "enum": ["normal", "anomaly"]},
-                    "category": {"type": "string"},
+                    "category": {"type": "string", "enum": list(CANONICAL_POLICY_CATEGORIES)},
                     "earliest_alert_sec": {"type": "number"},
                     "reason": {"type": "string"},
                 },
-                "required": ["decision", "existence"],
+                "required": ["decision", "existence", "category"],
             },
         },
     },
@@ -73,27 +75,12 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "verify_hypothesis",
-            "description": "Verify whether the currently visited evidence supports the active anomaly hypothesis.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "verification_mode": {
-                        "type": "string",
-                        "enum": ["soft_alert_check", "hard_alert_check", "final_check", "full_keep_drop", "reward_only"],
-                    },
-                    "candidate_window_ids": {"type": "array", "items": {"type": "string"}},
-                    "candidate_evidence_ids": {"type": "array", "items": {"type": "string"}},
-                    "evidence_moment_ids": {"type": "array", "items": {"type": "string"}},
-                    "claim": {"type": "object"},
-                    "alert": {"type": "object"},
-                    "query": {"type": "string"},
-                    "verifier_backend": {
-                        "type": "string",
-                        "enum": ["heuristic", "qwen_self_verifier", "hybrid"],
-                    },
-                },
-                "required": ["verification_mode"],
-            },
+            "description": (
+                "Verify whether the currently selected evidence subset is sufficient, necessary enough, "
+                "and actionable for the active anomaly hypothesis using a compact policy-produced "
+                "self-verification verdict."
+            ),
+            "parameters": build_self_verification_tool_schema(),
         },
     },
     {
@@ -101,7 +88,13 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "finalize_case",
             "description": "Finalize the structured anomaly decision once enough evidence has been gathered.",
-            "parameters": {"type": "object"},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "existence": {"type": "string", "enum": ["normal", "anomaly"]},
+                    "category": {"type": "string", "enum": list(CANONICAL_POLICY_CATEGORIES)},
+                },
+            },
         },
     },
 ]

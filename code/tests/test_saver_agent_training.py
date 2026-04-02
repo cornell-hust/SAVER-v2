@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import types
 
 import cv2
 import numpy as np
@@ -21,6 +22,8 @@ try:
     import saver_agent.training as training
 except ModuleNotFoundError:
     training = None
+
+from saver_agent.runtime import DistributedRuntime
 
 
 class SaverAgentTrainingTests(unittest.TestCase):
@@ -307,6 +310,337 @@ class SaverAgentTrainingTests(unittest.TestCase):
         self.assertEqual(trainer.args.dataloader_num_workers, 3)
         self.assertEqual(trainer.args.dataloader_prefetch_factor, 4)
         self.assertTrue(trainer.args.dataloader_persistent_workers)
+
+    def test_rollout_eval_callback_only_saves_epoch_resume_checkpoint(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        rollout_eval_config = training.RolloutEvaluationConfig(data_path="/tmp/eval.jsonl")
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.TrainerCallback = object
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            callback = training._build_rollout_eval_callback(
+                processor=object(),
+                rollout_eval_config=rollout_eval_config,
+            )
+        callback.runtime = SimpleNamespace(
+            is_main_process=True,
+            is_distributed=False,
+            rank=0,
+            world_size=1,
+            local_rank=0,
+        )
+
+        class _FakeModel:
+            def __init__(self):
+                self.training = True
+                self.eval_calls = 0
+                self.train_calls = 0
+
+            def eval(self):
+                self.training = False
+                self.eval_calls += 1
+
+            def train(self):
+                self.training = True
+                self.train_calls += 1
+
+        model = _FakeModel()
+        args = SimpleNamespace(output_dir="/tmp/sft_out")
+        state = SimpleNamespace(epoch=1.0, global_step=12)
+        control = SimpleNamespace()
+        captured = {}
+
+        def _fake_save(**kwargs):
+            captured["epoch_index"] = kwargs["epoch_index"]
+            captured["output_dir"] = kwargs["output_dir"]
+            captured["optimizer"] = kwargs["optimizer"]
+            captured["lr_scheduler"] = kwargs["lr_scheduler"]
+            return Path("/tmp/sft_out/epoch_resume/epoch_001")
+
+        with patch(
+            "saver_agent.training.save_sft_epoch_resume_checkpoint",
+            side_effect=_fake_save,
+        ), patch(
+            "saver_agent.qwen_policy.QwenGenerationPolicy.from_components",
+            side_effect=AssertionError("in-process rollout eval should not build a policy"),
+        ), patch(
+            "saver_agent.training.run_rollout_eval_with_policy",
+            side_effect=AssertionError("in-process rollout eval should be deferred to a separate process"),
+        ), patch(
+            "saver_agent.training.gc.collect",
+            return_value=0,
+        ), patch(
+            "torch.cuda.is_available",
+            return_value=False,
+        ):
+            returned = callback.on_epoch_end(
+                args,
+                state,
+                control,
+                model=model,
+                optimizer="optimizer_state",
+                lr_scheduler="scheduler_state",
+            )
+
+        self.assertIs(returned, control)
+        self.assertEqual(captured["epoch_index"], 1)
+        self.assertEqual(captured["output_dir"], "/tmp/sft_out")
+        self.assertEqual(captured["optimizer"], "optimizer_state")
+        self.assertEqual(captured["lr_scheduler"], "scheduler_state")
+        self.assertEqual(model.eval_calls, 1)
+        self.assertEqual(model.train_calls, 1)
+
+    def test_rollout_eval_callback_runs_inline_eval_when_enabled(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        rollout_eval_config = training.RolloutEvaluationConfig(
+            data_path="/tmp/eval.jsonl",
+            inline_rollout_eval=True,
+            policy_max_new_tokens=77,
+            max_total_images=5,
+        )
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.TrainerCallback = object
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            callback = training._build_rollout_eval_callback(
+                processor="processor_stub",
+                rollout_eval_config=rollout_eval_config,
+            )
+        callback.runtime = SimpleNamespace(
+            is_main_process=True,
+            is_distributed=False,
+            rank=0,
+            world_size=1,
+            local_rank=0,
+        )
+
+        class _FakeModel:
+            def __init__(self):
+                self.training = True
+                self.eval_calls = 0
+                self.train_calls = 0
+
+            def eval(self):
+                self.training = False
+                self.eval_calls += 1
+
+            def train(self):
+                self.training = True
+                self.train_calls += 1
+
+        model = _FakeModel()
+        args = SimpleNamespace(output_dir="/tmp/sft_out")
+        state = SimpleNamespace(epoch=1.0, global_step=12)
+        control = SimpleNamespace()
+        captured = {}
+
+        def _fake_save(**kwargs):
+            captured["epoch_index"] = kwargs["epoch_index"]
+            return Path("/tmp/sft_out/epoch_resume/epoch_001")
+
+        def _fake_policy_from_components(**kwargs):
+            captured["policy_kwargs"] = dict(kwargs)
+            return "inline_policy"
+
+        def _fake_run_rollout_eval_with_policy(policy, **kwargs):
+            captured["policy"] = policy
+            captured["eval_kwargs"] = dict(kwargs)
+            return {"temporal_miou": 0.42}
+
+        with patch(
+            "saver_agent.training.save_sft_epoch_resume_checkpoint",
+            side_effect=_fake_save,
+        ), patch(
+            "saver_agent.qwen_policy.QwenGenerationPolicy.from_components",
+            side_effect=_fake_policy_from_components,
+        ), patch(
+            "saver_agent.training.run_rollout_eval_with_policy",
+            side_effect=_fake_run_rollout_eval_with_policy,
+        ), patch(
+            "saver_agent.training.gc.collect",
+            return_value=0,
+        ), patch(
+            "torch.cuda.is_available",
+            return_value=False,
+        ):
+            returned = callback.on_epoch_end(
+                args,
+                state,
+                control,
+                model=model,
+                optimizer="optimizer_state",
+                lr_scheduler="scheduler_state",
+            )
+
+        self.assertIs(returned, control)
+        self.assertEqual(captured["epoch_index"], 1)
+        self.assertEqual(captured["policy"], "inline_policy")
+        self.assertEqual(captured["policy_kwargs"]["model"], model)
+        self.assertEqual(captured["policy_kwargs"]["processor"], "processor_stub")
+        self.assertEqual(captured["policy_kwargs"]["max_new_tokens"], 77)
+        self.assertEqual(captured["policy_kwargs"]["max_total_images"], 5)
+        self.assertFalse(captured["policy_kwargs"]["do_sample"])
+        self.assertEqual(captured["eval_kwargs"]["output_dir"], "/tmp/sft_out")
+        self.assertEqual(captured["eval_kwargs"]["epoch_index"], 1)
+        self.assertEqual(captured["eval_kwargs"]["epoch_value"], 1.0)
+        self.assertIs(captured["eval_kwargs"]["rollout_eval_config"], rollout_eval_config)
+        self.assertEqual(model.eval_calls, 1)
+        self.assertEqual(model.train_calls, 1)
+
+    def test_run_rollout_eval_from_checkpoint_uses_rank_local_policy_device_map(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        captured = {}
+        runtime = DistributedRuntime(rank=2, world_size=4, local_rank=2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir) / "epoch_resume" / "epoch_001"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            rollout_eval_config = training.RolloutEvaluationConfig(
+                data_path="/tmp/eval.jsonl",
+                policy_max_new_tokens=77,
+                max_total_images=5,
+            )
+
+            def _fake_from_pretrained(
+                checkpoint_path,
+                *,
+                torch_dtype,
+                device_map,
+                attn_implementation,
+                max_new_tokens,
+                max_total_images,
+                do_sample,
+            ):
+                captured["checkpoint_path"] = str(checkpoint_path)
+                captured["torch_dtype"] = torch_dtype
+                captured["device_map"] = device_map
+                captured["attn_implementation"] = attn_implementation
+                captured["max_new_tokens"] = max_new_tokens
+                captured["max_total_images"] = max_total_images
+                captured["do_sample"] = do_sample
+                return "policy_stub"
+
+            with patch(
+                "saver_agent.training.load_qwen_model_and_processor",
+                side_effect=AssertionError("recovery eval should load policy directly onto the rank-local inference device"),
+            ), patch(
+                "saver_agent.qwen_policy.QwenGenerationPolicy.from_pretrained",
+                side_effect=_fake_from_pretrained,
+            ), patch(
+                "saver_agent.training.run_rollout_eval_with_policy",
+                return_value={"temporal_miou": 0.5},
+            ) as mocked_run_rollout_eval_with_policy, patch(
+                "saver_agent.training.gc.collect",
+                return_value=0,
+            ), patch(
+                "torch.cuda.is_available",
+                return_value=False,
+            ):
+                result = training.run_rollout_eval_from_checkpoint(
+                    checkpoint_path=checkpoint_dir,
+                    output_dir="/tmp/sft_out",
+                    rollout_eval_config=rollout_eval_config,
+                    epoch_index=1,
+                    model_path="/models/base",
+                    torch_dtype="bfloat16",
+                    attn_implementation="flash_attention_2",
+                    runtime=runtime,
+                )
+
+        self.assertEqual(result["temporal_miou"], 0.5)
+        self.assertEqual(captured["checkpoint_path"], str(checkpoint_dir))
+        self.assertEqual(captured["device_map"], {"": 2})
+        self.assertEqual(captured["torch_dtype"], "bfloat16")
+        self.assertEqual(captured["attn_implementation"], "flash_attention_2")
+        self.assertEqual(captured["max_new_tokens"], 77)
+        self.assertEqual(captured["max_total_images"], 5)
+        self.assertFalse(captured["do_sample"])
+        self.assertEqual(mocked_run_rollout_eval_with_policy.call_args.args[0], "policy_stub")
+
+    def test_weighted_sft_uses_token_advantages_for_token_level_nll(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        class _FakeTrainingArguments:
+            def __init__(self, **kwargs):
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
+
+        class _FakeTrainerCallback:
+            pass
+
+        class _FakeTrainer:
+            def __init__(self, *args, **kwargs):
+                self.args = kwargs["args"]
+                self.train_dataset = kwargs["train_dataset"]
+                self.data_collator = kwargs["data_collator"]
+
+            def add_callback(self, callback):
+                return callback
+
+        logits = torch.tensor(
+            [[[2.0, 0.0], [2.0, 0.0], [0.0, 0.0]]],
+            dtype=torch.float32,
+        )
+
+        class _ToyModel(torch.nn.Module):
+            def __init__(self, fixed_logits: torch.Tensor):
+                super().__init__()
+                self.fixed_logits = fixed_logits
+
+            def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+                return SimpleNamespace(loss=None, logits=self.fixed_logits.clone())
+
+        fake_transformers = SimpleNamespace(
+            Trainer=_FakeTrainer,
+            TrainingArguments=_FakeTrainingArguments,
+            TrainerCallback=_FakeTrainerCallback,
+        )
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            trainer = training.create_trainer(
+                model=_ToyModel(logits),
+                processor=self._FakeProcessor(),
+                train_dataset=training.WeightedExampleDataset(
+                    [
+                        {
+                            "messages": [
+                                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                                {"role": "user", "content": [{"type": "text", "text": "user"}]},
+                            ],
+                            "target_response": "<answer>{}</answer>",
+                        }
+                    ]
+                ),
+                output_dir="/tmp/saver_training_test",
+                learning_rate=1e-5,
+                num_train_epochs=1.0,
+                per_device_train_batch_size=1,
+                gradient_accumulation_steps=1,
+                logging_steps=1,
+                save_steps=10,
+                save_total_limit=1,
+                warmup_ratio=0.0,
+                weight_decay=0.0,
+                max_grad_norm=1.0,
+                bf16=False,
+                fp16=False,
+                training_objective="weighted_sft",
+            )
+
+        inputs = {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "labels": torch.tensor([[-100, 0, 1]], dtype=torch.long),
+            "sample_weight": torch.tensor([1.0], dtype=torch.float32),
+            "token_advantages": torch.tensor([[0.0, 1.0, 3.0]], dtype=torch.float32),
+        }
+        loss = trainer.compute_loss(_ToyModel(logits), dict(inputs))
+
+        expected_token_nll = -torch.log_softmax(logits[:, :-1, :], dim=-1)
+        expected = (
+            float(expected_token_nll[0, 0, 0]) * 1.0 + float(expected_token_nll[0, 1, 1]) * 3.0
+        ) / 4.0
+        self.assertAlmostEqual(float(loss), expected, places=6)
 
     def test_collator_reuses_cached_budget_plan_for_same_feature_cache_key(self):
         self.assertIsNotNone(training, "saver_agent.training module is missing")

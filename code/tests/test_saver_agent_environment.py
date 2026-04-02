@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -55,6 +56,21 @@ class SaverAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(is_search, [0])
         self.assertEqual(len(states), 1)
 
+    def test_execute_predictions_rejects_malformed_answer_and_keeps_episode_active(self):
+        next_obs, dones, valid_actions, is_search, states = self.env.execute_predictions(
+            ['<think>done</think><answer>not-json</answer>'],
+            [self.multimodal_cache],
+            [SaverEnvironmentState()],
+            [True],
+        )
+
+        self.assertEqual(dones, [0])
+        self.assertEqual(valid_actions, [0])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(next_obs[0]["name"], "parse_error")
+        self.assertIn("<answer>", next_obs[0]["content"][0]["text"])
+        self.assertEqual(len(states), 1)
+
     def test_execute_predictions_invalid_tool_format_returns_parse_error_and_keeps_episode_active(self):
         next_obs, dones, valid_actions, is_search, states = self.env.execute_predictions(
             ["I will use scan_timeline to inspect the clip."],
@@ -68,6 +84,7 @@ class SaverAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(is_search, [0])
         self.assertEqual(next_obs[0]["name"], "parse_error")
         self.assertIn("<tool_call>", next_obs[0]["content"][0]["text"])
+        self.assertIn("verify_hypothesis", next_obs[0]["content"][0]["text"])
         self.assertEqual(len(states[0].visited_windows), 0)
 
     def test_parse_actions_accepts_unquoted_tool_name_mapping_payload(self):
@@ -93,6 +110,12 @@ class SaverAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(actions, ["answer"])
         self.assertEqual(contents[0], '{"existence":"anomaly","category":"assault"}')
 
+    def test_parse_actions_rejects_malformed_answer_payload(self):
+        actions, contents = parse_actions_and_contents(['<answer>not-json</answer>'])
+
+        self.assertEqual(actions, ["invalid_answer"])
+        self.assertEqual(contents[0], "not-json")
+
     def test_invalid_finalize_case_retry_message_mentions_required_schema_fields(self):
         multimodal_cache = {
             **self.multimodal_cache,
@@ -115,6 +138,18 @@ class SaverAgentEnvironmentTests(unittest.TestCase):
         retry_text = next_obs[0]["content"][0]["text"]
         self.assertIn("finalize_case", retry_text)
         self.assertIn("summary", retry_text)
+
+    def test_execute_predictions_reraises_internal_tool_failures_instead_of_masking_them_as_parse_errors(self):
+        with patch("saver_agent.environment.execute_tool_call", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.env.execute_predictions(
+                    [
+                        '<think>search</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":7.0,"num_frames":3}}</tool_call>'
+                    ],
+                    [self.multimodal_cache],
+                    [SaverEnvironmentState()],
+                    [True],
+                )
 
 
 if __name__ == "__main__":

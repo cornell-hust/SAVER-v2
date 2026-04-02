@@ -33,8 +33,8 @@ class TimeSearchRolloutAdapter:
         tool_message: Dict[str, Any],
         multimodal_cache: Dict[str, Any],
     ) -> Dict[str, Any]:
-        adapted = copy.deepcopy(tool_message)
-        content = list(adapted.get("content", []))
+        adapted = {key: value for key, value in dict(tool_message).items() if key != "content"}
+        content = [dict(item) if isinstance(item, dict) else item for item in list(tool_message.get("content", []))]
         if adapted.get("name") == "parse_error":
             content.append(
                 {
@@ -59,7 +59,7 @@ class TimeSearchRolloutAdapter:
                     {
                         "type": "text",
                         "text": (
-                            "Verifier says the current evidence is sufficient. "
+                            "Your verification judged the current evidence sufficient. "
                             "Call finalize_case next using your current structured claim supported by searched evidence only. "
                             "After finalize_case returns, output the final answer inside <answer></answer>."
                             f"{finalize_suffix}"
@@ -71,7 +71,7 @@ class TimeSearchRolloutAdapter:
                     {
                         "type": "text",
                         "text": (
-                            "Verifier says the current evidence is not yet sufficient. "
+                            "Your verification judged the current evidence not yet sufficient. "
                             "Search more evidence or refine the claim before finalizing."
                         ),
                     }
@@ -80,7 +80,14 @@ class TimeSearchRolloutAdapter:
                 content.append(
                     {
                         "type": "text",
-                        "text": "Verifier says the current evidence does not align with the claim. Revise the claim before continuing.",
+                        "text": "Your verification judged the current evidence misaligned with the claim. Revise the claim before continuing.",
+                    }
+                )
+            elif recommended_action == "refine_evidence":
+                content.append(
+                    {
+                        "type": "text",
+                        "text": "Your verification judged the selected evidence redundant. Refine the evidence subset before finalizing.",
                     }
                 )
             adapted["content"] = content

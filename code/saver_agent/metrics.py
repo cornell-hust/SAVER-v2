@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from saver_agent.categories import canonicalize_saver_category
 from saver_agent.score_summary import extract_verifier_statuses, summarize_scored_rollouts
 
 
@@ -24,6 +25,12 @@ def _mean(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     return float(sum(values) / len(values))
+
+
+def _safe_rate(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return float(numerator) / float(denominator)
 
 
 def _normalize_interval(interval: Sequence[float] | None) -> Optional[Tuple[float, float]]:
@@ -170,7 +177,7 @@ def _normalize_existence(value: Any) -> str:
 
 
 def _normalize_category(value: Any) -> str:
-    text = str(value or "").strip().lower()
+    text = canonicalize_saver_category(value)
     return text or "unknown"
 
 
@@ -211,20 +218,90 @@ def _infer_first_alert(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _infer_candidate_window_ids(record: Dict[str, Any]) -> List[str]:
-    turns = record.get("turns") or []
-    for turn in reversed(turns):
-        if turn.get("verifier_verified_window_ids"):
-            return list(turn.get("verifier_verified_window_ids") or [])
+def _known_evidence_window_ids(record: Dict[str, Any]) -> set[str]:
     state = record.get("state") or {}
-    if state.get("active_evidence_window_ids"):
-        return list(state.get("active_evidence_window_ids") or [])
-    return [str(entry.get("window_id")) for entry in (state.get("evidence_ledger") or []) if entry.get("window_id")]
+    return {
+        str(entry.get("window_id")).strip()
+        for entry in (state.get("evidence_ledger") or [])
+        if str(entry.get("window_id") or "").strip()
+    }
+
+
+def _filter_known_window_ids(window_ids: Sequence[str], *, known_window_ids: set[str]) -> List[str]:
+    filtered: List[str] = []
+    seen = set()
+    for value in window_ids or []:
+        window_id = str(value).strip()
+        if not window_id or window_id not in known_window_ids or window_id in seen:
+            continue
+        filtered.append(window_id)
+        seen.add(window_id)
+    return filtered
+
+
+def _latest_verification_turn(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for turn in reversed(record.get("turns") or []):
+        if str(turn.get("tool_name") or "") == "verify_hypothesis":
+            return turn
+    return None
+
+
+def _latest_verification_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    verification_records = ((record.get("state") or {}).get("verification_records") or [])
+    if verification_records:
+        return dict(verification_records[-1] or {})
+    return None
+
+
+def _infer_candidate_window_ids(record: Dict[str, Any]) -> Tuple[List[str], bool]:
+    known_window_ids = _known_evidence_window_ids(record)
+    latest_verify_turn = _latest_verification_turn(record)
+    if latest_verify_turn is not None:
+        raw_window_ids = (
+            latest_verify_turn.get("verifier_verified_window_ids")
+            or latest_verify_turn.get("verifier_best_effort_window_ids")
+            or latest_verify_turn.get("self_verification_selected_window_ids")
+            or []
+        )
+        selection_observed = bool(
+            raw_window_ids
+            or latest_verify_turn.get("verification_parse_mode")
+            or latest_verify_turn.get("invalid_selected_window_ids")
+            or latest_verify_turn.get("selection_resolution_source")
+            or latest_verify_turn.get("verifier_failure_reasons")
+        )
+        if selection_observed:
+            return _filter_known_window_ids(raw_window_ids, known_window_ids=known_window_ids), True
+
+    state = record.get("state") or {}
+    active_window_ids = list(state.get("active_evidence_window_ids") or [])
+    if active_window_ids:
+        return _filter_known_window_ids(active_window_ids, known_window_ids=known_window_ids), True
+
+    latest_verification_record = _latest_verification_record(record)
+    if latest_verification_record is not None:
+        raw_window_ids = (
+            latest_verification_record.get("verified_window_ids")
+            or latest_verification_record.get("best_effort_window_ids")
+            or latest_verification_record.get("selected_window_ids")
+            or []
+        )
+        selection_observed = bool(
+            raw_window_ids
+            or latest_verification_record.get("verification_parse_mode")
+            or latest_verification_record.get("invalid_selected_window_ids")
+            or latest_verification_record.get("selection_resolution_source")
+            or latest_verification_record.get("failure_reasons")
+        )
+        if selection_observed:
+            return _filter_known_window_ids(raw_window_ids, known_window_ids=known_window_ids), True
+
+    return [], False
 
 
 def _resolve_state_windows(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     state = record.get("state") or {}
-    entries = list(state.get("visited_windows") or []) + list(state.get("evidence_ledger") or [])
+    entries = list(state.get("evidence_ledger") or [])
     resolved: Dict[str, Dict[str, Any]] = {}
     for entry in entries:
         window_id = entry.get("window_id")
@@ -254,8 +331,8 @@ def _protocol_compliance_flag(record: Dict[str, Any]) -> float:
     finalize_turn_index = _first_matching_turn_index(turns, tool_name="finalize_case")
     answer_turn_index = _first_matching_turn_index(turns, action="answer")
 
-    has_finalize_artifact = finalize_turn_index is not None or bool(state.get("finalized_case"))
-    has_answer_artifact = answer_turn_index is not None or bool(record.get("final_answer"))
+    has_finalize_artifact = finalize_turn_index is not None or isinstance(state.get("finalized_case"), dict)
+    has_answer_artifact = answer_turn_index is not None and isinstance(record.get("final_answer"), dict)
 
     if not has_finalize_artifact or not has_answer_artifact:
         return 0.0
@@ -267,7 +344,7 @@ def _protocol_compliance_flag(record: Dict[str, Any]) -> float:
 def _select_predicted_evidence_windows(record: Dict[str, Any], *, top_k: int) -> List[Tuple[float, float]]:
     if top_k <= 0:
         return []
-    candidate_ids = list(_infer_candidate_window_ids(record) or [])
+    candidate_ids, selection_observed = _infer_candidate_window_ids(record)
     by_window_id = _resolve_state_windows(record)
     selected: List[Tuple[float, float]] = []
     seen = set()
@@ -282,7 +359,7 @@ def _select_predicted_evidence_windows(record: Dict[str, Any], *, top_k: int) ->
         selected.append(normalized)
         if len(selected) >= top_k:
             return selected
-    if selected:
+    if selected or selection_observed:
         return selected[:top_k]
     for window in by_window_id.values():
         normalized = _normalize_interval((window.get("start_sec"), window.get("end_sec")))
@@ -319,6 +396,43 @@ def _evidence_match_counts(
     return matched_predicted, len(predicted_windows), len(reference_windows)
 
 
+def _verify_health_summary(scored_records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    verify_parse_mode_counts = Counter()
+    total_verify_turns = 0
+    legacy_compatibility_used_count = 0
+    invalid_selected_turns = 0
+    unresolved_selection_turns = 0
+    verify_invalid_turns = 0
+
+    for record in scored_records:
+        for turn in record.get("turns") or []:
+            if str(turn.get("tool_name") or "") != "verify_hypothesis":
+                continue
+            total_verify_turns += 1
+            parse_mode = str(turn.get("verification_parse_mode") or "unknown")
+            verify_parse_mode_counts[parse_mode] += 1
+            if bool(turn.get("legacy_compatibility_used")):
+                legacy_compatibility_used_count += 1
+            if list(turn.get("invalid_selected_window_ids") or []):
+                invalid_selected_turns += 1
+            failure_reasons = {str(value) for value in (turn.get("verifier_failure_reasons") or []) if str(value).strip()}
+            if (
+                "selected_evidence_not_resolved_to_known_windows" in failure_reasons
+                or str(turn.get("selection_resolution_source") or "") == "unresolved"
+            ):
+                unresolved_selection_turns += 1
+            if not bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"})):
+                verify_invalid_turns += 1
+
+    return {
+        "verify_parse_mode_counts": {str(key): int(value) for key, value in sorted(verify_parse_mode_counts.items())},
+        "legacy_compatibility_used_count": int(legacy_compatibility_used_count),
+        "invalid_selected_window_rate": _safe_rate(invalid_selected_turns, total_verify_turns),
+        "unresolved_selection_rate": _safe_rate(unresolved_selection_turns, total_verify_turns),
+        "verify_invalid_turn_rate": _safe_rate(verify_invalid_turns, total_verify_turns),
+    }
+
+
 def summarize_saver_metrics(
     scored_records: Sequence[Dict[str, Any]],
     *,
@@ -348,6 +462,7 @@ def summarize_saver_metrics(
     search_steps: List[float] = []
     total_turns: List[float] = []
     tool_validity_values: List[float] = []
+    formal_turn_validity_values: List[float] = []
     protocol_flags: List[float] = []
     primary_status_counter = Counter()
     alert_status_counter = Counter()
@@ -372,9 +487,10 @@ def summarize_saver_metrics(
                 _normalize_category(claim.get("category")) if pred_existence == "anomaly" else "normal"
             )
             temporal_ious.append(_interval_iou(claim.get("anomaly_interval_sec"), target.get("anomaly_interval_sec")))
-            precursor_ious.append(
-                _interval_iou(claim.get("precursor_interval_sec"), target.get("precursor_interval_sec"))
-            )
+            if _normalize_interval(target.get("precursor_interval_sec")) is not None:
+                precursor_ious.append(
+                    _interval_iou(claim.get("precursor_interval_sec"), target.get("precursor_interval_sec"))
+                )
             gt_counterfactual_type = _normalize_counterfactual_type(target.get("counterfactual_type"))
             if gt_counterfactual_type != "none":
                 counterfactual_hits.append(
@@ -422,10 +538,28 @@ def summarize_saver_metrics(
         )
 
         turns = list(record.get("turns") or [])
+        invalid_attempts = list(record.get("invalid_attempts") or [])
         if turns:
-            tool_validity_values.append(
-                sum(1.0 for turn in turns if bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"})))
+            formal_turn_validity_values.append(
+                sum(
+                    1.0
+                    for turn in turns
+                    if bool(turn.get("valid_action", turn.get("action") in {"tool_call", "answer"}))
+                )
                 / len(turns)
+            )
+        else:
+            formal_turn_validity_values.append(0.0)
+
+        attempts = turns + invalid_attempts
+        if attempts:
+            tool_validity_values.append(
+                sum(
+                    1.0
+                    for attempt in attempts
+                    if bool(attempt.get("valid_action", attempt.get("action") in {"tool_call", "answer"}))
+                )
+                / len(attempts)
             )
         else:
             tool_validity_values.append(0.0)
@@ -481,6 +615,7 @@ def summarize_saver_metrics(
         key: (alert_status_counter.get(key, 0) / num_records if num_records else 0.0)
         for key in ["justified", "premature", "late", "not_applicable", "unknown"]
     }
+    verify_health = _verify_health_summary(scored_records)
     summary = {
         "num_records": num_records,
         "existence_ap": _binary_average_precision(existence_targets, existence_scores),
@@ -506,8 +641,10 @@ def summarize_saver_metrics(
         "mean_search_steps": _mean(search_steps),
         "mean_num_turns": _mean(total_turns),
         "tool_call_validity_rate": _mean(tool_validity_values),
+        "formal_turn_validity_rate": _mean(formal_turn_validity_values),
         "protocol_compliance_rate": _mean(protocol_flags),
         "main_metrics_reference_free": True,
+        **verify_health,
     }
     if include_diagnostic_summary:
         summary["diagnostic_summary"] = {

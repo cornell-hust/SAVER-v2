@@ -66,14 +66,31 @@ configure_experiment_layout() {
   DEFAULT_ANNOTATION_DIR="${default_annotation_dir}"
   if [[ -n "${exp_name}" ]]; then
     RUN_BASE_DIR="${experiment_base_dir}/${exp_name}"
-    DEFAULT_ARTIFACT_DIR="${default_annotation_dir}"
+    DEFAULT_ARTIFACT_DIR="${RUN_BASE_DIR}/train_artifacts"
     DEFAULT_CHECKPOINT_DIR="${RUN_BASE_DIR}/checkpoints"
     DEFAULT_ROLLOUT_ROOT="${RUN_BASE_DIR}/rollouts"
+    DEFAULT_LOG_DIR="${RUN_BASE_DIR}/logs"
     echo "[main] experiment output base: ${RUN_BASE_DIR}"
   else
     RUN_BASE_DIR=""
     DEFAULT_ARTIFACT_DIR="${default_annotation_dir}"
     DEFAULT_CHECKPOINT_DIR="${default_exp_root}/checkpoints"
     DEFAULT_ROLLOUT_ROOT="${default_exp_root}/rollouts"
+    DEFAULT_LOG_DIR="${experiment_base_dir}/logs"
   fi
+}
+
+configure_script_logging() {
+  local script_name="${1:-script}"
+  LOG_DIR="${LOG_DIR:-${DEFAULT_LOG_DIR}}"
+  mkdir -p "${LOG_DIR}"
+  if [[ "${SCRIPT_LOGGING_ENABLED:-1}" != "1" ]]; then
+    return 0
+  fi
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  SCRIPT_LOG_FILE="${SCRIPT_LOG_FILE:-${LOG_DIR}/${script_name}.${timestamp}.log}"
+  mkdir -p "$(dirname "${SCRIPT_LOG_FILE}")"
+  exec > >(tee -a "${SCRIPT_LOG_FILE}") 2>&1
+  echo "[main] script log: ${SCRIPT_LOG_FILE}"
 }

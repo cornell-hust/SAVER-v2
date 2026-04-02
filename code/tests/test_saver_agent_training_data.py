@@ -1,9 +1,11 @@
 import copy
+import importlib
 import json
 import re
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -16,6 +18,12 @@ from saver_agent.config import SaverAgentConfig
 from saver_agent.adapter import TimeSearchRolloutAdapter
 from saver_agent.rollout import ReplayPolicy, SaverRolloutRunner
 from saver_agent.environment import SaverEnvironmentState, SaverVideoInteraction
+
+
+try:
+    TRAINING_DATA_MODULE = importlib.import_module("saver_agent.training_data")
+except ModuleNotFoundError:
+    TRAINING_DATA_MODULE = None
 
 
 try:
@@ -265,6 +273,109 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         message_texts = [str(item.get("text") or "") for item in last_message.get("content") or [] if item.get("type") == "text"]
         self.assertTrue(any("Revise the claim" in text for text in message_texts), msg=message_texts)
 
+    def test_build_oracle_sft_examples_serializes_structured_self_verification_and_teacher_judge_fields(self):
+        self.assertIsNotNone(build_oracle_sft_examples, "saver_agent.training_data module is missing")
+
+        record = {
+            **self.record,
+            "oracle_sft": {
+                "trajectory": [
+                    {
+                        "tool": "verify_hypothesis",
+                        "arguments": {
+                            "verification_mode": "full_keep_drop",
+                            "claim": {"existence": "anomaly", "category": "assault"},
+                            "candidate_window_ids": ["w0001"],
+                        },
+                        "oracle_verifier_feedback": {
+                            "verification_mode": "full_keep_drop",
+                            "selected_window_ids": ["w0001"],
+                            "selected_evidence_ids": ["e0001"],
+                            "selected_evidence_moment_ids": ["ev1"],
+                            "sufficiency_score": 0.82,
+                            "necessity_score": 0.44,
+                            "alertability_score": 0.66,
+                            "counterfactual_faithfulness": 0.63,
+                            "verification_decision": "sufficient",
+                            "recommended_action": "finalize",
+                            "rationale": "The selected trigger evidence is sufficient.",
+                            "teacher_judge_scores": {"sufficiency": 0.91, "necessity": 0.58},
+                            "teacher_judge_decision": "sufficient",
+                            "teacher_judge_rationale": "Teacher judge agrees the selected evidence is enough.",
+                        },
+                    }
+                ],
+                "final_decision": self.item["multimodal_cache"]["structured_target"],
+            },
+        }
+
+        examples = build_oracle_sft_examples(self.item, record, config=SaverAgentConfig())
+
+        self.assertGreaterEqual(len(examples), 2)
+        tool_message = examples[1]["messages"][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertEqual(tool_message["name"], "verify_hypothesis")
+        payload = json.loads(tool_message["content"][0]["text"])
+        self.assertEqual(payload["verification_decision"], "sufficient")
+        self.assertEqual(payload["selected_evidence_moment_ids"], ["ev1"])
+        self.assertNotIn("primary_status", payload)
+        self.assertNotIn("alert_status", payload)
+        self.assertNotIn("failure_reasons", payload)
+        self.assertNotIn("selected_evidence_ids", payload)
+        self.assertIn("teacher_judge_scores", payload)
+        self.assertEqual(payload["teacher_judge_decision"], "sufficient")
+        self.assertIn("teacher_judge_rationale", payload)
+
+    def test_build_oracle_sft_examples_merges_self_verification_targets_into_verify_tool_call(self):
+        self.assertIsNotNone(build_oracle_sft_examples, "saver_agent.training_data module is missing")
+
+        record = {
+            **self.record,
+            "oracle_sft": {
+                "trajectory": [
+                    {
+                        "tool": "verify_hypothesis",
+                        "arguments": {
+                            "verification_mode": "full_keep_drop",
+                            "claim": {"existence": "anomaly", "category": "assault"},
+                            "candidate_window_ids": ["w0001"],
+                        },
+                        "oracle_verifier_feedback": {
+                            "verification_mode": "full_keep_drop",
+                            "selected_window_ids": ["w0001"],
+                            "selected_evidence_ids": ["e0001"],
+                            "selected_evidence_moment_ids": ["ev1"],
+                            "sufficiency_score": 0.82,
+                            "necessity_score": 0.44,
+                            "alertability_score": 0.66,
+                            "counterfactual_faithfulness": 0.63,
+                            "verification_decision": "sufficient",
+                            "recommended_action": "finalize",
+                            "rationale": "The selected trigger evidence is sufficient.",
+                            "teacher_judge_scores": {"sufficiency": 0.91, "necessity": 0.58},
+                            "teacher_judge_decision": "sufficient",
+                            "teacher_judge_rationale": "Teacher judge agrees the selected evidence is enough.",
+                        },
+                    }
+                ],
+                "final_decision": self.item["multimodal_cache"]["structured_target"],
+            },
+        }
+
+        examples = build_oracle_sft_examples(self.item, record, config=SaverAgentConfig())
+
+        self.assertGreaterEqual(len(examples), 1)
+        target_response = examples[0]["target_response"]
+        self.assertIn('"verification_decision":"sufficient"', target_response)
+        self.assertIn('"selected_evidence_moment_ids":["ev1"]', target_response)
+        self.assertNotIn('"primary_status"', target_response)
+        self.assertNotIn('"alert_status"', target_response)
+        self.assertNotIn('"failure_reasons"', target_response)
+        self.assertNotIn('"selected_evidence_ids"', target_response)
+        self.assertNotIn('"teacher_judge_scores"', target_response)
+        self.assertEqual(examples[0]["teacher_judge_decision"], "sufficient")
+        self.assertIn("teacher_judge_scores", examples[0])
+
     def test_build_reward_weighted_examples_assigns_turn_level_advantages(self):
         self.assertIsNotNone(build_reward_weighted_examples, "saver_agent.training_data module is missing")
 
@@ -397,13 +508,14 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         runner = SaverRolloutRunner(
             environment=SaverVideoInteraction(),
             adapter=TimeSearchRolloutAdapter(),
-            max_turns=5,
+            max_turns=6,
         )
         policy = ReplayPolicy(
             [
                 '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"aggressive contact","start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
                 '<think>alert</think><tool_call>{"name":"emit_alert","arguments":{"decision":"soft_alert","existence":"anomaly","category":"assault","alert_sec":0.5,"claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0}}}</tool_call>',
-                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"soft_alert_check","claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0},"candidate_window_ids":["w0001"],"alert":{"decision":"soft_alert","alert_sec":0.5}}}</tool_call>',
+                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"soft_alert_check","claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0},"candidate_window_ids":["w0002"],"selected_window_ids":["w0002"],"selected_evidence_ids":["e0002"],"selected_evidence_moment_ids":[],"alert":{"decision":"soft_alert","alert_sec":0.5},"verification_decision":"insufficient","recommended_action":"continue_search","sufficiency_score":0.35,"necessity_score":0.22,"alertability_score":0.18,"counterfactual_faithfulness":0.26}}</tool_call>',
                 '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
                 '<think>done</think><answer>{"existence":"anomaly","category":"assault"}</answer>',
             ]
@@ -434,7 +546,7 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         self.assertGreaterEqual(finalize_example["turn_component_weights"]["evidence_local"], 1.0)
         self.assertIn("counterfactual_group_ids", verify_example)
 
-    def test_build_counterfactual_grpo_examples_attaches_search_local_advantage_to_search_turns(self):
+    def test_build_counterfactual_grpo_examples_attaches_search_local_advantage_to_seek_evidence_turns(self):
         self.assertIsNotNone(build_counterfactual_grpo_examples, "saver_agent.training_data module is missing")
 
         runner = SaverRolloutRunner(
@@ -445,9 +557,9 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         policy = ReplayPolicy(
             [
                 '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
-                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"soft_alert_check","claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0},"candidate_window_ids":["w0001"],"alert":{"decision":"soft_alert","alert_sec":0.5}}}</tool_call>',
+                '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"aggressive contact","start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"soft_alert_check","claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0},"candidate_window_ids":["w0002"],"selected_window_ids":["w0002"],"selected_evidence_ids":["e0002"],"selected_evidence_moment_ids":[],"alert":{"decision":"soft_alert","alert_sec":0.5},"verification_decision":"insufficient","recommended_action":"continue_search","sufficiency_score":0.35,"necessity_score":0.22,"alertability_score":0.18,"counterfactual_faithfulness":0.26}}</tool_call>',
                 '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
-                '<think>done</think><answer>{"existence":"anomaly","category":"assault"}</answer>',
             ]
         )
         rollout = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
@@ -462,12 +574,349 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
             search_local_alpha=0.6,
         )
 
+        seek_example = next(example for example in examples if example.get("tool_name") == "seek_evidence")
+        self.assertIn("search_local", seek_example["advantage_components"])
+        self.assertIn("search_local", seek_example["turn_component_weights"])
+        self.assertNotEqual(seek_example["advantage_components"]["search_local"], 0.0)
+        self.assertGreaterEqual(seek_example["turn_component_weights"]["search_local"], 1.0)
+        self.assertIn("actual_search_branch", seek_example["counterfactual_metadata"])
+
+    def test_build_counterfactual_grpo_examples_does_not_attach_search_local_to_scan_timeline(self):
+        self.assertIsNotNone(build_counterfactual_grpo_examples, "saver_agent.training_data module is missing")
+
+        runner = SaverRolloutRunner(
+            environment=SaverVideoInteraction(),
+            adapter=TimeSearchRolloutAdapter(),
+            max_turns=3,
+        )
+        policy = ReplayPolicy(
+            [
+                '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
+                '<think>done</think><answer>{"existence":"anomaly","category":"assault"}</answer>',
+            ]
+        )
+        rollout = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
+        rollout["reward_summary"] = {"total_reward": 1.0}
+        rollout["group_advantage"] = 0.7
+
+        examples = build_counterfactual_grpo_examples(
+            self.item,
+            rollout,
+            config=SaverAgentConfig(),
+            local_verifier_backend="self_teacher",
+            search_local_alpha=0.6,
+        )
+
         scan_example = next(example for example in examples if example.get("tool_name") == "scan_timeline")
-        self.assertIn("search_local", scan_example["advantage_components"])
-        self.assertIn("search_local", scan_example["turn_component_weights"])
-        self.assertNotEqual(scan_example["advantage_components"]["search_local"], 0.0)
-        self.assertGreaterEqual(scan_example["turn_component_weights"]["search_local"], 1.0)
-        self.assertIn("actual_search_branch", scan_example["counterfactual_metadata"])
+        self.assertEqual(scan_example["turn_component_weights"]["search_local"], 0.0)
+        self.assertEqual(scan_example["advantage_components"]["search_local"], 0.0)
+
+    def test_build_counterfactual_grpo_examples_attaches_teacher_local_advantage_to_verify_turn(self):
+        self.assertIsNotNone(build_counterfactual_grpo_examples, "saver_agent.training_data module is missing")
+
+        rollout = {
+            "video_id": "sample_training_data",
+            "reward_summary": {"total_reward": 1.0},
+            "group_advantage": 0.7,
+            "turns": [
+                {
+                    "step_index": 1,
+                    "assistant_response_raw": '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"full_keep_drop","claim":{"existence":"anomaly","category":"assault"},"selected_window_ids":["w0001"],"selected_evidence_ids":["e0001"],"selected_evidence_moment_ids":["ev1"],"verification_decision":"sufficient","recommended_action":"finalize","sufficiency_score":0.8,"necessity_score":0.4}}</tool_call>',
+                    "action": "tool_call",
+                    "valid_action": True,
+                    "tool_name": "verify_hypothesis",
+                    "self_verification_decision": "sufficient",
+                    "self_verification_scores": {
+                        "sufficiency": 0.8,
+                        "necessity": 0.4,
+                        "alertability": 0.7,
+                        "counterfactual_faithfulness": 0.6,
+                    },
+                    "teacher_judge_scores": {
+                        "sufficiency": 0.84,
+                        "necessity": 0.45,
+                        "alertability": 0.72,
+                        "counterfactual_faithfulness": 0.64,
+                    },
+                    "teacher_judge_decision": "sufficient",
+                    "teacher_judge_rationale": "Teacher agrees with the selected evidence subset.",
+                }
+            ],
+        }
+
+        examples = build_counterfactual_grpo_examples(
+            self.item,
+            rollout,
+            config=SaverAgentConfig(),
+        )
+
+        self.assertEqual(len(examples), 1)
+        verify_example = examples[0]
+        self.assertIn("teacher_local", verify_example["advantage_components"])
+        self.assertGreater(verify_example["advantage_components"]["teacher_local"], 0.0)
+        self.assertGreaterEqual(verify_example["turn_component_weights"]["teacher_local"], 1.0)
+        self.assertEqual(verify_example["teacher_judge_decision"], "sufficient")
+        self.assertGreater(verify_example["teacher_judge_reward"], 0.0)
+
+    def test_build_counterfactual_grpo_examples_self_teacher_backend_avoids_external_verifier_calls(self):
+        self.assertIsNotNone(build_counterfactual_grpo_examples, "saver_agent.training_data module is missing")
+
+        runner = SaverRolloutRunner(
+            environment=SaverVideoInteraction(),
+            adapter=TimeSearchRolloutAdapter(),
+            max_turns=6,
+        )
+        policy = ReplayPolicy(
+            [
+                '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"aggressive contact","start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>alert</think><tool_call>{"name":"emit_alert","arguments":{"decision":"soft_alert","existence":"anomaly","category":"assault","alert_sec":0.5,"claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0}}}</tool_call>',
+                '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"soft_alert_check","claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0},"candidate_window_ids":["w0002"],"selected_window_ids":["w0002"],"selected_evidence_ids":["e0002"],"selected_evidence_moment_ids":[],"alert":{"decision":"soft_alert","alert_sec":0.5},"verification_decision":"sufficient","recommended_action":"finalize","sufficiency_score":0.78,"necessity_score":0.51,"alertability_score":0.74,"counterfactual_faithfulness":0.68}}</tool_call>',
+                '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
+                '<think>done</think><answer>{"existence":"anomaly","category":"assault"}</answer>',
+            ]
+        )
+        rollout = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
+        rollout["reward_summary"] = {"total_reward": 1.1}
+        rollout["group_advantage"] = 0.75
+
+        with patch("saver_agent.training_data.score_search_counterfactual_group", side_effect=AssertionError("search verifier should not run")), \
+             patch("saver_agent.training_data.score_alert_counterfactual_group", side_effect=AssertionError("alert verifier should not run")), \
+             patch("saver_agent.training_data.score_evidence_counterfactual_group", side_effect=AssertionError("evidence verifier should not run")):
+            examples = build_counterfactual_grpo_examples(
+                self.item,
+                rollout,
+                config=SaverAgentConfig(),
+                local_verifier_backend="self_teacher",
+            )
+
+        self.assertGreaterEqual(len(examples), 4)
+        verify_example = next(example for example in examples if example.get("tool_name") == "verify_hypothesis")
+        self.assertIn("teacher_local", verify_example["advantage_components"])
+
+    def test_self_teacher_search_group_does_not_depend_on_future_verify_turn(self):
+        self.assertIsNotNone(TRAINING_DATA_MODULE, "saver_agent.training_data module is missing")
+
+        runner = SaverRolloutRunner(
+            environment=SaverVideoInteraction(),
+            adapter=TimeSearchRolloutAdapter(),
+            max_turns=3,
+        )
+        policy = ReplayPolicy(
+            [
+                '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"aggressive contact","start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
+            ]
+        )
+        base_rollout = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
+        base_rollout["reward_summary"] = {"total_reward": 1.0}
+        anchor_turn = copy.deepcopy(base_rollout["turns"][1])
+        anchor_window_ids = [
+            str(entry.get("window_id"))
+            for entry in (anchor_turn.get("state_delta") or {}).get("new_evidence_windows") or []
+            if entry.get("window_id")
+        ]
+
+        def _with_future_verify(selected_window_ids, verification_decision: str, sufficiency: float, necessity: float):
+            rollout = copy.deepcopy(base_rollout)
+            rollout["turns"].append(
+                {
+                    "step_index": 4,
+                    "tool_name": "verify_hypothesis",
+                    "latest_claim_after": {"existence": "anomaly", "category": "assault", "earliest_alert_sec": 1.0},
+                    "selected_window_ids_after": list(selected_window_ids),
+                    "self_verification_decision": verification_decision,
+                    "verifier_primary_status": "complete" if verification_decision == "sufficient" else "misaligned",
+                    "verifier_alert_status": "justified",
+                    "self_verification_scores": {
+                        "sufficiency": sufficiency,
+                        "necessity": necessity,
+                        "alertability": 0.4,
+                        "counterfactual_faithfulness": 0.3,
+                    },
+                }
+            )
+            return rollout
+
+        rollout_high = _with_future_verify(["wfut_a"], "sufficient", 0.92, 0.55)
+        rollout_low = _with_future_verify(["wfut_b"], "misaligned", 0.12, 0.08)
+        records_high = TRAINING_DATA_MODULE._build_search_counterfactual_group(
+            rollout_high,
+            anchor_turn,
+            multimodal_cache=self.item["multimodal_cache"],
+            local_verifier_backend="self_teacher",
+            local_use_reference_supervision=False,
+        )
+        records_low = TRAINING_DATA_MODULE._build_search_counterfactual_group(
+            rollout_low,
+            anchor_turn,
+            multimodal_cache=self.item["multimodal_cache"],
+            local_verifier_backend="self_teacher",
+            local_use_reference_supervision=False,
+        )
+        use_search_high = next(record for record in records_high if record.get("branch_type") == "use_search")
+        use_search_low = next(record for record in records_low if record.get("branch_type") == "use_search")
+
+        self.assertEqual(use_search_high["selected_window_ids"], use_search_low["selected_window_ids"])
+
+    def test_self_teacher_alert_group_does_not_depend_on_future_verify_turn(self):
+        self.assertIsNotNone(TRAINING_DATA_MODULE, "saver_agent.training_data module is missing")
+
+        runner = SaverRolloutRunner(
+            environment=SaverVideoInteraction(),
+            adapter=TimeSearchRolloutAdapter(),
+            max_turns=3,
+        )
+        policy = ReplayPolicy(
+            [
+                '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>alert</think><tool_call>{"name":"emit_alert","arguments":{"decision":"soft_alert","existence":"anomaly","category":"assault","alert_sec":0.5,"claim":{"existence":"anomaly","category":"assault","earliest_alert_sec":1.0}}}</tool_call>',
+                '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
+            ]
+        )
+        base_rollout = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
+        base_rollout["reward_summary"] = {"total_reward": 1.0}
+        anchor_turn = copy.deepcopy(base_rollout["turns"][1])
+
+        def _with_future_verify(verification_decision: str, sufficiency: float):
+            rollout = copy.deepcopy(base_rollout)
+            rollout["turns"].append(
+                {
+                    "step_index": 4,
+                    "tool_name": "verify_hypothesis",
+                    "latest_claim_after": {"existence": "anomaly", "category": "assault", "earliest_alert_sec": 1.0},
+                    "self_verification_decision": verification_decision,
+                    "verifier_primary_status": "complete" if verification_decision == "sufficient" else "misaligned",
+                    "verifier_alert_status": "justified",
+                    "self_verification_scores": {
+                        "sufficiency": sufficiency,
+                        "necessity": 0.2,
+                        "alertability": 0.7,
+                        "counterfactual_faithfulness": 0.4,
+                    },
+                }
+            )
+            return rollout
+
+        rollout_high = _with_future_verify("sufficient", 0.85)
+        rollout_low = _with_future_verify("misaligned", 0.1)
+        records_high = TRAINING_DATA_MODULE._build_alert_counterfactual_group(
+            rollout_high,
+            anchor_turn,
+            multimodal_cache=self.item["multimodal_cache"],
+            local_verifier_backend="self_teacher",
+            local_use_reference_supervision=False,
+        )
+        records_low = TRAINING_DATA_MODULE._build_alert_counterfactual_group(
+            rollout_low,
+            anchor_turn,
+            multimodal_cache=self.item["multimodal_cache"],
+            local_verifier_backend="self_teacher",
+            local_use_reference_supervision=False,
+        )
+        alert_now_high = next(record for record in records_high if record.get("branch_type") == "alert_now")
+        alert_now_low = next(record for record in records_low if record.get("branch_type") == "alert_now")
+
+        self.assertAlmostEqual(alert_now_high["branch_reward"], alert_now_low["branch_reward"], places=6)
+        self.assertAlmostEqual(alert_now_high["local_advantage"], alert_now_low["local_advantage"], places=6)
+
+    def test_self_teacher_evidence_group_does_not_depend_on_future_verify_turn(self):
+        self.assertIsNotNone(TRAINING_DATA_MODULE, "saver_agent.training_data module is missing")
+
+        runner = SaverRolloutRunner(
+            environment=SaverVideoInteraction(),
+            adapter=TimeSearchRolloutAdapter(),
+            max_turns=3,
+        )
+        policy = ReplayPolicy(
+            [
+                '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"aggressive contact","start_sec":0.0,"end_sec":4.0,"num_frames":2}}</tool_call>',
+                '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
+            ]
+        )
+        base_rollout = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
+        base_rollout["reward_summary"] = {"total_reward": 1.0}
+        anchor_turn = copy.deepcopy(base_rollout["turns"][2])
+
+        def _with_future_verify(verification_decision: str, sufficiency: float):
+            rollout = copy.deepcopy(base_rollout)
+            rollout["turns"].append(
+                {
+                    "step_index": 4,
+                    "tool_name": "verify_hypothesis",
+                    "self_verification_decision": verification_decision,
+                    "verifier_primary_status": "complete" if verification_decision == "sufficient" else "misaligned",
+                    "verifier_alert_status": "justified",
+                    "self_verification_scores": {
+                        "sufficiency": sufficiency,
+                        "necessity": 0.4,
+                        "alertability": 0.7,
+                        "counterfactual_faithfulness": 0.6,
+                    },
+                }
+            )
+            return rollout
+
+        records_high = TRAINING_DATA_MODULE._build_evidence_counterfactual_group(
+            _with_future_verify("sufficient", 0.9),
+            anchor_turn,
+            multimodal_cache=self.item["multimodal_cache"],
+            local_verifier_backend="self_teacher",
+            local_use_reference_supervision=False,
+        )
+        records_low = TRAINING_DATA_MODULE._build_evidence_counterfactual_group(
+            _with_future_verify("misaligned", 0.1),
+            anchor_turn,
+            multimodal_cache=self.item["multimodal_cache"],
+            local_verifier_backend="self_teacher",
+            local_use_reference_supervision=False,
+        )
+
+        self.assertEqual(records_high, records_low)
+
+    def test_turn_level_advantages_penalize_invalid_attempts_before_successful_step(self):
+        self.assertIsNotNone(TRAINING_DATA_MODULE, "saver_agent.training_data module is missing")
+
+        clean = TRAINING_DATA_MODULE._compute_turn_level_advantages(
+            {
+                "reward_summary": {"total_reward": 1.0},
+                "turns": [
+                    {"step_index": 1, "tool_name": "scan_timeline", "valid_action": True, "new_evidence_ids": []},
+                    {"step_index": 2, "tool_name": "seek_evidence", "valid_action": True, "new_evidence_ids": ["e0001"]},
+                ],
+                "invalid_attempts": [],
+            },
+            gamma=0.9,
+            alpha=0.5,
+            search_bonus=0.05,
+            evidence_bonus=0.1,
+            finalize_bonus=0.2,
+            invalid_penalty=0.75,
+        )
+        with_retries = TRAINING_DATA_MODULE._compute_turn_level_advantages(
+            {
+                "reward_summary": {"total_reward": 1.0},
+                "turns": [
+                    {"step_index": 1, "tool_name": "scan_timeline", "valid_action": True, "new_evidence_ids": []},
+                    {"step_index": 2, "tool_name": "seek_evidence", "valid_action": True, "new_evidence_ids": ["e0001"]},
+                ],
+                "invalid_attempts": [
+                    {"step_index": 2, "action": None, "valid_action": False},
+                    {"step_index": 2, "action": None, "valid_action": False},
+                ],
+            },
+            gamma=0.9,
+            alpha=0.5,
+            search_bonus=0.05,
+            evidence_bonus=0.1,
+            finalize_bonus=0.2,
+            invalid_penalty=0.75,
+        )
+
+        self.assertLess(with_retries[1]["turn_credit"], clean[1]["turn_credit"])
 
 
 if __name__ == "__main__":

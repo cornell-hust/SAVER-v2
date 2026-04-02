@@ -7,9 +7,104 @@ from pathlib import Path
 
 
 ROOT = Path("/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from saver_agent.offline_scoring import ReferenceDataProvider, attach_teacher_judge_to_records, score_rollout_records
 
 
 class ScoreSaverRolloutCliTests(unittest.TestCase):
+    def test_attach_teacher_judge_to_records_annotates_verify_turns(self):
+        data_record = {
+            "schema_version": "saver_agent.v1",
+            "video_id": "sample_rollout_teacher",
+            "video_path": "videos/sample_rollout_teacher.mp4",
+            "split": "test",
+            "video_meta": {"fps": 1.0, "duration_sec": 8.0, "total_frames": 8},
+            "agent_task": {"task_prompt": "Determine whether an anomaly exists."},
+            "structured_target": {
+                "existence": "anomaly",
+                "category": "assault",
+                "severity": 4,
+                "anomaly_interval_sec": [1.0, 6.0],
+                "precursor_interval_sec": [0.0, 1.0],
+                "earliest_alert_sec": 1.0,
+                "counterfactual_type": "remove_actor_interaction",
+            },
+            "tool_io": {
+                "oracle_windows_sec": [
+                    {"moment_id": "ev1", "role": "trigger", "window": [1.0, 4.0], "description": "trigger"},
+                ],
+            },
+        }
+        rollout = {
+            "video_id": "sample_rollout_teacher",
+            "dataset_index": 0,
+            "terminated_reason": "answered",
+            "num_turns": 1,
+            "final_answer": {"existence": "anomaly", "category": "assault"},
+            "state": {
+                "visited_windows": [],
+                "evidence_ledger": [],
+                "alerts": [],
+                "verification_records": [],
+                "finalized_case": {"existence": "anomaly", "category": "assault", "earliest_alert_sec": 1.0},
+                "last_claim": {"existence": "anomaly", "category": "assault", "earliest_alert_sec": 1.0},
+                "active_evidence_window_ids": [],
+                "verifier_cache": [],
+                "next_evidence_id": 1,
+                "next_window_id": 1,
+                "next_alert_id": 1,
+            },
+            "turns": [
+                {
+                    "step_index": 1,
+                    "assistant_response_raw": '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":{"verification_mode":"full_keep_drop","claim":{"existence":"anomaly","category":"assault"},"selected_window_ids":["w0001"],"selected_evidence_ids":["e0001"],"selected_evidence_moment_ids":["ev1"],"verification_decision":"sufficient","recommended_action":"finalize","sufficiency_score":0.8,"necessity_score":0.4}}</tool_call>',
+                    "action": "tool_call",
+                    "valid_action": True,
+                    "tool_name": "verify_hypothesis",
+                    "self_verification_decision": "sufficient",
+                    "self_verification_scores": {
+                        "sufficiency": 0.8,
+                        "necessity": 0.4,
+                        "alertability": 0.7,
+                        "counterfactual_faithfulness": 0.6,
+                    },
+                }
+            ],
+        }
+
+        class DummyJudge:
+            def annotate_example(self, example, *, input_mode=None):
+                updated = dict(example)
+                updated["teacher_judge_scores"] = {
+                    "sufficiency": 0.82,
+                    "necessity": 0.42,
+                    "alertability": 0.72,
+                    "counterfactual_faithfulness": 0.61,
+                }
+                updated["teacher_judge_decision"] = "sufficient"
+                updated["teacher_judge_rationale"] = "Teacher agrees."
+                return updated
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "data.jsonl"
+            data_path.write_text(json.dumps(data_record) + "\n", encoding="utf-8")
+            reference_data = ReferenceDataProvider(data_path=data_path, data_root=tmpdir)
+
+            annotated, summary = attach_teacher_judge_to_records(
+                [rollout],
+                reference_data=reference_data,
+                judge=DummyJudge(),
+                input_mode="text_only",
+            )
+
+        self.assertEqual(summary["num_teacher_judge_candidates"], 1)
+        self.assertEqual(summary["num_teacher_judge_annotated_turns"], 1)
+        verify_turn = annotated[0]["turns"][0]
+        self.assertEqual(verify_turn["teacher_judge_decision"], "sufficient")
+        self.assertGreater(verify_turn["teacher_judge_reward"], 0.0)
+
     def test_cli_scores_jsonl_rollouts_and_attaches_offline_verifier(self):
         rollout = {
             "video_id": "sample_rollout",
@@ -94,6 +189,7 @@ class ScoreSaverRolloutCliTests(unittest.TestCase):
                     str(output_path),
                     "--data",
                     str(data_path),
+                    "--attach-reference-offline-verifier",
                     "--verifier-backend",
                     "heuristic",
                     "--force-reverify",
@@ -109,6 +205,33 @@ class ScoreSaverRolloutCliTests(unittest.TestCase):
         self.assertIn("offline_verifier", scored)
         self.assertEqual(scored["offline_verifier"]["primary_status"], "complete")
         self.assertGreater(scored["reward_summary"]["total_reward"], 0.0)
+
+    def test_score_rollout_records_does_not_attach_reference_verifier_by_default(self):
+        rollout = {
+            "video_id": "sample_rollout_no_diag",
+            "terminated_reason": "answered",
+            "num_turns": 1,
+            "final_answer": {"existence": "anomaly", "category": "assault"},
+            "state": {
+                "visited_windows": [],
+                "evidence_ledger": [],
+                "alerts": [],
+                "verification_records": [],
+                "finalized_case": {"existence": "anomaly", "category": "assault"},
+                "last_claim": {"existence": "anomaly", "category": "assault"},
+                "active_evidence_window_ids": [],
+                "verifier_cache": [],
+                "next_evidence_id": 1,
+                "next_window_id": 1,
+                "next_alert_id": 1,
+            },
+            "turns": [],
+        }
+
+        scored = score_rollout_records([rollout])
+
+        self.assertNotIn("offline_verifier", scored[0])
+        self.assertFalse(scored[0]["scoring_metadata"]["attach_offline_verifier"])
 
     def test_cli_accepts_directory_of_jsonl_shards(self):
         rollout_a = {

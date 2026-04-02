@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from split_utils import parse_include_splits
+from saver_agent.categories import CANONICAL_POLICY_CATEGORIES, canonicalize_saver_category
 from saver_agent.proposal import build_proposal_supervision, select_query_for_moment
+from saver_agent.self_verification import build_policy_self_verification_payload
 
 
 SCHEMA_VERSION = "saver_agent.v1"
@@ -40,7 +42,7 @@ FINALIZE_CASE_SCHEMA = {
     "type": "object",
     "properties": {
         "existence": {"type": "string", "enum": ["normal", "anomaly"]},
-        "category": {"type": "string"},
+        "category": {"type": "string", "enum": list(CANONICAL_POLICY_CATEGORIES)},
         "severity": {"type": "integer"},
         "anomaly_interval_sec": {
             "oneOf": [
@@ -159,12 +161,66 @@ def union_frame_intervals(intervals: Iterable[List[int]]) -> Optional[List[int]]
     return [start_frame, end_frame]
 
 
+def _is_strict_precursor_interval(
+    interval_frames: Optional[List[int]],
+    *,
+    anomaly_start_frame: Optional[int],
+) -> bool:
+    interval = ensure_frame_interval(interval_frames)
+    if interval is None or anomaly_start_frame is None:
+        return interval is not None
+    # The second-domain interval uses an exclusive end timestamp:
+    # end_sec = (end_frame - base + 1) / fps. Therefore a precursor that ends
+    # on the same frame as anomaly_start already overlaps the anomaly in time.
+    return int(interval[1]) < int(anomaly_start_frame)
+
+
+def _sanitize_qa_pairs(
+    qa_pairs: Any,
+    *,
+    precursor_interval_sec: Optional[List[float]],
+    precursor_resolution_source: Optional[str],
+) -> List[Dict[str, Any]]:
+    cleaned_pairs: List[Dict[str, Any]] = []
+    keep_precursor_temporal = (
+        precursor_interval_sec is not None and str(precursor_resolution_source or "") == "annotation"
+    )
+    for qa in list(qa_pairs or []):
+        if not isinstance(qa, dict):
+            continue
+        if str(qa.get("type") or "") == "precursor_temporal" and not keep_precursor_temporal:
+            continue
+        cleaned_pairs.append(dict(qa))
+    return cleaned_pairs
+
+
+def _normalize_evidence_role(
+    role: Any,
+    *,
+    start_frame: int,
+    end_frame: int,
+    anomaly_start_frame: Optional[int],
+) -> str:
+    normalized_role = str(role or "unspecified")
+    if normalized_role != "precursor" or anomaly_start_frame is None:
+        return normalized_role
+    if _is_strict_precursor_interval(
+        [start_frame, end_frame],
+        anomaly_start_frame=anomaly_start_frame,
+    ):
+        return normalized_role
+    if int(start_frame) >= int(anomaly_start_frame):
+        return "trigger"
+    return "evidence"
+
+
 def normalize_evidence_moment(
     moment: Dict[str, Any],
     *,
     fps: float,
     frame_index_base: int,
     duration_sec: float,
+    anomaly_start_frame: Optional[int] = None,
 ) -> Dict[str, Any]:
     start_frame = int(moment["start_frame"])
     end_frame = int(moment["end_frame"])
@@ -174,9 +230,15 @@ def normalize_evidence_moment(
         frame_index_base=frame_index_base,
         duration_sec=duration_sec,
     )
+    normalized_role = _normalize_evidence_role(
+        moment.get("role"),
+        start_frame=start_frame,
+        end_frame=end_frame,
+        anomaly_start_frame=anomaly_start_frame,
+    )
     return {
-        "moment_id": moment.get("moment_id", f"{moment.get('role', 'ev')}_{start_frame}_{end_frame}"),
-        "role": moment.get("role", "unspecified"),
+        "moment_id": moment.get("moment_id", f"{normalized_role or 'ev'}_{start_frame}_{end_frame}"),
+        "role": normalized_role,
         "description": moment.get("description"),
         "start_frame": start_frame,
         "end_frame": end_frame,
@@ -207,22 +269,26 @@ def complete_precursor_interval(
         }
 
     annotated = ensure_frame_interval(temporal.get("precursor_interval_frames"))
-    if annotated:
-        seconds = frame_interval_to_seconds(
-            annotated,
-            fps=fps,
-            frame_index_base=frame_index_base,
-            duration_sec=duration_sec,
-        )
-        return {
-            "frames": annotated,
-            "seconds": list(seconds),
-            "source": "annotation",
-            "auto_completed": False,
-        }
-
     anomaly_interval = ensure_frame_interval(temporal.get("anomaly_interval_frames"))
     anomaly_start = anomaly_interval[0] if anomaly_interval else None
+    saw_explicit_non_strict_precursor = False
+
+    if annotated:
+        if _is_strict_precursor_interval(annotated, anomaly_start_frame=anomaly_start):
+            seconds = frame_interval_to_seconds(
+                annotated,
+                fps=fps,
+                frame_index_base=frame_index_base,
+                duration_sec=duration_sec,
+            )
+            return {
+                "frames": annotated,
+                "seconds": list(seconds),
+                "source": "annotation",
+                "auto_completed": False,
+            }
+        saw_explicit_non_strict_precursor = True
+
     evidence_moments = record.get("evidence", {}).get("evidence_moments", [])
 
     precursor_intervals = []
@@ -230,7 +296,10 @@ def complete_precursor_interval(
     for moment in evidence_moments:
         interval = ensure_frame_interval([moment["start_frame"], moment["end_frame"]])
         if moment.get("role") == "precursor":
-            precursor_intervals.append(interval)
+            if _is_strict_precursor_interval(interval, anomaly_start_frame=anomaly_start):
+                precursor_intervals.append(interval)
+            else:
+                saw_explicit_non_strict_precursor = True
         if anomaly_start is not None and interval[1] < anomaly_start:
             preceding_intervals.append(interval)
 
@@ -246,6 +315,14 @@ def complete_precursor_interval(
             "frames": resolved,
             "seconds": list(seconds),
             "source": "evidence_precursor_role",
+            "auto_completed": False,
+        }
+
+    if saw_explicit_non_strict_precursor:
+        return {
+            "frames": None,
+            "seconds": None,
+            "source": "non_strict_precursor_dropped",
             "auto_completed": False,
         }
 
@@ -334,6 +411,7 @@ class CanonicalSaverAdapter:
         frame_index_base = int(record.get("frame_index_base", 0))
 
         anomaly_interval_frames = ensure_frame_interval(record["temporal"].get("anomaly_interval_frames"))
+        anomaly_start_frame = anomaly_interval_frames[0] if anomaly_interval_frames else None
         anomaly_interval_sec = (
             list(
                 frame_interval_to_seconds(
@@ -366,6 +444,7 @@ class CanonicalSaverAdapter:
                 fps=fps,
                 frame_index_base=frame_index_base,
                 duration_sec=duration_sec,
+                anomaly_start_frame=anomaly_start_frame,
             )
             for moment in record.get("evidence", {}).get("evidence_moments", [])
         ]
@@ -389,10 +468,17 @@ class CanonicalSaverAdapter:
             },
             "scene": record.get("scene", {}),
             "key_objects": record.get("key_objects", []),
-            "label": record["label"],
+            "label": {
+                **record["label"],
+                "category": canonicalize_saver_category(
+                    record.get("label", {}).get("category"),
+                    existence="anomaly" if record.get("label", {}).get("is_anomaly") else "normal",
+                ),
+            },
             "temporal": {
                 **record["temporal"],
                 "anomaly_interval_sec": anomaly_interval_sec,
+                "precursor_interval_frames": precursor_info["frames"],
                 "precursor_interval_sec": precursor_info["seconds"],
                 "earliest_alert_sec": earliest_alert_sec,
                 "precursor_resolution": {
@@ -406,7 +492,11 @@ class CanonicalSaverAdapter:
             },
             "counterfactual": record.get("counterfactual", {}),
             "language": record.get("language", {}),
-            "qa_pairs": record.get("qa_pairs", []),
+            "qa_pairs": _sanitize_qa_pairs(
+                record.get("qa_pairs", []),
+                precursor_interval_sec=precursor_info["seconds"],
+                precursor_resolution_source=precursor_info["source"],
+            ),
             "provenance": record.get("provenance", {}),
             "qwen_preannotation": record.get("qwen_preannotation", {}),
             "auto_completed": {
@@ -432,7 +522,7 @@ class CanonicalSaverAdapter:
         task_prompt = self._build_task_prompt(base)
         structured_target = {
             "existence": existence,
-            "category": label["category"],
+            "category": canonicalize_saver_category(label["category"], existence=existence),
             "severity": label["severity"],
             "hard_normal": label["hard_normal"],
             "anomaly_interval_sec": anomaly_interval_sec,
@@ -498,17 +588,11 @@ class CanonicalSaverAdapter:
     def _build_task_prompt(self, base: Dict[str, Any]) -> str:
         scene = base.get("scene", {}).get("scenario")
         duration = round6(base["video_meta"]["duration_sec"])
-        if base["label"]["is_anomaly"]:
-            target_text = (
-                "Determine whether the video contains an actionable anomaly, search for precursor and trigger evidence, "
-                "raise a soft or hard alert when justified, verify that the searched evidence is sufficient, and then "
-                "return a structured final decision."
-            )
-        else:
-            target_text = (
-                "Determine whether the video is normal, avoid unnecessary alerts, and only declare normal after searching "
-                "enough to justify that no actionable anomaly exists."
-            )
+        target_text = (
+            "Determine whether the video contains an actionable anomaly or is normal, search for precursor and trigger "
+            "evidence when relevant, raise a soft or hard alert only when justified, verify that the searched evidence "
+            "is sufficient, and then return a structured final decision."
+        )
         return (
             f"Video duration: {duration} seconds. "
             f"Scene: {scene}. "
@@ -520,7 +604,37 @@ class CanonicalSaverAdapter:
         language = base.get("language") or {}
         structured_target = base.get("structured_target") or {}
         duration = round6(base["video_meta"]["duration_sec"])
-        trajectory.append(
+        next_window_id = 1
+        next_evidence_id = 1
+        searched_real_moments: List[Dict[str, Any]] = []
+        searched_real_refs: List[Dict[str, Any]] = []
+        searched_supplemental_refs: List[Dict[str, Any]] = []
+        normal_search_refs: List[Dict[str, Any]] = []
+
+        def append_step(
+            step: Dict[str, Any],
+            *,
+            ref_bucket: Optional[List[Dict[str, Any]]] = None,
+        ) -> Optional[Dict[str, Any]]:
+            nonlocal next_window_id, next_evidence_id
+            trajectory.append(step)
+            tool_name = str(step.get("tool") or "")
+            if tool_name not in {"scan_timeline", "seek_evidence"}:
+                return None
+            runtime_ref = {
+                "window_id": f"w{next_window_id:04d}",
+                "evidence_id": f"e{next_evidence_id:04d}",
+                "tool": tool_name,
+                "moment_id": (step.get("arguments") or {}).get("moment_id"),
+                "role": (step.get("arguments") or {}).get("role"),
+            }
+            next_window_id += 1
+            next_evidence_id += 1
+            if ref_bucket is not None:
+                ref_bucket.append(runtime_ref)
+            return runtime_ref
+
+        append_step(
             {
                 "tool": "scan_timeline",
                 "arguments": {
@@ -537,9 +651,8 @@ class CanonicalSaverAdapter:
         temporal = base["temporal"]
 
         if label["is_anomaly"]:
-            category = str(label.get("category") or "anomaly")
+            category = canonicalize_saver_category(label.get("category") or "anomaly", existence="anomaly")
             sorted_moments = self._sorted_evidence_moments(evidence_moments)
-            searched_real_moments: List[Dict[str, Any]] = []
             used_window_keys = {
                 self._window_key(moment.get("start_sec"), moment.get("end_sec"))
                 for moment in sorted_moments
@@ -548,14 +661,32 @@ class CanonicalSaverAdapter:
             proposal_supervision = base.get("proposal_supervision")
 
             def append_real_seek(moment: Dict[str, Any]) -> None:
-                trajectory.append(
+                runtime_ref = append_step(
                     self._seek_evidence_step(
                         moment,
                         category=category,
                         proposal_supervision=proposal_supervision,
-                    )
+                    ),
+                    ref_bucket=searched_real_refs,
                 )
                 searched_real_moments.append(moment)
+                if runtime_ref is not None:
+                    runtime_ref["moment_id"] = moment.get("moment_id")
+                    runtime_ref["role"] = moment.get("role")
+
+            def append_supplemental_seeks(count: int) -> List[Dict[str, Any]]:
+                added_refs: List[Dict[str, Any]] = []
+                steps = self._supplemental_seek_steps(
+                    base,
+                    category=category,
+                    used_window_keys=used_window_keys,
+                    count=count,
+                )
+                for step in steps:
+                    runtime_ref = append_step(step, ref_bucket=searched_supplemental_refs)
+                    if runtime_ref is not None:
+                        added_refs.append(runtime_ref)
+                return added_refs
 
             remaining_real_moments = list(sorted_moments)
             primary_moment = remaining_real_moments.pop(0) if remaining_real_moments else None
@@ -568,6 +699,7 @@ class CanonicalSaverAdapter:
                     "arguments": {
                         "decision": "soft_alert",
                         "existence": "anomaly",
+                        "category": category,
                         "earliest_alert_sec": temporal["earliest_alert_sec"],
                     },
                 }
@@ -582,18 +714,26 @@ class CanonicalSaverAdapter:
                             "evidence_moment_ids": [primary_moment["moment_id"]] if primary_moment is not None else [],
                             "claim": {
                                 "existence": "anomaly",
+                                "category": category,
                             },
                         },
                         "oracle_verifier_feedback": self._oracle_verifier_feedback(
                             verification_mode="soft_alert_check",
+                            verification_decision="misaligned",
                             primary_status="misaligned",
                             alert_status="premature",
                             recommended_action="revise_claim",
+                            selected_refs=searched_real_refs[:1],
+                            selected_evidence_moment_ids=[primary_moment["moment_id"]] if primary_moment is not None else [],
+                            sufficiency_score=0.18,
+                            necessity_score=0.24,
+                            alertability_score=0.12,
+                            counterfactual_faithfulness=0.21,
                             failure_reasons=[
                                 "current_claim_is_more_specific_than_the_observed_precursor_evidence",
                                 "alert_prefix_not_actionable",
                             ],
-                            explanation=(
+                            rationale=(
                                 "The current evidence only supports a tentative suspicious precursor, so the anomaly "
                                 "claim should be revised before continuing."
                             ),
@@ -607,14 +747,7 @@ class CanonicalSaverAdapter:
                 append_real_seek(moment)
 
             first_support_needed = max(0, 2 - len(first_support_batch))
-            trajectory.extend(
-                self._supplemental_seek_steps(
-                    base,
-                    category=category,
-                    used_window_keys=used_window_keys,
-                    count=first_support_needed,
-                )
-            )
+            append_supplemental_seeks(first_support_needed)
 
             selected_subset_ids = [
                 str(moment.get("moment_id"))
@@ -636,14 +769,21 @@ class CanonicalSaverAdapter:
                         },
                         "oracle_verifier_feedback": self._oracle_verifier_feedback(
                             verification_mode="full_keep_drop",
+                            verification_decision="insufficient",
                             primary_status="incomplete",
                             alert_status="premature",
                             recommended_action="continue_search",
+                            selected_refs=searched_real_refs[:2],
+                            selected_evidence_moment_ids=selected_subset_ids,
+                            sufficiency_score=0.47,
+                            necessity_score=0.31,
+                            alertability_score=0.34,
+                            counterfactual_faithfulness=0.39,
                             failure_reasons=[
                                 "selected_evidence_not_sufficient",
                                 "alert_prefix_not_actionable",
                             ],
-                            explanation=(
+                            rationale=(
                                 "The compact evidence subset is promising but still incomplete, so more decisive or "
                                 "confirmatory evidence should be searched before finalizing."
                             ),
@@ -654,14 +794,54 @@ class CanonicalSaverAdapter:
             if remaining_real_moments:
                 append_real_seek(remaining_real_moments[0])
             else:
-                trajectory.extend(
-                    self._supplemental_seek_steps(
-                        base,
-                        category=category,
-                        used_window_keys=used_window_keys,
-                        count=1,
+                append_supplemental_seeks(1)
+
+            if len(searched_real_refs) >= 3:
+                redundant_context_refs = append_supplemental_seeks(1)
+                if redundant_context_refs:
+                    trajectory.append(
+                        {
+                            "tool": "verify_hypothesis",
+                            "arguments": {
+                                "verification_mode": "full_keep_drop",
+                                "evidence_moment_ids": [
+                                    str(moment.get("moment_id"))
+                                    for moment in searched_real_moments
+                                    if moment.get("moment_id") is not None
+                                ],
+                                "claim": {
+                                    "existence": "anomaly",
+                                    "category": category,
+                                    "earliest_alert_sec": temporal.get("earliest_alert_sec"),
+                                },
+                            },
+                            "oracle_verifier_feedback": self._oracle_verifier_feedback(
+                                verification_mode="full_keep_drop",
+                                verification_decision="redundant",
+                                primary_status="redundant",
+                                alert_status="premature",
+                                recommended_action="refine_evidence",
+                                selected_refs=searched_real_refs + redundant_context_refs,
+                                selected_evidence_moment_ids=[
+                                    str(moment.get("moment_id"))
+                                    for moment in searched_real_moments
+                                    if moment.get("moment_id") is not None
+                                ],
+                                sufficiency_score=0.86,
+                                necessity_score=0.18,
+                                alertability_score=0.62,
+                                counterfactual_faithfulness=0.52,
+                                failure_reasons=[
+                                    "selected_evidence_not_necessary_enough",
+                                    "alert_prefix_not_actionable",
+                                ],
+                                rationale=(
+                                    "The searched evidence is now strong enough, but the current subset still includes "
+                                    "redundant broad context that should be pruned before finalizing."
+                                ),
+                            ),
+                        }
                     )
-                )
 
             trajectory.append(
                 {
@@ -687,16 +867,28 @@ class CanonicalSaverAdapter:
                     },
                     "oracle_verifier_feedback": self._oracle_verifier_feedback(
                         verification_mode="hard_alert_check",
+                        verification_decision="sufficient",
                         primary_status="complete",
                         alert_status="justified",
                         recommended_action="finalize",
+                        selected_refs=searched_real_refs,
+                        selected_evidence_moment_ids=[
+                            str(moment.get("moment_id"))
+                            for moment in searched_real_moments
+                            if moment.get("moment_id") is not None
+                        ],
+                        sufficiency_score=0.92,
+                        necessity_score=0.71,
+                        alertability_score=0.88,
+                        counterfactual_faithfulness=0.82,
                         failure_reasons=[],
-                        explanation="The selected evidence subset is sufficient, necessary enough, and actionably supports the current anomaly claim.",
+                        rationale="The selected evidence subset is sufficient, necessary enough, and actionably supports the current anomaly claim.",
                     ),
                 }
             )
         else:
-            trajectory.extend(self._normal_followup_scan_steps(base, count=3))
+            for step in self._normal_followup_scan_steps(base, count=3):
+                append_step(step, ref_bucket=normal_search_refs)
             trajectory.append(
                 {
                     "tool": "verify_hypothesis",
@@ -704,16 +896,23 @@ class CanonicalSaverAdapter:
                         "verification_mode": "final_check",
                         "claim": {
                             "existence": "normal",
-                            "category": label.get("category"),
+                            "category": canonicalize_saver_category(label.get("category"), existence="normal"),
                         },
                     },
                     "oracle_verifier_feedback": self._oracle_verifier_feedback(
                         verification_mode="final_check",
+                        verification_decision="sufficient",
                         primary_status="complete",
                         alert_status="not_applicable",
                         recommended_action="finalize",
+                        selected_refs=normal_search_refs,
+                        selected_evidence_moment_ids=[],
+                        sufficiency_score=0.9,
+                        necessity_score=0.58,
+                        alertability_score=0.0,
+                        counterfactual_faithfulness=0.74,
                         failure_reasons=[],
-                        explanation="The searched windows are enough to justify a normal decision, so the case can be finalized.",
+                        rationale="The searched windows are enough to justify a normal decision, so the case can be finalized.",
                     ),
                 }
             )
@@ -724,6 +923,15 @@ class CanonicalSaverAdapter:
                 "arguments": base["structured_target"],
             }
         )
+        for step in trajectory:
+            if str(step.get("tool") or "") != "verify_hypothesis":
+                continue
+            feedback = step.get("oracle_verifier_feedback") or {}
+            if not isinstance(feedback, dict):
+                continue
+            merged_arguments = dict(step.get("arguments") or {})
+            merged_arguments.update(feedback)
+            step["arguments"] = build_policy_self_verification_payload(merged_arguments)
         return {
             "trajectory": trajectory,
             "final_decision": base["structured_target"],
@@ -900,20 +1108,59 @@ class CanonicalSaverAdapter:
     def _oracle_verifier_feedback(
         *,
         verification_mode: str,
+        verification_decision: str,
         primary_status: str,
         alert_status: str,
         recommended_action: str,
+        selected_refs: Optional[List[Dict[str, Any]]] = None,
+        selected_evidence_moment_ids: Optional[List[str]] = None,
+        sufficiency_score: float,
+        necessity_score: float,
+        alertability_score: float,
+        counterfactual_faithfulness: float,
         failure_reasons: List[str],
-        explanation: str,
+        rationale: str,
+        teacher_judge_scores: Optional[Dict[str, Any]] = None,
+        teacher_judge_decision: Optional[str] = None,
+        teacher_judge_rationale: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return {
+        payload = build_policy_self_verification_payload(
+            {
             "verification_mode": verification_mode,
+            "verification_decision": verification_decision,
             "primary_status": primary_status,
             "alert_status": alert_status,
             "recommended_action": recommended_action,
+            "selected_window_ids": [
+                str(ref.get("window_id"))
+                for ref in list(selected_refs or [])
+                if ref.get("window_id") is not None
+            ],
+            "selected_evidence_ids": [
+                str(ref.get("evidence_id"))
+                for ref in list(selected_refs or [])
+                if ref.get("evidence_id") is not None
+            ],
+            "selected_evidence_moment_ids": [
+                str(moment_id)
+                for moment_id in list(selected_evidence_moment_ids or [])
+                if str(moment_id).strip()
+            ],
+            "sufficiency_score": round6(sufficiency_score),
+            "necessity_score": round6(necessity_score),
+            "alertability_score": round6(alertability_score),
+            "counterfactual_faithfulness": round6(counterfactual_faithfulness),
             "failure_reasons": list(failure_reasons or []),
-            "explanation": explanation,
-        }
+            "rationale": rationale,
+            }
+        )
+        if teacher_judge_scores is not None:
+            payload["teacher_judge_scores"] = dict(teacher_judge_scores)
+        if teacher_judge_decision is not None:
+            payload["teacher_judge_decision"] = str(teacher_judge_decision)
+        if teacher_judge_rationale is not None:
+            payload["teacher_judge_rationale"] = str(teacher_judge_rationale)
+        return payload
 
     @staticmethod
     def _query_for_role(role: str, category: str) -> str:

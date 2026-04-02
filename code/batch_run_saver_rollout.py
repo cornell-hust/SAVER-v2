@@ -11,7 +11,14 @@ from split_utils import parse_include_splits
 
 from run_saver_rollout import _serialize_result
 from saver_agent.adapter import TimeSearchRolloutAdapter
-from saver_agent.config import PromptConfig, PreviewConfig, RolloutTraceConfig, SaverAgentConfig
+from saver_agent.config import (
+    DEFAULT_POLICY_MAX_NEW_TOKENS,
+    DEFAULT_TOTAL_VISUAL_BUDGET,
+    PromptConfig,
+    PreviewConfig,
+    RolloutTraceConfig,
+    SaverAgentConfig,
+)
 from saver_agent.dataset import SaverAgentDataset
 from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH, QwenGenerationPolicy
@@ -65,7 +72,24 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--torch-dtype", default="auto", help="Torch dtype passed to from_pretrained.")
     parser.add_argument("--device-map", default="auto", help="Transformers device_map argument.")
     parser.add_argument("--attn-implementation", default="", help="Optional attention backend.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Generation length for Qwen policy.")
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_POLICY_MAX_NEW_TOKENS,
+        help="Generation length for Qwen policy.",
+    )
+    parser.add_argument(
+        "--total-visual-budget",
+        type=int,
+        default=0,
+        help="Alias for a coarse visual budget. Resolved as --max-total-images when the latter is unset.",
+    )
+    parser.add_argument(
+        "--max-total-images",
+        type=int,
+        default=DEFAULT_TOTAL_VISUAL_BUDGET,
+        help="Optional hard cap on total images preserved in the rollout prompt. 0 keeps all images.",
+    )
     parser.add_argument("--do-sample", action="store_true", help="Enable sampling for Qwen policy.")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
     parser.add_argument("--top-p", type=float, default=None, help="Sampling top-p.")
@@ -104,7 +128,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--verifier-backend",
         choices=["heuristic", "qwen_self_verifier", "hybrid"],
         default="heuristic",
-        help="Verifier backend used by verify_hypothesis calls that do not explicitly specify one.",
+        help="Diagnostic verifier backend only. Main rollout inference uses policy self-verification by default.",
+    )
+    parser.add_argument(
+        "--diagnostic-online-verifier-fallback",
+        action="store_true",
+        help="Allow legacy external verifier fallback inside verify_hypothesis. Diagnostic only.",
     )
     parser.add_argument(
         "--verifier-model-path",
@@ -230,6 +259,7 @@ def _build_qwen_policy(args: argparse.Namespace, *, runtime: Any) -> QwenGenerat
         device_map=resolve_inference_device_map(args.device_map, runtime=runtime),
         attn_implementation=args.attn_implementation or None,
         max_new_tokens=args.max_new_tokens,
+        max_total_images=(args.max_total_images if int(args.max_total_images) > 0 else args.total_visual_budget),
         do_sample=args.do_sample,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -323,9 +353,9 @@ def main() -> None:
     )
 
     verifier_runtime = None
-    if args.verifier_backend in {"qwen_self_verifier", "hybrid"} and local_indices:
+    if args.diagnostic_online_verifier_fallback and args.verifier_backend in {"qwen_self_verifier", "hybrid"} and local_indices:
         runtime_log(
-            f"loading verifier model from {args.verifier_model_path} with device_map={effective_verifier_device_map}",
+            f"loading diagnostic verifier model from {args.verifier_model_path} with device_map={effective_verifier_device_map}",
             runtime=runtime,
         )
         verifier_runtime = _build_qwen_verifier(args, runtime=runtime)
@@ -353,12 +383,14 @@ def main() -> None:
     total_local = len(local_indices)
     for completed, dataset_index in enumerate(local_indices, start=1):
         item = dataset[dataset_index]
-        _attach_verifier_runtime(
-            item,
-            args,
-            verifier_runtime,
-            verifier_device_map=effective_verifier_device_map,
-        )
+        if args.diagnostic_online_verifier_fallback:
+            item["multimodal_cache"]["allow_external_verifier_fallback"] = True
+            _attach_verifier_runtime(
+                item,
+                args,
+                verifier_runtime,
+                verifier_device_map=effective_verifier_device_map,
+            )
         _attach_proposal_runtime(item, proposal_runtime)
         policy = qwen_policy if qwen_policy is not None else ReplayPolicy(args.response)
         result = runner.run_episode(item, policy)
