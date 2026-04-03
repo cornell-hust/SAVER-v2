@@ -88,7 +88,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--rollout-count", type=int, default=16, help="Number of videos per iteration.")
     parser.add_argument("--num-generations", type=int, default=4, help="Number of sampled rollouts per video per iteration.")
     parser.add_argument("--rollout-start-index", type=int, default=0, help="Start index for the first iteration.")
-    parser.add_argument("--rollout-max-turns", type=int, default=12, help="Maximum rollout turns.")
+    parser.add_argument("--rollout-max-turns", type=int, default=14, help="Maximum rollout turns.")
     parser.add_argument("--dry-run", action="store_true", help="Collect/score examples but skip gradient updates.")
     parser.add_argument(
         "--min-weight",
@@ -343,7 +343,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-data-root", default="", help="Root path used to resolve relative video paths for epoch-end rollout eval.")
     parser.add_argument("--eval-include-splits", default="", help="Optional comma-separated split whitelist for --eval-data.")
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on eval records per epoch-end rollout eval.")
-    parser.add_argument("--eval-rollout-max-turns", type=int, default=12, help="Maximum rollout turns for epoch-end rollout eval.")
+    parser.add_argument("--eval-rollout-max-turns", type=int, default=14, help="Maximum rollout turns for epoch-end rollout eval.")
     parser.add_argument(
         "--eval-max-new-tokens-per-turn",
         type=int,
@@ -666,6 +666,8 @@ def _build_policy(model_path: str | Path, args: argparse.Namespace, *, runtime: 
         attn_implementation=args.attn_implementation or None,
         max_new_tokens=args.policy_max_new_tokens,
         max_total_images=args.max_total_images,
+        max_image_side=args.max_image_side,
+        max_image_pixels=args.max_image_pixels,
         do_sample=args.policy_do_sample,
         temperature=args.policy_temperature,
         top_p=args.policy_top_p,
@@ -806,6 +808,8 @@ def build_training_kwargs(
             rollout_max_turns=args.eval_rollout_max_turns,
             policy_max_new_tokens=args.eval_max_new_tokens_per_turn,
             max_total_images=_resolve_eval_max_total_images(args),
+            max_image_side=args.max_image_side,
+            max_image_pixels=args.max_image_pixels,
             proposal_model_path=args.eval_proposal_model_path or args.proposal_model_path,
             proposal_torch_dtype=args.eval_proposal_torch_dtype,
             proposal_device=args.eval_proposal_device,

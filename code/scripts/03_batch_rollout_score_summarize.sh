@@ -9,13 +9,21 @@ DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
 EXP_ROOT="${EXP_ROOT:-${DATA_ROOT}/Wmh/ideas/idea2_v2}"
 DATA_UTILS_DIR="${DATA_UTILS_DIR:-${CODE_DIR}/data_utils}"
 configure_experiment_layout "${CODE_DIR}" "${EXP_ROOT}" "${DATA_UTILS_DIR}"
+LOG_DIR="${LOG_DIR:-${DEFAULT_ROLLOUT_LOG_DIR}}"
 configure_script_logging "03_batch_rollout_score_summarize"
 ANNOTATION_DIR="${ANNOTATION_DIR:-${DEFAULT_ANNOTATION_DIR}}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DEFAULT_CHECKPOINT_DIR}}"
-ROLLOUT_ROOT="${ROLLOUT_ROOT:-${DEFAULT_ROLLOUT_ROOT}}"
 MODEL_ROOT="${MODEL_ROOT:-${DATA_ROOT}/Wmh/MLLMs}"
 
-DATA_PATH="${DATA_PATH:-${DATA_UTILS_DIR}/msad_saver_oracle_sft.jsonl}"
+if [[ -n "${SFT_CHECKPOINT_DIR:-}" ]]; then
+  CHECKPOINT_DIR="${SFT_CHECKPOINT_DIR}"
+elif [[ -n "${CHECKPOINT_DIR:-}" ]]; then
+  CHECKPOINT_DIR="${CHECKPOINT_DIR}"
+else
+  CHECKPOINT_DIR="${DEFAULT_SFT_CHECKPOINT_DIR}"
+fi
+ROLLOUT_ROOT="${ROLLOUT_ROOT:-${DEFAULT_ROLLOUT_ROOT}}"
+
+DATA_PATH="${DATA_PATH:-${DATA_UTILS_DIR}/msad_saver_runtime_test.jsonl}"
 INCLUDE_SPLITS="${INCLUDE_SPLITS:-test}"
 MODEL_PATH="${MODEL_PATH:-${CHECKPOINT_DIR}/saver_sft_qwen3vl_8b_eval_ddp}"
 RUN_NAME="${RUN_NAME:-sft_rollout_eval}"
@@ -25,9 +33,10 @@ PROPOSAL_TORCH_DTYPE="${PROPOSAL_TORCH_DTYPE:-auto}"
 PROPOSAL_DEVICE="${PROPOSAL_DEVICE:-}"
 
 START_INDEX="${START_INDEX:-0}"
+ROLLOUT_NPROC_PER_NODE="${ROLLOUT_NPROC_PER_NODE:-${NPROC_PER_NODE:-1}}"
 # 设为 0 表示从 START_INDEX 开始一路跑到该 split 结束，不截断。
 COUNT="${COUNT:-0}"
-MAX_TURNS="${MAX_TURNS:-12}"
+MAX_TURNS="${MAX_TURNS:-14}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-5}"
 TORCH_DTYPE="${TORCH_DTYPE:-auto}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
@@ -65,13 +74,19 @@ RAW_OUTPUT="${RAW_OUTPUT:-${RUN_DIR}/rollouts.raw.jsonl}"
 SCORED_OUTPUT="${SCORED_OUTPUT:-${RUN_DIR}/rollouts.scored.jsonl}"
 SUMMARY_OUTPUT="${SUMMARY_OUTPUT:-${RUN_DIR}/summary.json}"
 
-mkdir -p "${RUN_DIR}"
 cd "${CODE_DIR}"
 
+batch_cmd_prefix=(python)
+if [[ "${ROLLOUT_NPROC_PER_NODE}" != "1" ]]; then
+  batch_cmd_prefix=(torchrun --standalone --nproc_per_node="${ROLLOUT_NPROC_PER_NODE}")
+fi
+
 batch_cmd=(
-  python batch_run_saver_rollout.py
+  "${batch_cmd_prefix[@]}"
+  batch_run_saver_rollout.py
   --data "${DATA_PATH}"
   --data-root "${DATA_ROOT}"
+  --log-dir "${LOG_DIR}"
   --start-index "${START_INDEX}"
   --count "${COUNT}"
   --max-turns "${MAX_TURNS}"

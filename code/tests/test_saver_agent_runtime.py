@@ -1,5 +1,8 @@
 import sys
+import re
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +17,7 @@ try:
         distributed_runtime_from_env,
         resolve_inference_device_map,
         resolve_shard_spec,
+        runtime_log,
         shard_sequence,
         sharded_output_path,
     )
@@ -21,6 +25,7 @@ except ModuleNotFoundError:
     distributed_runtime_from_env = None
     resolve_inference_device_map = None
     resolve_shard_spec = None
+    runtime_log = None
     shard_sequence = None
     sharded_output_path = None
 
@@ -106,6 +111,29 @@ class SaverAgentRuntimeTests(unittest.TestCase):
             device_map = resolve_inference_device_map("auto", runtime=runtime)
 
         self.assertEqual(device_map, {"": 0})
+
+    def test_runtime_log_prefixes_timestamp_before_rank_prefix(self):
+        self.assertIsNotNone(runtime_log, "runtime_log is missing")
+
+        runtime = distributed_runtime_from_env({"RANK": "0", "WORLD_SIZE": "1", "LOCAL_RANK": "0"})
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            runtime_log("hello world", runtime=runtime)
+
+        output = buffer.getvalue().strip()
+        self.assertRegex(output, r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[main\] hello world$")
+
+    def test_runtime_log_does_not_double_prefix_preformatted_runtime_lines(self):
+        self.assertIsNotNone(runtime_log, "runtime_log is missing")
+
+        runtime = distributed_runtime_from_env({"RANK": "0", "WORLD_SIZE": "4", "LOCAL_RANK": "0"})
+        message = "[2026-04-02 17:16:27] [rank 0/4] rollout eval progress: 16/60 video_id=People_falling_32"
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            runtime_log(message, runtime=runtime)
+
+        output = buffer.getvalue().strip()
+        self.assertEqual(output, message)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ class SaverRolloutRunner:
         *,
         environment: Optional[SaverVideoInteraction] = None,
         adapter: Optional[TimeSearchRolloutAdapter] = None,
-        max_turns: int = 12,
+        max_turns: int = 14,
         config: Optional[SaverAgentConfig] = None,
     ):
         self.config = copy.deepcopy(config) if config is not None else SaverAgentConfig()
@@ -66,6 +66,7 @@ class SaverRolloutRunner:
         invalid_attempts: List[Dict[str, Any]] = []
         final_answer = None
         final_answer_text = None
+        final_answer_source = None
         terminated_reason = "max_turns"
         terminated_at_step = self.max_turns
         needs_state_delta = bool(self.config.rollout_trace.record_state_deltas)
@@ -96,6 +97,7 @@ class SaverRolloutRunner:
             )
             next_state = next_states[0]
             is_valid_action = bool(valid_actions[0])
+            terminal_after_turn = False
             if is_valid_action:
                 messages.append(self.adapter.build_assistant_message(response_text))
                 formal_step_index += 1
@@ -158,12 +160,14 @@ class SaverRolloutRunner:
             elif action == "answer":
                 final_answer_text = self.adapter.parse_answer_text(response_text)
                 final_answer = self._coerce_answer_payload(final_answer_text)
+                final_answer_source = "answer" if isinstance(final_answer, dict) else None
                 terminated_reason = "answered"
                 terminated_at_step = step_index
                 turn_info["parsed_answer"] = final_answer
                 if not is_valid_action:
                     final_answer = None
                     final_answer_text = None
+                    final_answer_source = None
                     terminated_reason = "max_turns"
                     terminated_at_step = self.max_turns
                 else:
@@ -191,6 +195,17 @@ class SaverRolloutRunner:
                 if turn_info["tool_name"] is None:
                     turn_info["tool_name"] = tool_message.get("name")
                 turn_info.update(self._summarize_tool_message(tool_message))
+            if (
+                is_valid_action
+                and str(turn_info.get("tool_name") or "") == "finalize_case"
+                and isinstance(state.finalized_case, dict)
+            ):
+                final_answer = copy.deepcopy(state.finalized_case)
+                final_answer_text = json.dumps(final_answer, ensure_ascii=False)
+                final_answer_source = "finalize_case"
+                terminated_reason = "finalized"
+                terminated_at_step = step_index
+                terminal_after_turn = True
 
             if needs_state_delta and state_before is not None and state_after is not None:
                 state_delta = self._compute_state_delta(state_before, state_after)
@@ -212,6 +227,8 @@ class SaverRolloutRunner:
                 )
             if is_valid_action:
                 turns.append(turn_info)
+                if terminal_after_turn:
+                    break
             else:
                 invalid_attempts.append(turn_info)
 
@@ -222,6 +239,7 @@ class SaverRolloutRunner:
             "num_invalid_attempts": len(invalid_attempts),
             "final_answer": final_answer,
             "final_answer_text": final_answer_text,
+            "final_answer_source": final_answer_source,
             "turns": turns,
             "invalid_attempts": invalid_attempts,
             "state": asdict(state),
@@ -231,6 +249,7 @@ class SaverRolloutRunner:
                 "reason": terminated_reason,
                 "terminated_at_step": terminated_at_step if turns else 0,
                 "final_answer_present": final_answer is not None,
+                "final_answer_source": final_answer_source,
                 "latest_verifier_status": self._latest_verifier_status(turns),
                 "latest_alert_status": self._latest_alert_status(turns),
                 "verification_turn_count": self._verification_turn_count(turns),
@@ -618,7 +637,7 @@ class SaverRolloutRunner:
         for turn in seek_turns:
             backend = str(turn.get("proposal_backend") or "unknown")
             backend_counts[backend] = backend_counts.get(backend, 0) + 1
-            if backend == "feature_topk":
+            if backend in {"feature_topk", "siglip_dpp"}:
                 num_feature_guided += 1
             if backend == "uniform":
                 num_uniform_fallback += 1

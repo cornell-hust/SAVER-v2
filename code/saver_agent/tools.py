@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 
 from saver_agent.categories import canonicalize_category_payload, validate_canonical_category_payload
-from saver_agent.proposal import coerce_feature_cache_payload, feature_guided_frame_proposal, normalize_query_text
+from saver_agent.proposal import (
+    coerce_feature_cache_payload,
+    feature_guided_frame_proposal,
+    normalize_query_package,
+    normalize_query_text,
+    summarize_query_package,
+)
 from saver_agent.schema import SaverEnvironmentState, validate_required_fields
 from saver_agent.self_verification import (
     normalize_self_verification_mode,
@@ -153,11 +160,44 @@ def _dedupe_string_list(values: List[Any] | Tuple[Any, ...] | None) -> List[str]
     return deduped
 
 
+def _resolve_legacy_selected_window_alias(
+    raw_window_id: str,
+    *,
+    evidence_window_ids: List[str],
+    compact_alias_mode: bool,
+) -> str | None:
+    if not evidence_window_ids:
+        return None
+
+    evidence_match = re.fullmatch(r"evidence_(\d+)", raw_window_id)
+    if evidence_match:
+        index = int(evidence_match.group(1))
+        if 0 <= index < len(evidence_window_ids):
+            return evidence_window_ids[index]
+        return None
+
+    zero_based_window_match = re.fullmatch(r"w_(\d+)", raw_window_id)
+    if zero_based_window_match:
+        index = int(zero_based_window_match.group(1))
+        if 0 <= index < len(evidence_window_ids):
+            return evidence_window_ids[index]
+        return None
+
+    compact_window_match = re.fullmatch(r"w(\d+)", raw_window_id)
+    if compact_alias_mode and compact_window_match:
+        index = int(compact_window_match.group(1)) - 1
+        if 0 <= index < len(evidence_window_ids):
+            return evidence_window_ids[index]
+
+    return None
+
+
 def _append_window(
     state: SaverEnvironmentState,
     *,
     kind: str,
     query: str | None,
+    query_package: Dict[str, Any] | None,
     query_normalized: str | None,
     query_source: str | None,
     moment_id: str | None,
@@ -178,6 +218,7 @@ def _append_window(
         "evidence_id": evidence_id,
         "kind": kind,
         "query": query,
+        "query_package": dict(query_package or {}),
         "query_normalized": query_normalized,
         "query_source": query_source,
         "moment_id": moment_id,
@@ -259,6 +300,12 @@ def _resolve_selected_window_ids(
     seen = set()
     invalid_selected_window_ids: List[str] = []
     resolution_sources: List[str] = []
+    evidence_window_ids = [
+        str(entry.get("window_id")).strip()
+        for entry in state.evidence_ledger
+        if str(entry.get("window_id") or "").strip()
+    ]
+    compact_alias_mode = bool(evidence_window_ids and evidence_window_ids[0] != "w0001")
     valid_window_ids = {
         str(entry.get("window_id")).strip()
         for entry in state.evidence_ledger
@@ -275,13 +322,25 @@ def _resolve_selected_window_ids(
         by_moment_id.setdefault(str(moment_id), []).append(entry)
 
     selected_window_added = False
-    for window_id in requested_selected_window_ids:
-        if window_id not in valid_window_ids:
-            invalid_selected_window_ids.append(window_id)
+    for raw_window_id in requested_selected_window_ids:
+        resolved_window_id = _resolve_legacy_selected_window_alias(
+            raw_window_id,
+            evidence_window_ids=evidence_window_ids,
+            compact_alias_mode=compact_alias_mode,
+        )
+        if resolved_window_id is None and raw_window_id in valid_window_ids:
+            resolved_window_id = raw_window_id
+        if resolved_window_id is None:
+            if raw_window_id not in invalid_selected_window_ids:
+                invalid_selected_window_ids.append(raw_window_id)
             continue
-        if window_id not in seen:
-            seen.add(window_id)
-            resolved.append(window_id)
+        if resolved_window_id not in valid_window_ids:
+            if raw_window_id not in invalid_selected_window_ids:
+                invalid_selected_window_ids.append(raw_window_id)
+            continue
+        if resolved_window_id not in seen:
+            seen.add(resolved_window_id)
+            resolved.append(resolved_window_id)
             selected_window_added = True
     if selected_window_added:
         resolution_sources.append("selected_window_ids")
@@ -392,6 +451,7 @@ def scan_timeline(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
         state,
         kind="scan",
         query=arguments.get("purpose"),
+        query_package=None,
         query_normalized=normalize_query_text(str(arguments.get("purpose") or "")),
         query_source="scan_purpose",
         moment_id=None,
@@ -421,7 +481,12 @@ def scan_timeline(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
 
 def seek_evidence(arguments: Dict[str, Any], multimodal_cache: Dict, state: SaverEnvironmentState):
     start_sec, end_sec, selected_indices, fps = _resolve_window(arguments, multimodal_cache)
-    query = str(arguments.get("query") or "")
+    query_package = normalize_query_package(
+        arguments.get("query_package"),
+        fallback_query=str(arguments.get("query") or ""),
+        rewrite_reason=str(arguments.get("query_source") or "model"),
+    )
+    query = summarize_query_package(query_package)
     feature_cache = coerce_feature_cache_payload(
         multimodal_cache.get("embedding"),
         fps=fps,
@@ -431,10 +496,11 @@ def seek_evidence(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
         feature_cache=feature_cache,
         proposal_runtime=multimodal_cache.get("proposal_runtime"),
         query=query,
+        query_package=query_package,
         start_sec=start_sec,
         end_sec=end_sec,
         fps=fps,
-        num_frames=max(1, len(selected_indices)),
+        num_frames=int(arguments.get("num_frames") or 0),
         top_k_candidates=int(arguments.get("top_k_candidates") or 8),
         candidate_merge_gap_sec=float(arguments.get("candidate_merge_gap_sec") or 1.0),
         query_source=str(arguments.get("query_source") or "model"),
@@ -447,6 +513,7 @@ def seek_evidence(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
         state,
         kind="evidence",
         query=query,
+        query_package=query_package,
         query_normalized=str(proposal_metadata.get("query_normalized") or normalize_query_text(query)),
         query_source=str(proposal_metadata.get("query_source") or arguments.get("query_source") or "model"),
         moment_id=str(arguments.get("moment_id")) if arguments.get("moment_id") is not None else None,
@@ -458,9 +525,29 @@ def seek_evidence(arguments: Dict[str, Any], multimodal_cache: Dict, state: Save
         record_as_evidence=True,
         metadata=proposal_metadata,
     )
+    evidence_window_id = str(entry.get("window_id") or "").strip()
+    evidence_id = str(entry.get("evidence_id") or "").strip()
+    moment_id = str(entry.get("moment_id") or "").strip()
+    role = str(entry.get("role") or "").strip()
+    registration_parts = []
+    if evidence_window_id:
+        registration_parts.append(f"window_id={evidence_window_id}")
+    if evidence_id:
+        registration_parts.append(f"evidence_id={evidence_id}")
+    if role:
+        registration_parts.append(f"role={role}")
+    if moment_id:
+        registration_parts.append(f"moment_id={moment_id}")
+    verification_hint = ""
+    if evidence_window_id:
+        verification_hint = f' If you later call verify_hypothesis on this evidence, use selected_window_ids=["{evidence_window_id}"].'
+        if moment_id:
+            verification_hint += f' You may also include selected_evidence_moment_ids=["{moment_id}"].'
     footer = (
+        f"Registered evidence {' '.join(registration_parts)}. "
         f"Searched evidence for query '{query}' in window [{start_sec:.3f}, {end_sec:.3f}] "
         f"and selected {len(selected_indices)} frames."
+        f"{verification_hint}"
     )
     return _build_visual_content(selected_indices, multimodal_cache, footer), state, entry
 

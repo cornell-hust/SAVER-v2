@@ -139,6 +139,50 @@ class SaverAgentEnvironmentTests(unittest.TestCase):
         self.assertIn("finalize_case", retry_text)
         self.assertIn("summary", retry_text)
 
+    def test_invalid_verify_retry_message_uses_current_evidence_window_ids_without_hardcoded_assault_claim(self):
+        next_obs, _, _, _, states = self.env.execute_predictions(
+            [
+                '<think>scan</think><tool_call>{"name":"scan_timeline","arguments":{"start_sec":0.0,"end_sec":7.0,"num_frames":3}}</tool_call>'
+            ],
+            [self.multimodal_cache],
+            [SaverEnvironmentState()],
+            [True],
+        )
+        self.assertEqual(next_obs[0]["name"], "scan_timeline")
+
+        next_obs, _, _, _, states = self.env.execute_predictions(
+            [
+                '<think>seek</think><tool_call>{"name":"seek_evidence","arguments":{"query":"look for anomaly","start_sec":1.0,"end_sec":4.0,"num_frames":2}}</tool_call>'
+            ],
+            [self.multimodal_cache],
+            states,
+            [True],
+        )
+        self.assertEqual(next_obs[0]["name"], "seek_evidence")
+
+        next_obs, dones, valid_actions, is_search, _ = self.env.execute_predictions(
+            [
+                (
+                    '<think>verify</think><tool_call>{"name":"verify_hypothesis","arguments":'
+                    '{"verification_mode":"final_check","verification_decision":"insufficient",'
+                    '"recommended_action":"continue_search","sufficiency_score":0.2,"necessity_score":0.1,'
+                    '"alertability_score":0.0,"counterfactual_faithfulness":0.3}}</tool_call>'
+                )
+            ],
+            [self.multimodal_cache],
+            states,
+            [True],
+        )
+
+        self.assertEqual(dones, [0])
+        self.assertEqual(valid_actions, [0])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(next_obs[0]["name"], "parse_error")
+        retry_text = next_obs[0]["content"][0]["text"]
+        self.assertIn('"selected_window_ids":["w0002"]', retry_text)
+        self.assertNotIn('"category":"assault"', retry_text)
+        self.assertNotIn('"selected_window_ids":["w0001"]', retry_text)
+
     def test_execute_predictions_reraises_internal_tool_failures_instead_of_masking_them_as_parse_errors(self):
         with patch("saver_agent.environment.execute_tool_call", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):

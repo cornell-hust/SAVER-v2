@@ -43,12 +43,43 @@ def _finalize_retry_prompt(multimodal_cache: Dict[str, Any] | None = None) -> st
     )
 
 
+def _verify_retry_prompt(state: SaverEnvironmentState | None = None) -> str:
+    evidence_window_ids = [
+        str(entry.get("window_id")).strip()
+        for entry in (state.evidence_ledger if state is not None else [])
+        if str(entry.get("window_id") or "").strip()
+    ]
+    selected_window_ids = evidence_window_ids[:1] or ["w0001"]
+    example_arguments = {
+        "verification_mode": "final_check",
+        "selected_window_ids": selected_window_ids,
+        "verification_decision": "insufficient",
+        "recommended_action": "continue_search",
+        "sufficiency_score": 0.2,
+        "necessity_score": 0.1,
+        "alertability_score": 0.0,
+        "counterfactual_faithfulness": 0.3,
+    }
+    return (
+        "The previous verify_hypothesis call was invalid. Retry immediately with exactly one "
+        f'<tool_call>{{"name":"verify_hypothesis","arguments":{json.dumps(example_arguments, ensure_ascii=False, separators=(",", ":"))}}}</tool_call>. '
+        "selected_window_ids must reference currently available evidence windows. "
+        "Do not output <answer> yet. Do not describe the intended tool call in plain English."
+    )
+
+
 def invalid_tool_call_message(
     *,
     tool_name: str | None = None,
     multimodal_cache: Dict[str, Any] | None = None,
+    state: SaverEnvironmentState | None = None,
 ) -> Dict[str, Any]:
-    prompt_text = _finalize_retry_prompt(multimodal_cache) if tool_name == "finalize_case" else INVALID_TOOL_CALL_PROMPT
+    if tool_name == "finalize_case":
+        prompt_text = _finalize_retry_prompt(multimodal_cache)
+    elif tool_name == "verify_hypothesis":
+        prompt_text = _verify_retry_prompt(state)
+    else:
+        prompt_text = INVALID_TOOL_CALL_PROMPT
     return {
         "role": "tool",
         "name": "parse_error",
@@ -262,6 +293,7 @@ class SaverVideoInteraction:
                         invalid_tool_call_message(
                             tool_name=content["function"]["name"],
                             multimodal_cache=multimodal_cache,
+                            state=state,
                         )
                     )
                     dones.append(0)

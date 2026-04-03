@@ -151,6 +151,32 @@ class SaverAgentQwenPolicyTests(unittest.TestCase):
 
         self.assertIsInstance(prepared[0]["content"][1]["image"], Image.Image)
 
+    def test_prepare_messages_resizes_images_and_video_frames_for_rollout_budgets(self):
+        policy = QwenGenerationPolicy(
+            model=_FakeModel(),
+            processor=_FakeProcessor(),
+            max_image_side=64,
+            max_image_pixels=1600,
+        )
+        messages = [
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "image", "image": torch.zeros(3, 80, 80)},
+                    {"type": "video", "video": [torch.zeros(3, 80, 80), torch.ones(3, 80, 80)]},
+                ],
+            }
+        ]
+
+        prepared = policy.prepare_messages(messages)
+
+        image_item = prepared[0]["content"][0]["image"]
+        video_frames = prepared[0]["content"][1]["video"]
+        self.assertIsInstance(image_item, Image.Image)
+        self.assertEqual(image_item.size, (40, 40))
+        self.assertTrue(all(isinstance(frame, Image.Image) for frame in video_frames))
+        self.assertEqual([frame.size for frame in video_frames], [(40, 40), (40, 40)])
+
     def test_prepare_messages_respects_max_total_images_budget(self):
         policy = QwenGenerationPolicy(
             model=_FakeModel(),

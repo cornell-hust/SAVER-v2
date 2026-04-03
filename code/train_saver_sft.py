@@ -20,6 +20,7 @@ from saver_agent.config import (
 from saver_agent.dataset import SaverAgentDataset
 from saver_agent.evaluation import RolloutEvaluationConfig
 from saver_agent.experiment_logging import resolve_experiment_log_dir, utc_timestamp, write_json
+from saver_agent.prepared_metadata import ensure_prepared_sft_metadata, write_prepared_sft_metadata
 from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH
 from saver_agent.runtime import distributed_runtime_from_env, runtime_log, should_log_progress
@@ -55,9 +56,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data/--prepared-data, e.g. train or train,val.")
     parser.add_argument("--output-dir", default="", help="Training output directory.")
     parser.add_argument("--log-dir", default="", help="Optional directory for SFT logs. Defaults to <output-dir>/logs.")
+    parser.add_argument(
+        "--rollout-eval-output-dir",
+        default="",
+        help="Optional directory for epoch-end rollout eval outputs. Defaults to <output-dir>.",
+    )
     parser.add_argument("--resume-from-checkpoint", default="", help="Optional Trainer/model checkpoint used to resume SFT or replay a missing epoch-end rollout eval.")
     parser.add_argument("--resume-rollout-eval-only", action="store_true", help="Only replay the missing epoch-end rollout eval for --resume-from-checkpoint, then exit.")
-    parser.add_argument("--inline-rollout-eval", action="store_true", help="Run epoch-end rollout eval inline before the next epoch instead of deferring it to an external recovery process.")
+    parser.set_defaults(inline_rollout_eval=True)
+    parser.add_argument(
+        "--inline-rollout-eval",
+        dest="inline_rollout_eval",
+        action="store_true",
+        help="Run epoch-end rollout eval inline before the next epoch. This is the default behavior.",
+    )
+    parser.add_argument(
+        "--defer-rollout-eval",
+        dest="inline_rollout_eval",
+        action="store_false",
+        help="Defer epoch-end rollout eval to the external recovery path instead of running it immediately after each epoch.",
+    )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Local Qwen model path.")
     parser.add_argument("--proposal-model-path", default="", help="Optional local SigLIP/CLIP path for query-conditioned proposal during SFT example preparation.")
     parser.add_argument("--proposal-torch-dtype", default="auto", help="Torch dtype for the proposal encoder used during SFT example preparation.")
@@ -158,7 +176,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-data-root", default="", help="Root path used to resolve relative video paths for epoch-end rollout eval.")
     parser.add_argument("--eval-include-splits", default="", help="Optional comma-separated split whitelist for --eval-data.")
     parser.add_argument("--eval-max-records", type=int, default=0, help="Optional cap on how many eval records to use per epoch.")
-    parser.add_argument("--eval-rollout-max-turns", type=int, default=12, help="Maximum rollout turns for epoch-end eval.")
+    parser.add_argument("--eval-rollout-max-turns", type=int, default=14, help="Maximum rollout turns for epoch-end eval.")
     parser.add_argument(
         "--eval-max-new-tokens-per-turn",
         type=int,
@@ -299,6 +317,8 @@ def _build_rollout_eval_config(
         rollout_max_turns=args.eval_rollout_max_turns,
         policy_max_new_tokens=args.eval_max_new_tokens_per_turn,
         max_total_images=_resolve_eval_max_total_images(args),
+        max_image_side=args.max_image_side,
+        max_image_pixels=args.max_image_pixels,
         verifier_backend=args.eval_verifier_backend,
         verifier_model_path=args.eval_verifier_model_path or args.model_path,
         proposal_model_path=args.eval_proposal_model_path or args.proposal_model_path,
@@ -593,6 +613,7 @@ def main() -> None:
         output_dir=args.output_dir,
         fallback_paths=[args.prepare_output, args.teacher_judge_output, args.dry_run_json],
     )
+    rollout_eval_output_dir = str(args.rollout_eval_output_dir or "").strip() or str(args.output_dir or "").strip()
     if runtime.is_main_process and log_dir is not None:
         write_json(
             log_dir / "train_saver_sft_run_config.json",
@@ -604,6 +625,7 @@ def main() -> None:
                 "include_splits": parse_include_splits(args.include_splits) or [],
                 "output_dir": args.output_dir,
                 "log_dir": str(log_dir),
+                "rollout_eval_output_dir": str(rollout_eval_output_dir),
                 "resume_from_checkpoint": args.resume_from_checkpoint,
                 "resume_rollout_eval_only": bool(args.resume_rollout_eval_only),
                 "inline_rollout_eval": bool(args.inline_rollout_eval),
@@ -636,7 +658,7 @@ def main() -> None:
         if rollout_eval_config is None:
             raise ValueError("--resume-rollout-eval-only requires --eval-data so the missing rollout eval can be replayed.")
         epoch_index = _resolve_resume_epoch_index(args.resume_from_checkpoint)
-        result = run_rollout_eval_from_checkpoint(
+        recovery_kwargs = dict(
             checkpoint_path=args.resume_from_checkpoint,
             output_dir=args.output_dir,
             rollout_eval_config=rollout_eval_config,
@@ -645,6 +667,11 @@ def main() -> None:
             torch_dtype=args.torch_dtype,
             attn_implementation=args.attn_implementation or None,
             runtime=runtime,
+        )
+        if str(args.rollout_eval_output_dir or "").strip():
+            recovery_kwargs["rollout_eval_output_dir"] = rollout_eval_output_dir
+        result = run_rollout_eval_from_checkpoint(
+            **recovery_kwargs,
         )
         final_summary = {
             "resume_from_checkpoint": args.resume_from_checkpoint,
@@ -666,6 +693,11 @@ def main() -> None:
         )
         proposal_runtime = _build_proposal_runtime(args, runtime=runtime)
     if args.prepared_data:
+        ensure_prepared_sft_metadata(
+            args.prepared_data,
+            config=config,
+            require_config_match=True,
+        )
         runtime_log(f"loading prepared SFT examples from {args.prepared_data}", runtime=runtime, main_process_only=True)
         examples = _load_jsonl(
             args.prepared_data,
@@ -706,8 +738,14 @@ def main() -> None:
     validation = _run_validation(args, examples)
     if args.prepare_output and runtime.is_main_process:
         _write_jsonl(args.prepare_output, examples)
+        write_prepared_sft_metadata(args.prepare_output, config=config)
     if args.teacher_judge_output and runtime.is_main_process:
         _write_jsonl(args.teacher_judge_output, examples)
+        write_prepared_sft_metadata(
+            args.teacher_judge_output,
+            config=config,
+            extra_fields={"teacher_annotated": True},
+        )
     if args.dry_run_json:
         if runtime.is_main_process:
             output_path = Path(args.dry_run_json)
@@ -736,6 +774,8 @@ def main() -> None:
         examples,
         model_path=args.model_path,
         output_dir=args.output_dir,
+        log_dir=str(log_dir) if log_dir is not None else "",
+        rollout_eval_output_dir=rollout_eval_output_dir,
         resume_from_checkpoint=args.resume_from_checkpoint,
         tensor_cache_dir=tensor_cache_dir,
         torch_dtype=args.torch_dtype,

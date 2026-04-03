@@ -230,6 +230,67 @@ class SaverAgentMetricsTests(unittest.TestCase):
 
         self.assertAlmostEqual(summary["protocol_compliance_rate"], 0.0, places=6)
 
+    def test_protocol_compliance_accepts_finalize_only_terminal_records(self):
+        data_records = [
+            {
+                "video_id": "case",
+                "video_meta": {"fps": 1.0, "duration_sec": 4.0, "total_frames": 4},
+                "structured_target": {
+                    "existence": "anomaly",
+                    "category": "assault",
+                    "severity": 3,
+                    "hard_normal": False,
+                    "anomaly_interval_sec": [0.5, 2.5],
+                    "precursor_interval_sec": [0.0, 0.5],
+                    "earliest_alert_sec": 0.5,
+                    "counterfactual_type": "remove_actor_interaction",
+                },
+                "tool_io": {"oracle_windows_sec": [{"window": [0.5, 2.5]}]},
+            }
+        ]
+        scored_records = [
+            {
+                "video_id": "case",
+                "num_turns": 2,
+                "turns": [
+                    {"step_index": 1, "tool_name": "verify_hypothesis", "valid_action": True},
+                    {"step_index": 2, "tool_name": "finalize_case", "valid_action": True},
+                ],
+                "final_answer": None,
+                "state": {
+                    "finalized_case": {
+                        "existence": "anomaly",
+                        "category": "assault",
+                        "severity": 3,
+                        "anomaly_interval_sec": [0.5, 2.5],
+                        "precursor_interval_sec": [0.0, 0.5],
+                        "counterfactual_type": "remove_actor_interaction",
+                    },
+                    "last_claim": {"existence": "anomaly", "category": "assault"},
+                    "visited_windows": [],
+                    "evidence_ledger": [{"window_id": "w0001", "start_sec": 0.5, "end_sec": 2.5}],
+                    "alerts": [],
+                    "active_evidence_window_ids": ["w0001"],
+                },
+                "offline_verifier": {
+                    "primary_status": "complete",
+                    "alert_status": "justified",
+                    "verified_window_ids": ["w0001"],
+                    "view_scores": {"full": {"exist_support": 0.9}, "keep": {"exist_support": 0.85}},
+                },
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "data.jsonl"
+            with data_path.open("w", encoding="utf-8") as f:
+                for record in data_records:
+                    f.write(json.dumps(record) + "\n")
+            reference_data = ReferenceDataProvider(data_path=data_path)
+            summary = summarize_saver_metrics(scored_records, reference_data=reference_data)
+
+        self.assertAlmostEqual(summary["protocol_compliance_rate"], 1.0, places=6)
+
     def test_tool_call_validity_rate_counts_invalid_attempts_not_just_formal_turns(self):
         data_records = [
             {

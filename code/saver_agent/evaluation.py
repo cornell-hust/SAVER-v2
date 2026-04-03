@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -41,9 +42,11 @@ class RolloutEvaluationConfig:
     include_splits: Optional[Sequence[str] | str] = None
     max_records: int = 0
     inline_rollout_eval: bool = False
-    rollout_max_turns: int = 12
+    rollout_max_turns: int = 14
     policy_max_new_tokens: int = 256
     max_total_images: int = 0
+    max_image_side: int = 0
+    max_image_pixels: int = 0
     proposal_model_path: str | Path = ""
     proposal_torch_dtype: str = "auto"
     proposal_device: str = ""
@@ -202,6 +205,15 @@ def _clear_stale_scored_shards(scored_shard_dir: Path) -> int:
     return removed
 
 
+def _clear_rollout_eval_sync_files(*, eval_root: Path) -> int:
+    removed = 0
+    for path in (eval_root / "metrics.json", eval_root / "failure.json"):
+        if path.exists():
+            path.unlink()
+            removed += 1
+    return removed
+
+
 def _expected_scored_shard_paths(
     *,
     scored_shard_dir: Path,
@@ -211,6 +223,60 @@ def _expected_scored_shard_paths(
         scored_shard_dir / f"part.rank{rank:02d}-of-{runtime.world_size:02d}.jsonl"
         for rank in range(int(runtime.world_size))
     ]
+
+
+def _write_rollout_eval_failure_marker(*, failure_path: Path, exc: Exception) -> None:
+    failure_path.parent.mkdir(parents=True, exist_ok=True)
+    failure_payload = {
+        "error_type": exc.__class__.__name__,
+        "error": str(exc),
+    }
+    failure_path.write_text(json.dumps(failure_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _wait_for_current_scored_records(
+    *,
+    scored_shard_dir: Path,
+    runtime: DistributedRuntime,
+    timeout_sec: float = 1800.0,
+    poll_interval_sec: float = 1.0,
+) -> list[Dict[str, Any]]:
+    deadline = time.time() + max(1.0, float(timeout_sec))
+    last_log_time = 0.0
+    shard_status: dict[str, str] = {}
+    expected_paths = _expected_scored_shard_paths(scored_shard_dir=scored_shard_dir, runtime=runtime)
+    while time.time() < deadline:
+        shard_status.clear()
+        merged_records: list[Dict[str, Any]] = []
+        all_ready = True
+        for shard_path in expected_paths:
+            if not shard_path.exists():
+                all_ready = False
+                shard_status[str(shard_path)] = "missing"
+                continue
+            try:
+                shard_records, _ = load_rollout_records(shard_path)
+            except Exception as exc:
+                all_ready = False
+                shard_status[str(shard_path)] = f"unreadable: {exc}"
+                continue
+            merged_records.extend(shard_records)
+            shard_status[str(shard_path)] = f"ready:{len(shard_records)}"
+        if all_ready:
+            return merged_records
+        now = time.time()
+        if now - last_log_time >= 30.0:
+            runtime_log(
+                "waiting for rollout-eval scored shards: " + json.dumps(shard_status, ensure_ascii=False),
+                runtime=runtime,
+                main_process_only=True,
+            )
+            last_log_time = now
+        time.sleep(max(0.05, float(poll_interval_sec)))
+    raise TimeoutError(
+        "Timed out while waiting for rollout-eval scored shard outputs: "
+        + json.dumps(shard_status, ensure_ascii=False)
+    )
 
 
 def _load_current_scored_records(
@@ -230,6 +296,38 @@ def _load_current_scored_records(
         shard_records, _ = load_rollout_records(shard_path)
         merged_records.extend(shard_records)
     return merged_records
+
+
+def _wait_for_rollout_eval_completion(
+    *,
+    metrics_path: Path,
+    failure_path: Path,
+    runtime: DistributedRuntime,
+    timeout_sec: float = 1800.0,
+    poll_interval_sec: float = 1.0,
+) -> None:
+    deadline = time.time() + max(1.0, float(timeout_sec))
+    last_log_time = 0.0
+    while time.time() < deadline:
+        if metrics_path.exists():
+            return
+        if failure_path.exists():
+            try:
+                payload = json.loads(failure_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {"error": failure_path.read_text(encoding="utf-8")}
+            raise RuntimeError(
+                "rollout eval failed on the main process: " + json.dumps(payload, ensure_ascii=False)
+            )
+        now = time.time()
+        if now - last_log_time >= 30.0:
+            runtime_log(
+                f"waiting for rollout-eval completion marker at {metrics_path}",
+                runtime=runtime,
+            )
+            last_log_time = now
+        time.sleep(max(0.05, float(poll_interval_sec)))
+    raise TimeoutError(f"Timed out while waiting for rollout-eval completion marker at {metrics_path}")
 
 
 def run_rollout_evaluation(
@@ -252,7 +350,9 @@ def run_rollout_evaluation(
         (
             "rollout eval policy budget: "
             f"max_new_tokens_per_turn={int(eval_config.policy_max_new_tokens)} "
-            f"max_total_images={int(eval_config.max_total_images) if int(eval_config.max_total_images) > 0 else 'all'}"
+            f"max_total_images={int(eval_config.max_total_images) if int(eval_config.max_total_images) > 0 else 'all'} "
+            f"max_image_side={int(eval_config.max_image_side) or 'off'} "
+            f"max_image_pixels={int(eval_config.max_image_pixels) or 'off'}"
         ),
         runtime=runtime,
         main_process_only=True,
@@ -275,13 +375,22 @@ def run_rollout_evaluation(
     local_indices = shard_sequence(all_indices, num_shards=shard_spec.num_shards, shard_index=shard_spec.shard_index)
 
     eval_root = Path(output_dir) / "rollout_eval" / f"epoch_{int(epoch_index):03d}"
+    metrics_path = eval_root / "metrics.json"
+    failure_path = eval_root / "failure.json"
     scored_shard_dir = eval_root / "scored_shards"
     scored_shard_dir.mkdir(parents=True, exist_ok=True)
     if runtime.is_main_process:
         removed_shards = _clear_stale_scored_shards(scored_shard_dir)
+        removed_sync_files = _clear_rollout_eval_sync_files(eval_root=eval_root)
         if removed_shards > 0:
             runtime_log(
                 f"cleared {removed_shards} stale rollout-eval scored shard files from {scored_shard_dir}",
+                runtime=runtime,
+                main_process_only=True,
+            )
+        if removed_sync_files > 0:
+            runtime_log(
+                f"cleared {removed_sync_files} stale rollout-eval sync files from {eval_root}",
                 runtime=runtime,
                 main_process_only=True,
             )
@@ -347,28 +456,35 @@ def run_rollout_evaluation(
         )
         local_scored_path = scored_shard_dir / f"part.rank{runtime.rank:02d}-of-{runtime.world_size:02d}.jsonl"
         save_rollout_records(local_scored_records, local_scored_path, metadata={"input_kind": "jsonl"})
-        distributed_barrier(runtime)
 
         if runtime.is_main_process:
-            merged_scored_records = _load_current_scored_records(
-                scored_shard_dir=scored_shard_dir,
+            try:
+                merged_scored_records = _wait_for_current_scored_records(
+                    scored_shard_dir=scored_shard_dir,
+                    runtime=runtime,
+                )
+                summary = summarize_saver_metrics(
+                    merged_scored_records,
+                    reference_data=reference_data,
+                    include_diagnostic_summary=bool(eval_config.attach_reference_diagnostics),
+                )
+                summary["epoch_index"] = int(epoch_index)
+                summary["num_scored_records"] = len(merged_scored_records)
+                metrics_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+                runtime_log(
+                    f"epoch {int(epoch_index)} rollout eval metrics saved to {metrics_path}",
+                    runtime=runtime,
+                    main_process_only=True,
+                )
+            except Exception as exc:
+                _write_rollout_eval_failure_marker(failure_path=failure_path, exc=exc)
+                raise
+        elif runtime.is_distributed:
+            _wait_for_rollout_eval_completion(
+                metrics_path=metrics_path,
+                failure_path=failure_path,
                 runtime=runtime,
             )
-            summary = summarize_saver_metrics(
-                merged_scored_records,
-                reference_data=reference_data,
-                include_diagnostic_summary=bool(eval_config.attach_reference_diagnostics),
-            )
-            summary["epoch_index"] = int(epoch_index)
-            summary["num_scored_records"] = len(merged_scored_records)
-            metrics_path = eval_root / "metrics.json"
-            metrics_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-            runtime_log(
-                f"epoch {int(epoch_index)} rollout eval metrics saved to {metrics_path}",
-                runtime=runtime,
-                main_process_only=True,
-            )
-        distributed_barrier(runtime)
         return summary
     finally:
         proposal_runtime = None

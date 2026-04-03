@@ -1,4 +1,5 @@
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -128,13 +129,105 @@ class ExperimentNameScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
         self.assertIn(str(ROOT / "ckpt" / "exp1"), result.stdout)
 
+    def test_common_experiment_exposes_stage_specific_layout_defaults(self):
+        helper = ROOT / "scripts" / "common_experiment.sh"
+        command = textwrap.dedent(
+            f"""\
+            source "{helper}"
+            EXP_NAME="exp1"
+            PROMPT_EXP_NAME=0
+            configure_experiment_layout "{ROOT}" "/tmp/exp_root" "/tmp/exp_root/data_utils"
+            printf 'SFT=%s\\n' "$DEFAULT_SFT_CHECKPOINT_DIR"
+            printf 'RL=%s\\n' "$DEFAULT_RL_CHECKPOINT_DIR"
+            printf 'ROLLOUT=%s\\n' "$DEFAULT_ROLLOUT_ROOT"
+            printf 'SFT_EVAL=%s\\n' "$DEFAULT_SFT_EVAL_DIR"
+            printf 'PIPELINE_LOG=%s\\n' "$DEFAULT_PIPELINE_LOG_DIR"
+            """
+        )
+        result = subprocess.run(
+            ["bash", "-lc", command],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
+        self.assertIn("SFT=" + str(ROOT / "ckpt" / "exp1" / "checkpoints" / "sft"), result.stdout)
+        self.assertIn("RL=" + str(ROOT / "ckpt" / "exp1" / "checkpoints" / "rl"), result.stdout)
+        self.assertIn("ROLLOUT=" + str(ROOT / "ckpt" / "exp1" / "eval" / "batch_rollout"), result.stdout)
+        self.assertIn("SFT_EVAL=" + str(ROOT / "ckpt" / "exp1" / "eval" / "sft_epoch_end"), result.stdout)
+        self.assertIn("PIPELINE_LOG=" + str(ROOT / "ckpt" / "exp1" / "logs" / "pipeline"), result.stdout)
+
+    def test_configure_script_logging_prefixes_terminal_lines_with_timestamps(self):
+        helper = ROOT / "scripts" / "common_experiment.sh"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir) / "logs"
+            command = textwrap.dedent(
+                f"""\
+                source "{helper}"
+                DEFAULT_LOG_DIR="{log_dir}"
+                SCRIPT_LOGGING_ENABLED=1
+                configure_script_logging "timestamp_test"
+                echo "hello timestamp"
+                """
+            )
+            env = os.environ.copy()
+            env["PROMPT_EXP_NAME"] = "0"
+            result = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
+            stdout_lines = [line for line in result.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(stdout_lines), 2, msg=result.stdout)
+            self.assertRegex(stdout_lines[0], r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[main\] script log: .+timestamp_test\.\d{8}_\d{6}\.log$")
+            self.assertRegex(stdout_lines[1], r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] hello timestamp$")
+
+    def test_configure_script_logging_does_not_double_prefix_existing_timestamped_lines(self):
+        helper = ROOT / "scripts" / "common_experiment.sh"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir) / "logs"
+            command = textwrap.dedent(
+                f"""\
+                source "{helper}"
+                DEFAULT_LOG_DIR="{log_dir}"
+                SCRIPT_LOGGING_ENABLED=1
+                configure_script_logging "timestamp_passthrough_test"
+                echo "[2026-04-03 09:19:58] [main] rollout progress: 115/240 dataset_index=114 video_id=Vandalism_12"
+                """
+            )
+            env = os.environ.copy()
+            env["PROMPT_EXP_NAME"] = "0"
+            result = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
+            stdout_lines = [line for line in result.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(stdout_lines), 2, msg=result.stdout)
+            self.assertEqual(
+                stdout_lines[1],
+                "[2026-04-03 09:19:58] [main] rollout progress: 115/240 dataset_index=114 video_id=Vandalism_12",
+            )
+
     def test_sft_script_uses_exp_name_for_prepared_data_and_output_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             data_utils_dir = base / "data_utils"
             run_base = base / "runs" / "exp1"
-            prepared_path = data_utils_dir / "msad_saver_agent_train.prepared_sft.jsonl"
-            eval_path = data_utils_dir / "msad_saver_oracle_sft.jsonl"
+            prepared_path = data_utils_dir / "msad_saver_sft_train.jsonl"
+            eval_path = data_utils_dir / "msad_saver_runtime_test.jsonl"
             model_dir = base / "models" / "qwen3-vl-8b-Instruct"
             fake_bin = base / "fake_bin"
             fake_bin.mkdir(parents=True, exist_ok=True)
@@ -159,14 +252,16 @@ class ExperimentNameScriptTests(unittest.TestCase):
             self.assertIn(f"--eval-data {eval_path}", log_text)
             self.assertIn("--eval-include-splits test", log_text)
             self.assertIn("--inline-rollout-eval", log_text)
-            self.assertIn(str(run_base / "checkpoints" / "saver_sft_qwen3vl_8b_eval_ddp"), log_text)
+            self.assertIn(str(run_base / "checkpoints" / "sft" / "saver_sft_qwen3vl_8b_eval_ddp"), log_text)
+            self.assertIn(str(run_base / "logs" / "sft"), log_text)
+            self.assertIn(str(run_base / "eval" / "sft_epoch_end"), log_text)
 
     def test_rollout_script_uses_exp_name_for_model_and_rollout_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             data_utils_dir = base / "data_utils"
             run_base = base / "runs" / "exp1"
-            data_path = data_utils_dir / "msad_saver_oracle_sft.jsonl"
+            data_path = data_utils_dir / "msad_saver_runtime_test.jsonl"
             model_dir = base / "models" / "qwen3-vl-8b-Instruct"
             fake_bin = base / "fake_bin"
             fake_bin.mkdir(parents=True, exist_ok=True)
@@ -188,17 +283,18 @@ class ExperimentNameScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
             self.assertIn(f"--data {data_path}", log_text)
             self.assertIn("--include-splits test", log_text)
-            self.assertIn(str(run_base / "checkpoints" / "saver_sft_qwen3vl_8b_eval_ddp"), log_text)
-            self.assertIn(str(run_base / "rollouts" / "sft_rollout_eval" / "rollouts.raw.jsonl"), log_text)
-            self.assertIn(str(run_base / "rollouts" / "sft_rollout_eval" / "summary.json"), log_text)
+            self.assertIn(str(run_base / "checkpoints" / "sft" / "saver_sft_qwen3vl_8b_eval_ddp"), log_text)
+            self.assertIn(str(run_base / "eval" / "batch_rollout" / "sft_rollout_eval" / "rollouts.raw.jsonl"), log_text)
+            self.assertIn(str(run_base / "eval" / "batch_rollout" / "sft_rollout_eval" / "summary.json"), log_text)
+            self.assertIn(str(run_base / "logs" / "rollout"), log_text)
 
     def test_rl_script_uses_exp_name_for_model_reference_and_output_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             data_utils_dir = base / "data_utils"
             run_base = base / "runs" / "exp1"
-            data_path = data_utils_dir / "msad_saver_agent_train.jsonl"
-            eval_path = data_utils_dir / "msad_saver_oracle_sft.jsonl"
+            data_path = data_utils_dir / "msad_saver_runtime_train.jsonl"
+            eval_path = data_utils_dir / "msad_saver_runtime_test.jsonl"
             model_dir = base / "models" / "qwen3-vl-8b-Instruct"
             fake_bin = base / "fake_bin"
             fake_bin.mkdir(parents=True, exist_ok=True)
@@ -218,8 +314,8 @@ class ExperimentNameScriptTests(unittest.TestCase):
             )
 
             log_text = log_path.read_text(encoding="utf-8")
-            expected_sft_dir = run_base / "checkpoints" / "saver_sft_qwen3vl_8b_eval_ddp"
-            expected_rl_dir = run_base / "checkpoints" / "saver_cea_grpo_v1"
+            expected_sft_dir = run_base / "checkpoints" / "sft" / "saver_sft_qwen3vl_8b_eval_ddp"
+            expected_rl_dir = run_base / "checkpoints" / "rl" / "saver_cea_grpo_v1"
             self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
             self.assertIn(f"--data {data_path}", log_text)
             self.assertIn(f"--eval-data {eval_path}", log_text)
@@ -227,14 +323,15 @@ class ExperimentNameScriptTests(unittest.TestCase):
             self.assertIn(f"--model-path {expected_sft_dir}", log_text)
             self.assertIn(f"--reference-model-path {expected_sft_dir}", log_text)
             self.assertIn(f"--output-dir {expected_rl_dir}", log_text)
+            self.assertIn(str(run_base / "logs" / "rl"), log_text)
 
     def test_sft_script_can_materialize_teacher_prepared_data_before_training(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             data_utils_dir = base / "data_utils"
             run_base = base / "runs" / "exp1"
-            prepared_path = data_utils_dir / "msad_saver_agent_train.prepared_sft.jsonl"
-            eval_path = data_utils_dir / "msad_saver_oracle_sft.jsonl"
+            prepared_path = data_utils_dir / "msad_saver_sft_train.jsonl"
+            eval_path = data_utils_dir / "msad_saver_runtime_test.jsonl"
             model_dir = base / "models" / "qwen3-vl-8b-Instruct"
             fake_bin = base / "fake_bin"
             fake_bin.mkdir(parents=True, exist_ok=True)
@@ -263,7 +360,7 @@ class ExperimentNameScriptTests(unittest.TestCase):
             log_text = log_path.read_text(encoding="utf-8")
             self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
             self.assertIn("annotate_teacher_judge_sft.py", log_text)
-            self.assertIn("msad_saver_agent_train.prepared_sft.teacher.jsonl", log_text)
+            self.assertIn("msad_saver_sft_train.teacher.jsonl", log_text)
             self.assertIn("--prepared-data", log_text)
 
     def test_sft_script_defaults_teacher_annotation_to_auto_mode_and_topk_views(self):
@@ -271,8 +368,8 @@ class ExperimentNameScriptTests(unittest.TestCase):
             base = Path(tmpdir)
             data_utils_dir = base / "data_utils"
             run_base = base / "runs" / "exp1"
-            prepared_path = data_utils_dir / "msad_saver_agent_train.prepared_sft.jsonl"
-            eval_path = data_utils_dir / "msad_saver_oracle_sft.jsonl"
+            prepared_path = data_utils_dir / "msad_saver_sft_train.jsonl"
+            eval_path = data_utils_dir / "msad_saver_runtime_test.jsonl"
             model_dir = base / "models" / "qwen3-vl-8b-Instruct"
             fake_bin = base / "fake_bin"
             fake_bin.mkdir(parents=True, exist_ok=True)
@@ -307,7 +404,7 @@ class ExperimentNameScriptTests(unittest.TestCase):
             base = Path(tmpdir)
             data_utils_dir = base / "data_utils"
             run_base = base / "runs" / "exp1"
-            data_path = data_utils_dir / "msad_saver_oracle_sft.jsonl"
+            data_path = data_utils_dir / "msad_saver_runtime_test.jsonl"
             model_dir = base / "models" / "qwen3-vl-8b-Instruct"
             fake_bin = base / "fake_bin"
             fake_bin.mkdir(parents=True, exist_ok=True)
@@ -345,8 +442,8 @@ class ExperimentNameScriptTests(unittest.TestCase):
             base = Path(tmpdir)
             data_utils_dir = base / "data_utils"
             run_base = base / "runs" / "exp1"
-            data_path = data_utils_dir / "msad_saver_agent_train.jsonl"
-            eval_path = data_utils_dir / "msad_saver_oracle_sft.jsonl"
+            data_path = data_utils_dir / "msad_saver_runtime_train.jsonl"
+            eval_path = data_utils_dir / "msad_saver_runtime_test.jsonl"
             model_dir = base / "models" / "qwen3-vl-8b-Instruct"
             fake_bin = base / "fake_bin"
             fake_bin.mkdir(parents=True, exist_ok=True)

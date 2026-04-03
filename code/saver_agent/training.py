@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import random
+import re
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -16,10 +17,11 @@ import torch.nn.functional as F
 
 from saver_agent.experiment_logging import append_jsonl, write_json
 from saver_agent.evaluation import RolloutEvaluationConfig, run_rollout_evaluation
-from saver_agent.qwen_policy import _to_pil_image
+from saver_agent.qwen_policy import _resize_image_for_budget, _to_pil_image
 from saver_agent.runtime import (
     distributed_barrier,
     distributed_runtime_from_env,
+    log_timestamp,
     resolve_inference_device_map,
     runtime_log,
     should_log_progress,
@@ -38,6 +40,7 @@ DEFAULT_LORA_TARGET_MODULES = [
 
 SFT_TENSOR_CACHE_SCHEMA_VERSION = "saver_agent.sft_tensor_cache.v1"
 SFT_EPOCH_RESUME_DIRNAME = "epoch_resume"
+_TIMESTAMP_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d+)?s\s*$")
 
 
 def _frame_cache_path(video_path: Path) -> Path:
@@ -492,30 +495,11 @@ def _resize_image_for_training(
     max_image_side: int = 0,
     max_image_pixels: int = 0,
 ) -> Any:
-    pil_image = _to_pil_image(image)
-    if not hasattr(pil_image, "size"):
-        return pil_image
-
-    width, height = pil_image.size
-    if width <= 0 or height <= 0:
-        return pil_image
-
-    scale = 1.0
-    if int(max_image_side) > 0:
-        current_max_side = max(width, height)
-        if current_max_side > int(max_image_side):
-            scale = min(scale, float(max_image_side) / float(current_max_side))
-    if int(max_image_pixels) > 0:
-        current_pixels = width * height
-        if current_pixels > int(max_image_pixels):
-            scale = min(scale, math.sqrt(float(max_image_pixels) / float(current_pixels)))
-
-    if scale >= 0.999:
-        return pil_image
-
-    resized_width = max(28, int(round(width * scale)))
-    resized_height = max(28, int(round(height * scale)))
-    return pil_image.resize((resized_width, resized_height))
+    return _resize_image_for_budget(
+        image,
+        max_image_side=max_image_side,
+        max_image_pixels=max_image_pixels,
+    )
 
 
 def _prune_stale_tool_images(
@@ -539,7 +523,15 @@ def _prune_stale_tool_images(
         if message_index in keep_indices:
             continue
         content = prepared[message_index].get("content", [])
-        prepared[message_index]["content"] = [item for item in content if item.get("type") != "image"]
+        removals: set[int] = set()
+        for content_index, item in enumerate(content):
+            item_type = item.get("type")
+            if item_type not in {"image", "video"}:
+                continue
+            removals.update(_paired_multimodal_removal_indices(content, content_index))
+        prepared[message_index]["content"] = [
+            item for idx, item in enumerate(content) if idx not in removals
+        ]
     return prepared
 
 
@@ -584,7 +576,10 @@ def _cap_total_images(
     image_positions.sort()
     removals_by_message: Dict[int, set[int]] = {}
     for message_index, content_index in image_positions[:overflow]:
-        removals_by_message.setdefault(message_index, set()).add(content_index)
+        content = list(messages[message_index].get("content", []))
+        removals_by_message.setdefault(message_index, set()).update(
+            _paired_multimodal_removal_indices(content, content_index)
+        )
 
     for message_index, removals in removals_by_message.items():
         content = list(messages[message_index].get("content", []))
@@ -748,7 +743,11 @@ def _drop_oldest_multimodal_item(messages: List[Dict[str, Any]]) -> bool:
         for content_index, item in enumerate(content):
             item_type = item.get("type")
             if item_type == "image" and ("image" in item or "image_ref" in item):
-                del content[content_index]
+                for removal_index in sorted(
+                    _paired_multimodal_removal_indices(content, content_index),
+                    reverse=True,
+                ):
+                    del content[removal_index]
                 if content:
                     messages[message_index]["content"] = content
                 elif message.get("role") not in {"system", "user"}:
@@ -757,7 +756,11 @@ def _drop_oldest_multimodal_item(messages: List[Dict[str, Any]]) -> bool:
                     messages[message_index]["content"] = []
                 return True
             if item_type == "video" and "video" in item:
-                del content[content_index]
+                for removal_index in sorted(
+                    _paired_multimodal_removal_indices(content, content_index),
+                    reverse=True,
+                ):
+                    del content[removal_index]
                 if content:
                     messages[message_index]["content"] = content
                 elif message.get("role") not in {"system", "user"}:
@@ -766,6 +769,20 @@ def _drop_oldest_multimodal_item(messages: List[Dict[str, Any]]) -> bool:
                     messages[message_index]["content"] = []
                 return True
     return False
+
+
+def _is_timestamp_text_item(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "text":
+        return False
+    return bool(_TIMESTAMP_ONLY_RE.match(str(item.get("text") or "").strip()))
+
+
+def _paired_multimodal_removal_indices(content: List[Dict[str, Any]], content_index: int) -> set[int]:
+    removals = {int(content_index)}
+    timestamp_index = int(content_index) - 1
+    if 0 <= timestamp_index < len(content) and _is_timestamp_text_item(content[timestamp_index]):
+        removals.add(timestamp_index)
+    return removals
 
 
 def _drop_oldest_history_message(messages: List[Dict[str, Any]]) -> bool:
@@ -2373,6 +2390,7 @@ def _build_rollout_eval_callback(
     *,
     processor: Any,
     rollout_eval_config: RolloutEvaluationConfig,
+    rollout_eval_output_dir: str | Path = "",
 ):
     try:
         from transformers import TrainerCallback
@@ -2383,6 +2401,7 @@ def _build_rollout_eval_callback(
         def __init__(self):
             self.processor = processor
             self.rollout_eval_config = rollout_eval_config
+            self.rollout_eval_output_dir = str(rollout_eval_output_dir or "").strip()
             self.runtime = distributed_runtime_from_env()
 
         def on_epoch_end(self, args, state, control, model=None, **kwargs):
@@ -2425,12 +2444,15 @@ def _build_rollout_eval_callback(
                         processor=self.processor,
                         max_new_tokens=int(self.rollout_eval_config.policy_max_new_tokens),
                         max_total_images=int(self.rollout_eval_config.max_total_images),
+                        max_image_side=int(self.rollout_eval_config.max_image_side),
+                        max_image_pixels=int(self.rollout_eval_config.max_image_pixels),
                         do_sample=False,
                     )
                     run_rollout_eval_with_policy(
                         policy,
                         rollout_eval_config=self.rollout_eval_config,
                         output_dir=args.output_dir,
+                        rollout_eval_output_dir=self.rollout_eval_output_dir,
                         epoch_index=epoch_index,
                         epoch_value=float(state.epoch or epoch_index),
                         runtime=self.runtime,
@@ -2462,15 +2484,24 @@ def sft_epoch_resume_dir(output_dir: str | Path, epoch_index: int) -> Path:
 def _write_rollout_eval_record(
     *,
     output_dir: str | Path,
+    eval_output_dir: str | Path = "",
     metrics: Dict[str, Any],
     epoch_value: float,
     runtime: Any,
 ) -> None:
     if not runtime.is_main_process:
         return
+    output_path = Path(output_dir)
+    explicit_eval_output_dir = str(eval_output_dir or "").strip()
+    write_to_legacy_output_dir = not explicit_eval_output_dir or Path(explicit_eval_output_dir) == output_path
+    record_output_dir = output_path if write_to_legacy_output_dir else Path(explicit_eval_output_dir)
     record = {"epoch": float(epoch_value), **metrics}
-    append_jsonl(Path(output_dir) / "rollout_eval_metrics.jsonl", record)
-    append_jsonl(Path(output_dir) / "logs" / "rollout_eval_metrics.jsonl", record)
+    append_jsonl(record_output_dir / "rollout_eval_metrics.jsonl", record)
+    summary_line = _format_rollout_eval_summary_line(epoch_value=float(epoch_value), metrics=metrics)
+    _append_rollout_eval_summary_line(record_output_dir / "rollout_eval_summary.log", summary_line)
+    if write_to_legacy_output_dir:
+        append_jsonl(output_path / "logs" / "rollout_eval_metrics.jsonl", record)
+        _append_rollout_eval_summary_line(output_path / "logs" / "rollout_eval_summary.log", summary_line)
     runtime_log(
         f"epoch {float(epoch_value):.2f} rollout eval: {json.dumps(metrics, ensure_ascii=False)}",
         runtime=runtime,
@@ -2478,26 +2509,66 @@ def _write_rollout_eval_record(
     )
 
 
+def _format_rollout_eval_summary_line(*, epoch_value: float, metrics: Dict[str, Any]) -> str:
+    ordered_keys = (
+        "num_records",
+        "existence_ap",
+        "existence_accuracy",
+        "category_macro_f1",
+        "temporal_miou",
+        "precursor_miou",
+        "alert_utility",
+        "evidence_f1_at_3",
+        "protocol_compliance_rate",
+        "mean_num_turns",
+    )
+    parts = [f"epoch={float(epoch_value):.2f}"]
+    for key in ordered_keys:
+        if key not in metrics:
+            continue
+        value = metrics.get(key)
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, int):
+            rendered = str(int(value))
+        elif isinstance(value, float):
+            rendered = f"{float(value):.4f}"
+        else:
+            rendered = str(value)
+        parts.append(f"{key}={rendered}")
+    return f"[{log_timestamp()}] {' '.join(parts)}"
+
+
+def _append_rollout_eval_summary_line(path: str | Path, line: str) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("a", encoding="utf-8") as f:
+        f.write(str(line).rstrip("\n") + "\n")
+
+
 def run_rollout_eval_with_policy(
     policy: Any,
     *,
     rollout_eval_config: RolloutEvaluationConfig,
     output_dir: str | Path,
+    rollout_eval_output_dir: str | Path = "",
     epoch_index: int,
     epoch_value: float | None = None,
     runtime: Any = None,
 ) -> Optional[Dict[str, Any]]:
     runtime = runtime or distributed_runtime_from_env()
+    resolved_rollout_eval_output_dir = str(rollout_eval_output_dir or "").strip() or str(output_dir)
     metrics = run_rollout_evaluation(
         policy,
         eval_config=rollout_eval_config,
-        output_dir=output_dir,
+        output_dir=resolved_rollout_eval_output_dir,
         epoch_index=int(epoch_index),
         runtime=runtime,
     )
     if metrics is not None:
         _write_rollout_eval_record(
             output_dir=output_dir,
+            eval_output_dir=resolved_rollout_eval_output_dir,
             metrics=metrics,
             epoch_value=float(epoch_value if epoch_value is not None else epoch_index),
             runtime=runtime,
@@ -2571,6 +2642,7 @@ def run_rollout_eval_from_checkpoint(
     *,
     checkpoint_path: str | Path,
     output_dir: str | Path,
+    rollout_eval_output_dir: str | Path = "",
     rollout_eval_config: RolloutEvaluationConfig,
     epoch_index: int,
     model_path: str | Path = "",
@@ -2606,6 +2678,8 @@ def run_rollout_eval_from_checkpoint(
         attn_implementation=attn_implementation,
         max_new_tokens=int(rollout_eval_config.policy_max_new_tokens),
         max_total_images=int(rollout_eval_config.max_total_images),
+        max_image_side=int(rollout_eval_config.max_image_side),
+        max_image_pixels=int(rollout_eval_config.max_image_pixels),
         do_sample=False,
     )
     try:
@@ -2613,6 +2687,7 @@ def run_rollout_eval_from_checkpoint(
             policy,
             rollout_eval_config=rollout_eval_config,
             output_dir=output_dir,
+            rollout_eval_output_dir=rollout_eval_output_dir,
             epoch_index=int(epoch_index),
             epoch_value=float(epoch_index),
             runtime=runtime,
@@ -2629,6 +2704,8 @@ def run_weighted_sft(
     *,
     model_path: str | Path,
     output_dir: str | Path,
+    log_dir: str | Path = "",
+    rollout_eval_output_dir: str | Path = "",
     resume_from_checkpoint: str | Path = "",
     tensor_cache_dir: str | Path = "",
     training_objective: str = "weighted_sft",
@@ -2673,13 +2750,18 @@ def run_weighted_sft(
     runtime = distributed_runtime_from_env()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = output_dir / "logs"
+    resolved_log_dir = Path(str(log_dir).strip()) if str(log_dir or "").strip() else output_dir / "logs"
+    resolved_rollout_eval_output_dir = (
+        Path(str(rollout_eval_output_dir).strip()) if str(rollout_eval_output_dir or "").strip() else output_dir
+    )
     if runtime.is_main_process:
         write_json(
-            log_dir / "run_weighted_sft_config.json",
+            resolved_log_dir / "run_weighted_sft_config.json",
             {
                 "model_path": str(model_path),
                 "output_dir": str(output_dir),
+                "log_dir": str(resolved_log_dir),
+                "rollout_eval_output_dir": str(resolved_rollout_eval_output_dir),
                 "resume_from_checkpoint": str(resume_from_checkpoint) if resume_from_checkpoint else "",
                 "tensor_cache_dir": str(tensor_cache_dir) if tensor_cache_dir else "",
                 "training_objective": str(training_objective),
@@ -2815,7 +2897,9 @@ def run_weighted_sft(
                 f"external_process_required={'no' if bool(rollout_eval_config.inline_rollout_eval) else 'yes'} "
                 f"main_eval=reference_free diagnostic_reference_eval={diagnostic_status} "
                 f"policy_max_new_tokens={int(rollout_eval_config.policy_max_new_tokens)} "
-                f"max_total_images={int(rollout_eval_config.max_total_images) if int(rollout_eval_config.max_total_images) > 0 else 'all'}"
+                f"max_total_images={int(rollout_eval_config.max_total_images) if int(rollout_eval_config.max_total_images) > 0 else 'all'} "
+                f"max_image_side={int(rollout_eval_config.max_image_side) or 'off'} "
+                f"max_image_pixels={int(rollout_eval_config.max_image_pixels) or 'off'}"
             ),
             runtime=runtime,
             main_process_only=True,
@@ -2824,6 +2908,7 @@ def run_weighted_sft(
             _build_rollout_eval_callback(
                 processor=processor,
                 rollout_eval_config=rollout_eval_config,
+                rollout_eval_output_dir=resolved_rollout_eval_output_dir,
             )
         )
     trainer = create_trainer(
@@ -2884,7 +2969,7 @@ def run_weighted_sft(
         trainer.save_model(str(output_dir))
         processor.save_pretrained(str(output_dir))
         write_json(
-            log_dir / "trainer_log_history.json",
+            resolved_log_dir / "trainer_log_history.json",
             {
                 "log_history": list(getattr(trainer.state, "log_history", []) or []),
                 "global_step": int(getattr(trainer.state, "global_step", 0) or 0),
@@ -2897,7 +2982,8 @@ def run_weighted_sft(
     result = {
         "num_examples": len(examples),
         "output_dir": str(output_dir),
-        "log_dir": str(log_dir),
+        "log_dir": str(resolved_log_dir),
+        "rollout_eval_output_dir": str(resolved_rollout_eval_output_dir),
         "tensor_cache_dir": str(tensor_cache_dir) if tensor_cache_dir else "",
         "train_loss": float(getattr(train_result, "training_loss", 0.0)),
         "training_objective": str(training_objective),
@@ -2907,5 +2993,5 @@ def run_weighted_sft(
         "reference_model_path": resolved_reference_model_path,
     }
     if trainer.is_world_process_zero():
-        write_json(log_dir / "run_weighted_sft_result.json", result)
+        write_json(resolved_log_dir / "run_weighted_sft_result.json", result)
     return result

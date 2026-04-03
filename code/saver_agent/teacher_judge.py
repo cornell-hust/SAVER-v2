@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import torch
 
 from saver_agent.environment import parse_actions_and_contents
+from saver_agent.proposal import summarize_query_package
 from saver_agent.qwen_policy import _build_generation_kwargs, _configure_qwen_processor, _to_pil_image
 from saver_agent.self_verification import PRIMARY_STATUS_TO_DECISION, SELF_VERIFICATION_DECISIONS, parse_self_verification_payload
 
@@ -451,7 +452,7 @@ def _collect_observation_windows(
                 "role": str(arguments.get("role") or "").strip(),
                 "start_sec": arguments.get("start_sec"),
                 "end_sec": arguments.get("end_sec"),
-                "query": str(arguments.get("query") or "").strip(),
+                "query": str(arguments.get("query") or summarize_query_package(arguments.get("query_package")) or "").strip(),
                 "images": image_entries,
                 "timestamps_sec": timestamps_sec,
                 "summary_text": "\n".join(message_texts).strip(),

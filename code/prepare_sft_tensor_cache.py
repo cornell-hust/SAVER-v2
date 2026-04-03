@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +12,7 @@ import torch
 
 from split_utils import parse_include_splits
 
+from saver_agent.prepared_metadata import ensure_prepared_sft_metadata
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH
 from saver_agent.runtime import distributed_runtime_from_env, runtime_log, should_log_progress
 from saver_agent.training import (
@@ -24,6 +27,9 @@ from saver_agent.training import (
     resolve_sft_tensor_cache_config_from_metadata,
     sft_tensor_cache_entry_path,
 )
+
+_PROCESS_POOL_EXECUTOR = ProcessPoolExecutor
+_WORKER_STATE: Dict[str, Any] = {}
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -59,7 +65,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-total-images",
         type=int,
-        default=0,
+        default=24,
         help="Optional hard cap on total images kept in each example. 0 keeps all images.",
     )
     parser.add_argument(
@@ -73,6 +79,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=128,
         help="How many frame_cache tensors/video readers to keep open while materializing image_ref payloads.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "How many worker processes to use inside each shard when materializing frames and building tensor cache "
+            "entries. 1 keeps legacy single-process behavior. 0 auto-scales from available CPUs and --num-shards."
+        ),
     )
     parser.add_argument(
         "--num-shards",
@@ -187,6 +202,101 @@ def _shard_file_suffix(*, num_shards: int, shard_index: int) -> str:
     return f".shard-{int(shard_index)}-of-{int(num_shards)}"
 
 
+def _resolve_num_workers(*, requested_num_workers: int, num_examples: int, num_shards: int) -> int:
+    normalized_requested = int(requested_num_workers)
+    if normalized_requested < 0:
+        raise ValueError(f"--num-workers must be >= 0, got {normalized_requested}")
+    if int(num_examples) <= 0:
+        return 1
+    if normalized_requested == 0:
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        auto_workers = max(1, cpu_count // max(1, int(num_shards)))
+        return max(1, min(int(num_examples), auto_workers))
+    return max(1, min(int(num_examples), normalized_requested))
+
+
+def _build_payload_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "max_image_side": args.max_image_side,
+        "max_image_pixels": args.max_image_pixels,
+        "keep_recent_tool_image_messages": args.keep_recent_tool_image_messages,
+        "max_total_images": args.max_total_images,
+        "max_seq_length": args.max_seq_length,
+        "keep_recent_text_messages": args.keep_recent_text_messages,
+    }
+
+
+def _safe_file_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except Exception:
+        return 0
+
+
+def _limit_worker_threads() -> None:
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    for env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[env_name] = "1"
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+
+def _initialize_worker(
+    model_path: str | Path,
+    frame_cache_max_cached_videos: int,
+    payload_kwargs: Dict[str, Any],
+) -> None:
+    _limit_worker_threads()
+    global _WORKER_STATE
+    _WORKER_STATE = {
+        "processor": _load_processor(model_path),
+        "resolver": _FrameReferenceResolver(max_cached_videos=int(frame_cache_max_cached_videos)),
+        "payload_kwargs": dict(payload_kwargs),
+    }
+
+
+def _build_cache_entry(
+    *,
+    example: Dict[str, Any],
+    entry_path: Path,
+    processor: Any,
+    resolver: _FrameReferenceResolver,
+    payload_kwargs: Dict[str, Any],
+) -> int:
+    entry_path.parent.mkdir(parents=True, exist_ok=True)
+    materialized_example = materialize_example_for_training(example, resolver=resolver)
+    payload = build_sft_tensor_cache_payload(
+        processor,
+        materialized_example,
+        **payload_kwargs,
+    )
+    torch.save(payload, entry_path)
+    return _safe_file_size(entry_path)
+
+
+def _build_cache_entry_worker(job: Dict[str, Any]) -> Dict[str, Any]:
+    if not _WORKER_STATE:
+        raise RuntimeError("Tensor cache worker state was not initialized.")
+    entry_path = Path(str(job["entry_path"]))
+    size_bytes = _build_cache_entry(
+        example=dict(job["example"]),
+        entry_path=entry_path,
+        processor=_WORKER_STATE["processor"],
+        resolver=_WORKER_STATE["resolver"],
+        payload_kwargs=dict(_WORKER_STATE["payload_kwargs"]),
+    )
+    return {
+        "cache_path": str(entry_path),
+        "size_bytes": int(size_bytes),
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     num_shards, shard_index = _normalize_shard_args(num_shards=args.num_shards, shard_index=args.shard_index)
@@ -203,6 +313,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         runtime=runtime,
         main_process_only=True,
     )
+    ensure_prepared_sft_metadata(prepared_data_path)
 
     examples = _load_prepared_examples(
         prepared_data_path,
@@ -215,6 +326,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         raise ValueError("No prepared SFT examples were loaded.")
     total_examples = len(examples)
     examples = _select_examples_for_shard(examples, num_shards=num_shards, shard_index=shard_index)
+    shard_examples = len(examples)
+    num_workers = _resolve_num_workers(
+        requested_num_workers=args.num_workers,
+        num_examples=shard_examples,
+        num_shards=num_shards,
+    )
 
     processor = _load_processor(args.model_path)
     processor_signature = build_processor_signature(processor)
@@ -248,38 +365,15 @@ def main(argv: Optional[List[str]] = None) -> None:
                 f"metadata_path={metadata_path} expected={json.dumps(expected_config, ensure_ascii=False, sort_keys=True)} "
                 f"actual={json.dumps(existing_config, ensure_ascii=False, sort_keys=True)}"
             )
-    resolver = _FrameReferenceResolver(max_cached_videos=args.frame_cache_max_cached_videos)
-
+    payload_kwargs = _build_payload_kwargs(args)
     manifest_rows: List[Dict[str, Any]] = []
+    work_items: List[Optional[Dict[str, Any]]] = []
     built_count = 0
     skipped_existing = 0
     total_bytes = 0
-    shard_examples = len(examples)
-    for idx, example in enumerate(examples, start=1):
+    for example in examples:
         cache_key = build_sft_tensor_cache_key(example)
         entry_path = sft_tensor_cache_entry_path(output_dir, cache_key)
-        entry_path.parent.mkdir(parents=True, exist_ok=True)
-        if entry_path.exists() and not args.overwrite_existing:
-            skipped_existing += 1
-        else:
-            materialized_example = materialize_example_for_training(example, resolver=resolver)
-            payload = build_sft_tensor_cache_payload(
-                processor,
-                materialized_example,
-                max_image_side=args.max_image_side,
-                max_image_pixels=args.max_image_pixels,
-                keep_recent_tool_image_messages=args.keep_recent_tool_image_messages,
-                max_total_images=args.max_total_images,
-                max_seq_length=args.max_seq_length,
-                keep_recent_text_messages=args.keep_recent_text_messages,
-            )
-            torch.save(payload, entry_path)
-            built_count += 1
-        try:
-            total_bytes += int(entry_path.stat().st_size)
-        except Exception:
-            pass
-
         manifest_rows.append(
             {
                 "cache_key": cache_key,
@@ -291,16 +385,86 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "tool_name": example.get("tool_name"),
             }
         )
-        if should_log_progress(idx, shard_examples, int(args.progress_every)):
-            runtime_log(
-                (
-                    "SFT tensor cache progress: "
-                    f"examples={idx}/{shard_examples} built={built_count} skipped_existing={skipped_existing} "
-                    f"shard={shard_index + 1}/{num_shards}"
-                ),
-                runtime=runtime,
-                main_process_only=True,
+        if entry_path.exists() and not args.overwrite_existing:
+            work_items.append(None)
+        else:
+            work_items.append(
+                {
+                    "example": example,
+                    "entry_path": str(entry_path),
+                }
             )
+
+    pending_jobs = [job for job in work_items if job is not None]
+    if num_workers <= 1:
+        resolver = _FrameReferenceResolver(max_cached_videos=args.frame_cache_max_cached_videos)
+        for idx, (example, job, manifest_row) in enumerate(zip(examples, work_items, manifest_rows), start=1):
+            entry_path = Path(str(manifest_row["cache_path"]))
+            if job is None:
+                skipped_existing += 1
+                total_bytes += _safe_file_size(entry_path)
+            else:
+                total_bytes += _build_cache_entry(
+                    example=example,
+                    entry_path=entry_path,
+                    processor=processor,
+                    resolver=resolver,
+                    payload_kwargs=payload_kwargs,
+                )
+                built_count += 1
+            if should_log_progress(idx, shard_examples, int(args.progress_every)):
+                runtime_log(
+                    (
+                        "SFT tensor cache progress: "
+                        f"examples={idx}/{shard_examples} built={built_count} skipped_existing={skipped_existing} "
+                        f"shard={shard_index + 1}/{num_shards}"
+                    ),
+                    runtime=runtime,
+                    main_process_only=True,
+                )
+    else:
+        if pending_jobs:
+            chunksize = max(1, len(pending_jobs) // max(1, num_workers * 4))
+            with _PROCESS_POOL_EXECUTOR(
+                max_workers=num_workers,
+                initializer=_initialize_worker,
+                initargs=(args.model_path, args.frame_cache_max_cached_videos, payload_kwargs),
+            ) as executor:
+                result_iter = iter(executor.map(_build_cache_entry_worker, pending_jobs, chunksize=chunksize))
+                for idx, (job, manifest_row) in enumerate(zip(work_items, manifest_rows), start=1):
+                    entry_path = Path(str(manifest_row["cache_path"]))
+                    if job is None:
+                        skipped_existing += 1
+                        total_bytes += _safe_file_size(entry_path)
+                    else:
+                        result = next(result_iter)
+                        total_bytes += int(result.get("size_bytes") or 0)
+                        built_count += 1
+                    if should_log_progress(idx, shard_examples, int(args.progress_every)):
+                        runtime_log(
+                            (
+                                "SFT tensor cache progress: "
+                                f"examples={idx}/{shard_examples} built={built_count} "
+                                f"skipped_existing={skipped_existing} shard={shard_index + 1}/{num_shards}"
+                            ),
+                            runtime=runtime,
+                            main_process_only=True,
+                        )
+        else:
+            for idx, manifest_row in enumerate(manifest_rows, start=1):
+                entry_path = Path(str(manifest_row["cache_path"]))
+                skipped_existing += 1
+                total_bytes += _safe_file_size(entry_path)
+                if should_log_progress(idx, shard_examples, int(args.progress_every)):
+                    runtime_log(
+                        (
+                            "SFT tensor cache progress: "
+                            f"examples={idx}/{shard_examples} built={built_count} skipped_existing={skipped_existing} "
+                            f"shard={shard_index + 1}/{num_shards}"
+                        ),
+                        runtime=runtime,
+                        main_process_only=True,
+                    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(metadata_path, metadata)
@@ -320,6 +484,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "total_bytes": int(total_bytes),
         "num_shards": int(num_shards),
         "shard_index": int(shard_index),
+        "num_workers": int(num_workers),
         "metadata_path": str(metadata_path),
         "manifest_path": str(manifest_path),
     }

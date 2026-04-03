@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Optional
 
 from split_utils import parse_include_splits
 
+from saver_agent.prepared_metadata import (
+    ensure_prepared_sft_metadata,
+    load_prepared_sft_metadata,
+    prepared_sft_metadata_path,
+)
 from saver_agent.runtime import (
     distributed_barrier,
     distributed_runtime_from_env,
@@ -17,12 +22,12 @@ from saver_agent.runtime import (
     resolve_inference_device_map,
     resolve_shard_spec,
     runtime_log,
-    shard_sequence,
     sharded_output_path,
 )
 from saver_agent.teacher_judge import (
     QwenTeacherJudge,
     annotate_teacher_judge_examples,
+    is_teacher_judge_candidate,
     reweight_teacher_judge_examples,
 )
 from saver_agent.training import _FrameReferenceResolver
@@ -201,11 +206,48 @@ def _write_jsonl(path: str | Path, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _resolve_teacher_judge_shard_indices(
+    rows: List[Dict[str, Any]],
+    *,
+    num_shards: int,
+) -> List[List[int]]:
+    if int(num_shards) < 1:
+        raise ValueError("num_shards must be at least 1.")
+    shard_indices_by_shard: List[List[int]] = [[] for _ in range(int(num_shards))]
+    verify_candidate_index = 0
+    for row_index, row in enumerate(rows):
+        if is_teacher_judge_candidate(row):
+            assigned_shard = verify_candidate_index % int(num_shards)
+            verify_candidate_index += 1
+        else:
+            assigned_shard = row_index % int(num_shards)
+        shard_indices_by_shard[int(assigned_shard)].append(int(row_index))
+    return shard_indices_by_shard
+
+
+def _expected_shard_indices(
+    *,
+    total_rows: int,
+    num_shards: int,
+    shard_index: int,
+    shard_indices_by_shard: Optional[List[List[int]]] = None,
+) -> List[int]:
+    if shard_indices_by_shard is not None:
+        if not 0 <= int(shard_index) < len(shard_indices_by_shard):
+            raise ValueError(
+                f"shard_index={shard_index} is outside the provided shard mapping range "
+                f"[0, {len(shard_indices_by_shard) - 1}]."
+            )
+        return list(shard_indices_by_shard[int(shard_index)])
+    return list(range(int(shard_index), int(total_rows), int(num_shards)))
+
+
 def _merge_sharded_outputs(
     output_path: str | Path,
     *,
     total_rows: int,
     num_shards: int,
+    shard_indices_by_shard: Optional[List[List[int]]] = None,
 ) -> List[Dict[str, Any]]:
     base_output_path = Path(output_path)
     if int(num_shards) <= 1:
@@ -214,7 +256,12 @@ def _merge_sharded_outputs(
     for shard_index in range(int(num_shards)):
         shard_output_path = sharded_output_path(base_output_path, num_shards=int(num_shards), shard_index=shard_index)
         shard_rows = _load_jsonl(shard_output_path)
-        expected_indices = list(range(shard_index, int(total_rows), int(num_shards)))
+        expected_indices = _expected_shard_indices(
+            total_rows=int(total_rows),
+            num_shards=int(num_shards),
+            shard_index=shard_index,
+            shard_indices_by_shard=shard_indices_by_shard,
+        )
         if len(shard_rows) != len(expected_indices):
             raise ValueError(
                 "Shard output row count does not match expected shard partition size. "
@@ -235,6 +282,7 @@ def _wait_for_sharded_outputs(
     *,
     total_rows: int,
     num_shards: int,
+    shard_indices_by_shard: Optional[List[List[int]]] = None,
     timeout_sec: float = 1800.0,
     poll_interval_sec: float = 1.0,
 ) -> None:
@@ -246,7 +294,12 @@ def _wait_for_sharded_outputs(
         shard_status.clear()
         for shard_index in range(int(num_shards)):
             shard_output_path = sharded_output_path(base_output_path, num_shards=int(num_shards), shard_index=shard_index)
-            expected_indices = list(range(shard_index, int(total_rows), int(num_shards)))
+            expected_indices = _expected_shard_indices(
+                total_rows=int(total_rows),
+                num_shards=int(num_shards),
+                shard_index=shard_index,
+                shard_indices_by_shard=shard_indices_by_shard,
+            )
             expected_count = len(expected_indices)
             if not shard_output_path.exists():
                 all_ready = False
@@ -285,12 +338,20 @@ def main(argv: Optional[List[str]] = None) -> None:
     dist_initialized = init_torch_distributed(runtime)
     shard_spec = resolve_shard_spec(num_shards=args.num_shards, shard_index=args.shard_index, runtime=runtime)
     output_path = sharded_output_path(args.output, num_shards=shard_spec.num_shards, shard_index=shard_spec.shard_index)
+    input_metadata = ensure_prepared_sft_metadata(args.input)
     rows = _load_jsonl(
         args.input,
         skip_invalid_lines=args.skip_invalid_jsonl_lines,
         include_splits=args.include_splits,
     )
-    local_rows = shard_sequence(rows, num_shards=shard_spec.num_shards, shard_index=shard_spec.shard_index)
+    shard_indices_by_shard = _resolve_teacher_judge_shard_indices(rows, num_shards=shard_spec.num_shards)
+    local_row_indices = _expected_shard_indices(
+        total_rows=len(rows),
+        num_shards=shard_spec.num_shards,
+        shard_index=shard_spec.shard_index,
+        shard_indices_by_shard=shard_indices_by_shard,
+    )
+    local_rows = [rows[row_index] for row_index in local_row_indices]
     effective_device_map = resolve_inference_device_map(args.device_map, runtime=runtime)
     runtime_log(
         (
@@ -329,6 +390,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         annotated_rows, reweight_summary = reweight_teacher_judge_examples(annotated_rows)
         _write_jsonl(output_path, annotated_rows)
         runtime_log(f"saved {len(annotated_rows)} teacher-annotated examples to {output_path}", runtime=runtime)
+        if not shard_spec.is_sharded:
+            metadata_path = prepared_sft_metadata_path(output_path)
+            metadata = dict(input_metadata)
+            metadata["teacher_annotated"] = True
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         merged_output_path: Optional[Path] = None
         if shard_spec.is_sharded and runtime.is_distributed and dist_initialized:
             if runtime.is_main_process:
@@ -336,16 +402,24 @@ def main(argv: Optional[List[str]] = None) -> None:
                     args.output,
                     total_rows=len(rows),
                     num_shards=shard_spec.num_shards,
+                    shard_indices_by_shard=shard_indices_by_shard,
                 )
                 merged_rows = _merge_sharded_outputs(
                     args.output,
                     total_rows=len(rows),
                     num_shards=shard_spec.num_shards,
+                    shard_indices_by_shard=shard_indices_by_shard,
                 )
                 merged_output_path = Path(args.output)
                 runtime_log(
                     f"merged {len(merged_rows)} sharded teacher-judge outputs into {merged_output_path}",
                     runtime=runtime,
+                )
+                merged_metadata = dict(load_prepared_sft_metadata(args.input))
+                merged_metadata["teacher_annotated"] = True
+                prepared_sft_metadata_path(merged_output_path).write_text(
+                    json.dumps(merged_metadata, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
                 )
     finally:
         progress_visualizer.close()

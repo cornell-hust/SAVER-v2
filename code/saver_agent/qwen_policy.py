@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -205,6 +206,38 @@ def _to_pil_image(image: Any) -> Any:
     return image
 
 
+def _resize_image_for_budget(
+    image: Any,
+    *,
+    max_image_side: int = 0,
+    max_image_pixels: int = 0,
+) -> Any:
+    pil_image = _to_pil_image(image)
+    if not hasattr(pil_image, "size"):
+        return pil_image
+
+    width, height = pil_image.size
+    if width <= 0 or height <= 0:
+        return pil_image
+
+    scale = 1.0
+    if int(max_image_side) > 0:
+        current_max_side = max(width, height)
+        if current_max_side > int(max_image_side):
+            scale = min(scale, float(max_image_side) / float(current_max_side))
+    if int(max_image_pixels) > 0:
+        current_pixels = width * height
+        if current_pixels > int(max_image_pixels):
+            scale = min(scale, math.sqrt(float(max_image_pixels) / float(current_pixels)))
+
+    if scale >= 0.999:
+        return pil_image
+
+    resized_width = max(28, int(round(width * scale)))
+    resized_height = max(28, int(round(height * scale)))
+    return pil_image.resize((resized_width, resized_height))
+
+
 def _is_image_item(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "image" and ("image" in item or "image_ref" in item)
 
@@ -265,6 +298,8 @@ class QwenGenerationPolicy:
         processor: Any,
         max_new_tokens: int = 512,
         max_total_images: int = 0,
+        max_image_side: int = 0,
+        max_image_pixels: int = 0,
         do_sample: bool = False,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -275,6 +310,8 @@ class QwenGenerationPolicy:
         self.processor = processor
         self.max_new_tokens = int(max_new_tokens)
         self.max_total_images = int(max_total_images)
+        self.max_image_side = int(max_image_side)
+        self.max_image_pixels = int(max_image_pixels)
         self.do_sample = bool(do_sample)
         self.temperature = temperature
         self.top_p = top_p
@@ -293,6 +330,8 @@ class QwenGenerationPolicy:
         processor: Any,
         max_new_tokens: int = 512,
         max_total_images: int = 0,
+        max_image_side: int = 0,
+        max_image_pixels: int = 0,
         do_sample: bool = False,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -304,6 +343,8 @@ class QwenGenerationPolicy:
             processor=processor,
             max_new_tokens=max_new_tokens,
             max_total_images=max_total_images,
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
             do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
@@ -321,6 +362,8 @@ class QwenGenerationPolicy:
         attn_implementation: Optional[str] = None,
         max_new_tokens: int = 512,
         max_total_images: int = 0,
+        max_image_side: int = 0,
+        max_image_pixels: int = 0,
         do_sample: bool = False,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -366,6 +409,8 @@ class QwenGenerationPolicy:
             processor=processor,
             max_new_tokens=max_new_tokens,
             max_total_images=max_total_images,
+            max_image_side=max_image_side,
+            max_image_pixels=max_image_pixels,
             do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
@@ -410,7 +455,11 @@ class QwenGenerationPolicy:
             for item in content:
                 item_type = item.get("type")
                 if item_type == "image" and "image" in item:
-                    item["image"] = _to_pil_image(item["image"])
+                    item["image"] = _resize_image_for_budget(
+                        item["image"],
+                        max_image_side=self.max_image_side,
+                        max_image_pixels=self.max_image_pixels,
+                    )
                 elif item_type == "video" and "video" in item:
                     item["video"] = self._prepare_video_payload(item["video"])
         return prepared
@@ -510,9 +559,30 @@ class QwenGenerationPolicy:
 
     def _prepare_video_payload(self, video: Any) -> Any:
         if isinstance(video, list):
-            return [_to_pil_image(frame) for frame in video]
+            return [
+                _resize_image_for_budget(
+                    frame,
+                    max_image_side=self.max_image_side,
+                    max_image_pixels=self.max_image_pixels,
+                )
+                for frame in video
+            ]
         if isinstance(video, tuple):
-            return [_to_pil_image(frame) for frame in video]
+            return [
+                _resize_image_for_budget(
+                    frame,
+                    max_image_side=self.max_image_side,
+                    max_image_pixels=self.max_image_pixels,
+                )
+                for frame in video
+            ]
         if isinstance(video, torch.Tensor) and video.ndim == 4:
-            return [_to_pil_image(frame) for frame in video]
+            return [
+                _resize_image_for_budget(
+                    frame,
+                    max_image_side=self.max_image_side,
+                    max_image_pixels=self.max_image_pixels,
+                )
+                for frame in video
+            ]
         return video

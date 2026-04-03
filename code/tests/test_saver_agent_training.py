@@ -1,4 +1,6 @@
 import io
+import json
+import re
 import sys
 import tempfile
 import unittest
@@ -500,6 +502,8 @@ class SaverAgentTrainingTests(unittest.TestCase):
                 data_path="/tmp/eval.jsonl",
                 policy_max_new_tokens=77,
                 max_total_images=5,
+                max_image_side=640,
+                max_image_pixels=307200,
             )
 
             def _fake_from_pretrained(
@@ -510,6 +514,8 @@ class SaverAgentTrainingTests(unittest.TestCase):
                 attn_implementation,
                 max_new_tokens,
                 max_total_images,
+                max_image_side,
+                max_image_pixels,
                 do_sample,
             ):
                 captured["checkpoint_path"] = str(checkpoint_path)
@@ -518,6 +524,8 @@ class SaverAgentTrainingTests(unittest.TestCase):
                 captured["attn_implementation"] = attn_implementation
                 captured["max_new_tokens"] = max_new_tokens
                 captured["max_total_images"] = max_total_images
+                captured["max_image_side"] = max_image_side
+                captured["max_image_pixels"] = max_image_pixels
                 captured["do_sample"] = do_sample
                 return "policy_stub"
 
@@ -555,8 +563,77 @@ class SaverAgentTrainingTests(unittest.TestCase):
         self.assertEqual(captured["attn_implementation"], "flash_attention_2")
         self.assertEqual(captured["max_new_tokens"], 77)
         self.assertEqual(captured["max_total_images"], 5)
+        self.assertEqual(captured["max_image_side"], 640)
+        self.assertEqual(captured["max_image_pixels"], 307200)
         self.assertFalse(captured["do_sample"])
         self.assertEqual(mocked_run_rollout_eval_with_policy.call_args.args[0], "policy_stub")
+
+    def test_write_rollout_eval_record_also_writes_human_readable_summary_log(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        runtime = DistributedRuntime(rank=0, world_size=1, local_rank=0)
+        metrics = {
+            "num_records": 240,
+            "existence_ap": 0.81,
+            "category_macro_f1": 0.12,
+            "temporal_miou": 0.23,
+            "precursor_miou": 0.11,
+            "alert_utility": 0.52,
+            "evidence_f1_at_3": 0.34,
+            "protocol_compliance_rate": 0.27,
+            "mean_num_turns": 8.5,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            training._write_rollout_eval_record(
+                output_dir=tmpdir,
+                metrics=metrics,
+                epoch_value=1.0,
+                runtime=runtime,
+            )
+
+            summary_path = Path(tmpdir) / "rollout_eval_summary.log"
+            logs_summary_path = Path(tmpdir) / "logs" / "rollout_eval_summary.log"
+            self.assertTrue(summary_path.exists())
+            self.assertTrue(logs_summary_path.exists())
+
+            summary_line = summary_path.read_text(encoding="utf-8").strip()
+            self.assertRegex(
+                summary_line,
+                r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] epoch=1\.00 num_records=240 "
+                r"existence_ap=0\.8100 category_macro_f1=0\.1200 temporal_miou=0\.2300 "
+                r"precursor_miou=0\.1100 alert_utility=0\.5200 evidence_f1_at_3=0\.3400 "
+                r"protocol_compliance_rate=0\.2700 mean_num_turns=8\.5000$",
+            )
+            self.assertEqual(summary_line, logs_summary_path.read_text(encoding="utf-8").strip())
+
+            jsonl_record = json.loads((Path(tmpdir) / "rollout_eval_metrics.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(jsonl_record["epoch"], 1.0)
+
+    def test_write_rollout_eval_record_can_target_explicit_eval_output_dir_without_legacy_duplicates(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        runtime = DistributedRuntime(rank=0, world_size=1, local_rank=0)
+        metrics = {
+            "num_records": 16,
+            "temporal_miou": 0.25,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "checkpoints" / "sft"
+            eval_output_dir = Path(tmpdir) / "eval" / "sft_epoch_end"
+            training._write_rollout_eval_record(
+                output_dir=output_dir,
+                eval_output_dir=eval_output_dir,
+                metrics=metrics,
+                epoch_value=1.0,
+                runtime=runtime,
+            )
+
+            self.assertTrue((eval_output_dir / "rollout_eval_metrics.jsonl").exists())
+            self.assertTrue((eval_output_dir / "rollout_eval_summary.log").exists())
+            self.assertFalse((output_dir / "rollout_eval_metrics.jsonl").exists())
+            self.assertFalse((output_dir / "logs" / "rollout_eval_metrics.jsonl").exists())
 
     def test_weighted_sft_uses_token_advantages_for_token_level_nll(self):
         self.assertIsNotNone(training, "saver_agent.training module is missing")
@@ -952,6 +1029,108 @@ class SaverAgentTrainingTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in prepared], ["system", "user", "assistant", "tool"])
         texts = [message["content"][0]["text"] for message in prepared]
         self.assertEqual(texts, ["sys", "user", "a2", "t2"])
+
+    def test_prepare_messages_drops_timestamp_text_when_capping_total_images(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "0.000s"},
+                    {"type": "image", "image": torch.zeros(3, 8, 8)},
+                    {"type": "text", "text": "1.000s"},
+                    {"type": "image", "image": torch.ones(3, 8, 8)},
+                    {"type": "text", "text": "2.000s"},
+                    {"type": "image", "image": torch.full((3, 8, 8), 2)},
+                    {"type": "text", "text": "decide next tool"},
+                ],
+            }
+        ]
+
+        prepared = training._prepare_messages(messages, max_total_images=2)
+
+        text_items = [
+            item.get("text")
+            for item in prepared[0]["content"]
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        image_items = [
+            item
+            for item in prepared[0]["content"]
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        self.assertEqual(len(image_items), 2)
+        self.assertNotIn("0.000s", text_items)
+        self.assertIn("1.000s", text_items)
+        self.assertIn("2.000s", text_items)
+        self.assertIn("decide next tool", text_items)
+
+    def test_prepare_messages_drops_timestamp_text_when_pruning_stale_tool_images(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "sys"}]},
+            {"role": "user", "content": [{"type": "text", "text": "user"}]},
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "text", "text": "0.000s"},
+                    {"type": "image", "image": torch.zeros(3, 8, 8)},
+                    {"type": "text", "text": "older evidence"},
+                ],
+            },
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "text", "text": "1.000s"},
+                    {"type": "image", "image": torch.ones(3, 8, 8)},
+                    {"type": "text", "text": "newer evidence"},
+                ],
+            },
+        ]
+
+        prepared = training._prepare_messages(messages, keep_recent_tool_image_messages=1)
+
+        older_tool_texts = [
+            item.get("text")
+            for item in prepared[2]["content"]
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        newer_tool_texts = [
+            item.get("text")
+            for item in prepared[3]["content"]
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        self.assertEqual(older_tool_texts, ["older evidence"])
+        self.assertIn("1.000s", newer_tool_texts)
+
+    def test_drop_oldest_multimodal_item_removes_paired_timestamp_text(self):
+        self.assertIsNotNone(training, "saver_agent.training module is missing")
+
+        messages = [
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "text", "text": "0.000s"},
+                    {"type": "image", "image": torch.zeros(3, 8, 8)},
+                    {"type": "text", "text": "1.000s"},
+                    {"type": "image", "image": torch.ones(3, 8, 8)},
+                    {"type": "text", "text": "notes"},
+                ],
+            }
+        ]
+
+        removed = training._drop_oldest_multimodal_item(messages)
+
+        self.assertTrue(removed)
+        text_items = [
+            item.get("text")
+            for item in messages[0]["content"]
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        self.assertNotIn("0.000s", text_items)
+        self.assertIn("1.000s", text_items)
 
     def test_single_example_multimodal_collator_enforces_max_seq_length_and_keeps_response_labels(self):
         self.assertIsNotNone(training, "saver_agent.training module is missing")

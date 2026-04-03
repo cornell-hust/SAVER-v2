@@ -332,7 +332,9 @@ def _protocol_compliance_flag(record: Dict[str, Any]) -> float:
     answer_turn_index = _first_matching_turn_index(turns, action="answer")
 
     has_finalize_artifact = finalize_turn_index is not None or isinstance(state.get("finalized_case"), dict)
-    has_answer_artifact = answer_turn_index is not None and isinstance(record.get("final_answer"), dict)
+    has_valid_explicit_answer = answer_turn_index is not None and isinstance(record.get("final_answer"), dict)
+    has_implicit_terminal_answer = answer_turn_index is None and has_finalize_artifact
+    has_answer_artifact = has_valid_explicit_answer or has_implicit_terminal_answer
 
     if not has_finalize_artifact or not has_answer_artifact:
         return 0.0

@@ -213,7 +213,14 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
                 {
                     "tool": "seek_evidence",
                     "arguments": {
-                        "query": "physical struggle",
+                        "query_package": {
+                            "event_cue": "physical struggle",
+                            "key_objects": ["person in red shirt", "person in black shirt"],
+                            "scene_context": "shop aisle",
+                            "hypothesis": "suspected interpersonal violence",
+                            "negative_constraints": [],
+                            "rewrite_reason": "focus_trigger",
+                        },
                         "start_sec": 1.0,
                         "end_sec": 4.0,
                         "moment_id": "ev1",
@@ -501,6 +508,32 @@ class SaverAgentTrainingDataTests(unittest.TestCase):
         self.assertTrue(all("image" not in item for item in image_items))
         self.assertTrue(all("image_ref" in item for item in image_items))
         json.dumps(examples)
+
+    def test_build_oracle_sft_examples_serializes_history_incrementally(self):
+        self.assertIsNotNone(build_oracle_sft_examples, "saver_agent.training_data module is missing")
+        self.assertIsNotNone(TRAINING_DATA_MODULE, "saver_agent.training_data module is missing")
+
+        original_serialize_messages = TRAINING_DATA_MODULE._serialize_messages
+        serialize_call_count = 0
+
+        def _counting_serialize_messages(*args, **kwargs):
+            nonlocal serialize_call_count
+            serialize_call_count += 1
+            return original_serialize_messages(*args, **kwargs)
+
+        with patch.object(
+            TRAINING_DATA_MODULE,
+            "_serialize_messages",
+            side_effect=_counting_serialize_messages,
+        ):
+            build_oracle_sft_examples(
+                self.item,
+                self.record,
+                config=SaverAgentConfig(),
+                serialize_messages=True,
+            )
+
+        self.assertEqual(serialize_call_count, 1)
 
     def test_build_counterfactual_grpo_examples_attaches_local_advantages_and_component_weights(self):
         self.assertIsNotNone(build_counterfactual_grpo_examples, "saver_agent.training_data module is missing")

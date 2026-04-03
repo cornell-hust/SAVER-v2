@@ -33,7 +33,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-root", default="", help="Root path used to resolve relative video paths.")
     parser.add_argument("--include-splits", default="", help="Optional comma-separated split whitelist for --data.")
     parser.add_argument("--index", type=int, default=0, help="Dataset sample index.")
-    parser.add_argument("--max-turns", type=int, default=12, help="Maximum rollout turns.")
+    parser.add_argument("--max-turns", type=int, default=14, help="Maximum rollout turns.")
     parser.add_argument(
         "--policy-backend",
         choices=["replay", "qwen"],
@@ -65,6 +65,18 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_TOTAL_VISUAL_BUDGET,
         help="Optional hard cap on total images preserved in the rollout prompt. 0 keeps all images.",
+    )
+    parser.add_argument(
+        "--max-image-side",
+        type=int,
+        default=0,
+        help="Optional rollout-time max image side length in pixels. 0 disables resizing.",
+    )
+    parser.add_argument(
+        "--max-image-pixels",
+        type=int,
+        default=0,
+        help="Optional rollout-time max image area in pixels. 0 disables resizing.",
     )
     parser.add_argument("--do-sample", action="store_true", help="Enable sampling for Qwen policy.")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
@@ -224,6 +236,8 @@ def main() -> None:
             attn_implementation=args.attn_implementation or None,
             max_new_tokens=args.max_new_tokens,
             max_total_images=(args.max_total_images if int(args.max_total_images) > 0 else args.total_visual_budget),
+            max_image_side=args.max_image_side,
+            max_image_pixels=args.max_image_pixels,
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,

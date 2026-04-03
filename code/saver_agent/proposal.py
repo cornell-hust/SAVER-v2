@@ -4,7 +4,8 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -67,6 +68,15 @@ _RELATION_TO_QUERY = (
     (("ground", "lying", "fallen"), "person on ground"),
     (("fire", "flame", "flames"), "fire"),
     (("smoke",), "smoke"),
+)
+
+_QUERY_PACKAGE_KEYS = (
+    "event_cue",
+    "key_objects",
+    "scene_context",
+    "hypothesis",
+    "negative_constraints",
+    "rewrite_reason",
 )
 
 
@@ -228,6 +238,102 @@ def select_query_for_moment(
     return best_text, best_source
 
 
+def normalize_query_package(
+    query_package: Optional[Dict[str, Any]],
+    *,
+    fallback_query: str = "",
+    fallback_scene_context: str = "",
+    rewrite_reason: str = "",
+) -> Dict[str, Any]:
+    package = dict(query_package or {})
+    event_cue = str(package.get("event_cue") or "").strip()
+    key_objects = [str(value).strip() for value in list(package.get("key_objects") or []) if str(value).strip()]
+    scene_context = str(package.get("scene_context") or fallback_scene_context or "").strip()
+    hypothesis = str(package.get("hypothesis") or "").strip()
+    negative_constraints = [
+        str(value).strip()
+        for value in list(package.get("negative_constraints") or [])
+        if str(value).strip()
+    ]
+    resolved_rewrite_reason = str(package.get("rewrite_reason") or rewrite_reason or "").strip()
+
+    fallback_normalized = normalize_query_text(fallback_query)
+    if not event_cue:
+        event_cue = fallback_normalized or str(fallback_query or "").strip()
+    if not hypothesis:
+        hypothesis = event_cue
+
+    normalized_key_objects: List[str] = []
+    seen_key_objects = set()
+    for value in key_objects:
+        normalized = normalize_query_text(value) or value
+        if not normalized or normalized in seen_key_objects:
+            continue
+        normalized_key_objects.append(normalized)
+        seen_key_objects.add(normalized)
+
+    normalized_negative_constraints: List[str] = []
+    seen_negative_constraints = set()
+    for value in negative_constraints:
+        normalized = normalize_query_text(value) or value
+        if not normalized or normalized in seen_negative_constraints:
+            continue
+        normalized_negative_constraints.append(normalized)
+        seen_negative_constraints.add(normalized)
+
+    return {
+        "event_cue": normalize_query_text(event_cue) or event_cue,
+        "key_objects": normalized_key_objects,
+        "scene_context": normalize_query_text(scene_context) or scene_context,
+        "hypothesis": normalize_query_text(hypothesis) or hypothesis,
+        "negative_constraints": normalized_negative_constraints,
+        "rewrite_reason": resolved_rewrite_reason,
+    }
+
+
+def render_query_package_texts(query_package: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    package = normalize_query_package(query_package)
+    positive_texts: List[Dict[str, Any]] = []
+    negative_texts: List[Dict[str, Any]] = []
+
+    def _append_text(entries: List[Dict[str, Any]], text: str, *, weight: float, source: str) -> None:
+        normalized = normalize_query_text(text)
+        if not normalized:
+            return
+        for entry in entries:
+            if entry["text"] == normalized:
+                entry["weight"] = max(float(entry["weight"]), float(weight))
+                return
+        entries.append({"text": normalized, "weight": float(weight), "source": source})
+
+    if package["event_cue"]:
+        _append_text(positive_texts, package["event_cue"], weight=0.40, source="event_cue")
+    for value in package["key_objects"]:
+        _append_text(positive_texts, value, weight=0.20, source="key_objects")
+    if package["scene_context"]:
+        _append_text(positive_texts, package["scene_context"], weight=0.10, source="scene_context")
+    if package["hypothesis"]:
+        _append_text(positive_texts, package["hypothesis"], weight=0.25, source="hypothesis")
+    for value in package["negative_constraints"]:
+        _append_text(negative_texts, value, weight=0.15, source="negative_constraints")
+
+    return {
+        "query_package": package,
+        "positive_texts": positive_texts,
+        "negative_texts": negative_texts,
+        "rewrite_reason": package["rewrite_reason"],
+    }
+
+
+def summarize_query_package(query_package: Optional[Dict[str, Any]]) -> str:
+    rendered = render_query_package_texts(query_package)
+    positive_texts = list(rendered.get("positive_texts") or [])
+    if positive_texts:
+        return str(positive_texts[0].get("text") or "").strip()
+    package = rendered.get("query_package") or {}
+    return str(package.get("event_cue") or package.get("hypothesis") or "").strip()
+
+
 def compute_frame_cache_signature(*, fps: float, frame_indices: Sequence[int], num_frames: int) -> str:
     payload = {
         "fps": round(float(fps), 6),
@@ -346,11 +452,153 @@ def _cluster_sorted_indices(indices: Sequence[int], *, max_gap: int) -> List[Lis
     return clusters
 
 
+def _compute_dynamic_num_frames(
+    *,
+    window_span_sec: float,
+    candidate_frame_scores: Sequence[float],
+    candidate_windows: Sequence[Dict[str, Any]],
+    requested_num_frames: int = 0,
+    max_num_frames: int = 8,
+) -> tuple[int, Dict[str, Any]]:
+    effective_cap = max(1, int(max_num_frames))
+    if requested_num_frames > 0:
+        effective_cap = max(1, min(effective_cap, int(requested_num_frames)))
+    base_k = 1 if float(window_span_sec) < 2.0 else 2
+    ambiguity_bonus = 0
+    if len(candidate_frame_scores) >= 5:
+        top1 = float(candidate_frame_scores[0])
+        top5 = float(candidate_frame_scores[min(4, len(candidate_frame_scores) - 1)])
+        ambiguity_bonus = 1 if top1 - top5 < 0.08 else 0
+    density_bonus = 1 if len(candidate_windows) >= 3 else 0
+    adaptive_num_frames = max(1, min(effective_cap, base_k + ambiguity_bonus + density_bonus))
+    return adaptive_num_frames, {
+        "base_k": int(base_k),
+        "ambiguity_bonus": int(ambiguity_bonus),
+        "density_bonus": int(density_bonus),
+        "requested_num_frames": int(requested_num_frames or 0),
+        "effective_cap": int(effective_cap),
+    }
+
+
+def _build_dpp_kernel(
+    *,
+    candidate_embeddings: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    candidate_timestamps: torch.Tensor,
+    alpha: float = 1.0,
+    tau_sec: float = 2.0,
+) -> torch.Tensor:
+    if candidate_embeddings.ndim != 2:
+        raise ValueError("candidate_embeddings must be rank-2.")
+    similarity = torch.matmul(candidate_embeddings, candidate_embeddings.T).clamp(min=0.0, max=1.0)
+    if tau_sec > 0:
+        temporal_distance = torch.abs(candidate_timestamps[:, None] - candidate_timestamps[None, :])
+        temporal_kernel = torch.exp(-temporal_distance / float(tau_sec))
+        similarity = similarity * temporal_kernel
+    if candidate_scores.numel() == 0:
+        quality = torch.ones((candidate_embeddings.shape[0],), dtype=torch.float32)
+    else:
+        score_min = torch.min(candidate_scores)
+        score_max = torch.max(candidate_scores)
+        if float(score_max - score_min) > 1e-8:
+            normalized_scores = (candidate_scores - score_min) / (score_max - score_min)
+        else:
+            normalized_scores = torch.ones_like(candidate_scores)
+        quality = torch.exp(float(alpha) * normalized_scores).float()
+    quality_outer = quality[:, None] * quality[None, :]
+    kernel = similarity * quality_outer
+    diagonal = torch.diagonal(kernel).clamp_min(1e-6)
+    diagonal_indices = torch.arange(kernel.shape[0], dtype=torch.long)
+    kernel[diagonal_indices, diagonal_indices] = diagonal
+    return kernel
+
+
+def _encode_query_text_entries(
+    proposal_runtime: Any,
+    text_entries: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    entries = [dict(entry) for entry in text_entries if str(entry.get("text") or "").strip()]
+    if not entries:
+        return []
+
+    texts = [str(entry["text"]) for entry in entries]
+    encoded_entries: List[Dict[str, Any]] = []
+
+    try:
+        embeddings = proposal_runtime.encode_texts(texts)
+        if not isinstance(embeddings, torch.Tensor):
+            raise TypeError("proposal_runtime.encode_texts must return a torch.Tensor.")
+        if embeddings.ndim == 1:
+            embeddings = embeddings.unsqueeze(0)
+        if int(embeddings.shape[0]) != len(entries):
+            raise ValueError("proposal_runtime.encode_texts returned a mismatched batch size.")
+        for entry, embedding in zip(entries, embeddings):
+            encoded_entry = dict(entry)
+            encoded_entry["embedding"] = embedding.detach().float().cpu()
+            encoded_entries.append(encoded_entry)
+        return encoded_entries
+    except Exception:
+        pass
+
+    for entry in entries:
+        text = str(entry["text"])
+        try:
+            embedding = proposal_runtime.encode_texts([text])
+        except Exception:
+            continue
+        if not isinstance(embedding, torch.Tensor):
+            raise TypeError("proposal_runtime.encode_texts must return a torch.Tensor.")
+        if embedding.ndim == 2:
+            if int(embedding.shape[0]) < 1:
+                continue
+            embedding = embedding[0]
+        elif embedding.ndim != 1:
+            raise ValueError("proposal_runtime.encode_texts returned an unexpected tensor rank.")
+        encoded_entry = dict(entry)
+        encoded_entry["embedding"] = embedding.detach().float().cpu()
+        encoded_entries.append(encoded_entry)
+    return encoded_entries
+
+
+def _greedy_map_dpp(kernel: torch.Tensor, *, num_select: int) -> List[int]:
+    if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+        raise ValueError("kernel must be a square matrix.")
+    total = int(kernel.shape[0])
+    if total <= 0 or num_select <= 0:
+        return []
+    num_select = min(int(num_select), total)
+    selected: List[int] = []
+    remaining = list(range(total))
+    eye_cache: Dict[int, torch.Tensor] = {}
+    while remaining and len(selected) < num_select:
+        best_index = None
+        best_score = None
+        for candidate in remaining:
+            subset = selected + [candidate]
+            subset_tensor = torch.tensor(subset, dtype=torch.long)
+            subkernel = kernel.index_select(0, subset_tensor).index_select(1, subset_tensor)
+            matrix_size = int(subkernel.shape[0])
+            if matrix_size not in eye_cache:
+                eye_cache[matrix_size] = torch.eye(matrix_size, dtype=subkernel.dtype)
+            stabilized = subkernel + 1e-6 * eye_cache[matrix_size]
+            sign, logabsdet = torch.linalg.slogdet(stabilized)
+            score = float(logabsdet.item()) if float(sign.item()) > 0 else float("-inf")
+            if best_score is None or score > best_score:
+                best_score = score
+                best_index = candidate
+        if best_index is None:
+            break
+        selected.append(int(best_index))
+        remaining.remove(int(best_index))
+    return selected
+
+
 def feature_guided_frame_proposal(
     *,
     feature_cache: Optional[Dict[str, Any]],
     proposal_runtime: Any,
     query: str,
+    query_package: Optional[Dict[str, Any]] = None,
     start_sec: float,
     end_sec: float,
     fps: float,
@@ -359,36 +607,46 @@ def feature_guided_frame_proposal(
     candidate_merge_gap_sec: float = 1.0,
     query_source: str = "model",
 ) -> Dict[str, Any]:
-    normalized_query = normalize_query_text(query)
+    normalized_package = normalize_query_package(query_package, fallback_query=query)
+    query_rendering = render_query_package_texts(normalized_package)
+    normalized_query = summarize_query_package(normalized_package) or normalize_query_text(query)
     if feature_cache is None:
         return {
             "proposal_backend": "uniform",
             "feature_cache_used": False,
-            "query_raw": str(query or ""),
+            "query_raw": str(normalized_query or query or ""),
             "query_normalized": normalized_query,
             "query_source": str(query_source or "model"),
+            "query_package": normalized_package,
+            "query_rendering": query_rendering,
             "proposal_candidate_count": 0,
             "proposal_candidate_frame_indices": [],
             "proposal_candidate_frame_scores": [],
             "proposal_candidate_windows": [],
             "selected_frame_indices": [],
             "selected_frame_scores": [],
+            "adaptive_num_frames": 0,
             "proposal_fallback_reason": "missing_feature_cache",
         }
-    if proposal_runtime is None or not normalized_query:
+    positive_texts = [dict(entry) for entry in list(query_rendering.get("positive_texts") or [])]
+    negative_texts = [dict(entry) for entry in list(query_rendering.get("negative_texts") or [])]
+    if proposal_runtime is None or not positive_texts:
         return {
             "proposal_backend": "uniform",
             "feature_cache_used": True,
-            "query_raw": str(query or ""),
+            "query_raw": str(normalized_query or query or ""),
             "query_normalized": normalized_query,
             "query_source": str(query_source or "model"),
+            "query_package": normalized_package,
+            "query_rendering": query_rendering,
             "proposal_candidate_count": 0,
             "proposal_candidate_frame_indices": [],
             "proposal_candidate_frame_scores": [],
             "proposal_candidate_windows": [],
             "selected_frame_indices": [],
             "selected_frame_scores": [],
-            "proposal_fallback_reason": "missing_query_encoder" if proposal_runtime is None else "empty_query",
+            "adaptive_num_frames": 0,
+            "proposal_fallback_reason": "missing_query_encoder" if proposal_runtime is None else "empty_query_package",
         }
 
     embeddings = feature_cache.get("embeddings")
@@ -396,36 +654,78 @@ def feature_guided_frame_proposal(
         return {
             "proposal_backend": "uniform",
             "feature_cache_used": True,
-            "query_raw": str(query or ""),
+            "query_raw": str(normalized_query or query or ""),
             "query_normalized": normalized_query,
             "query_source": str(query_source or "model"),
+            "query_package": normalized_package,
+            "query_rendering": query_rendering,
             "proposal_candidate_count": 0,
             "proposal_candidate_frame_indices": [],
             "proposal_candidate_frame_scores": [],
             "proposal_candidate_windows": [],
             "selected_frame_indices": [],
             "selected_frame_scores": [],
+            "adaptive_num_frames": 0,
             "proposal_fallback_reason": "invalid_feature_cache",
         }
 
-    text_embeddings = proposal_runtime.encode_texts([normalized_query])
-    if not isinstance(text_embeddings, torch.Tensor):
-        raise TypeError("proposal_runtime.encode_texts must return a torch.Tensor.")
-    if text_embeddings.ndim == 1:
-        text_embeddings = text_embeddings.unsqueeze(0)
+    positive_encoded_entries = _encode_query_text_entries(proposal_runtime, positive_texts)
+    negative_encoded_entries = _encode_query_text_entries(proposal_runtime, negative_texts)
+    if not positive_encoded_entries:
+        return {
+            "proposal_backend": "uniform",
+            "feature_cache_used": True,
+            "query_raw": str(normalized_query or query or ""),
+            "query_normalized": normalized_query,
+            "query_source": str(query_source or "model"),
+            "query_package": normalized_package,
+            "query_rendering": query_rendering,
+            "proposal_candidate_count": 0,
+            "proposal_candidate_frame_indices": [],
+            "proposal_candidate_frame_scores": [],
+            "proposal_candidate_windows": [],
+            "selected_frame_indices": [],
+            "selected_frame_scores": [],
+            "adaptive_num_frames": 0,
+            "proposal_fallback_reason": "empty_query_embeddings",
+        }
     frame_embeddings = embeddings.detach().float().cpu()
-    text_embeddings = text_embeddings.detach().float().cpu()
+    positive_embeddings = torch.stack(
+        [entry["embedding"] for entry in positive_encoded_entries],
+        dim=0,
+    ).detach().float().cpu()
     if not bool(feature_cache.get("normalized", False)):
         frame_embeddings = _l2_normalize(frame_embeddings)
-    text_embeddings = _l2_normalize(text_embeddings)
+    positive_embeddings = _l2_normalize(positive_embeddings)
+    negative_embeddings = None
+    if negative_encoded_entries:
+        negative_embeddings = torch.stack(
+            [entry["embedding"] for entry in negative_encoded_entries],
+            dim=0,
+        ).detach().float().cpu()
+        negative_embeddings = _l2_normalize(negative_embeddings)
 
     start_index = max(int(math.floor(float(start_sec) * float(fps))), 0)
     end_index = min(int(math.floor(float(end_sec) * float(fps))), int(frame_embeddings.shape[0]) - 1)
     if end_index < start_index:
         end_index = start_index
     search_embeddings = frame_embeddings[start_index : end_index + 1]
-    scores = torch.matmul(search_embeddings, text_embeddings[0])
-    effective_top_k = max(int(num_frames), min(int(top_k_candidates), int(scores.shape[0])))
+    positive_weight_tensor = torch.tensor(
+        [float(entry.get("weight") or 0.0) for entry in positive_encoded_entries],
+        dtype=torch.float32,
+    )
+    positive_scores = torch.matmul(search_embeddings, positive_embeddings.T)
+    scores = torch.matmul(positive_scores, positive_weight_tensor)
+    if negative_embeddings is not None and negative_encoded_entries:
+        negative_weight_tensor = torch.tensor(
+            [float(entry.get("weight") or 0.0) for entry in negative_encoded_entries],
+            dtype=torch.float32,
+        )
+        negative_scores = torch.matmul(search_embeddings, negative_embeddings.T)
+        scores = scores - torch.matmul(negative_scores, negative_weight_tensor)
+    requested_num_frames = max(0, int(num_frames or 0))
+    top_k_hint = max(requested_num_frames, 4)
+    effective_top_k = min(int(scores.shape[0]), max(min(4 * top_k_hint, 64), int(top_k_candidates), 1))
     top_scores, top_local_indices = torch.topk(scores, k=effective_top_k)
     candidate_global_indices = [int(index) + start_index for index in top_local_indices.tolist()]
     candidate_frame_scores = [round(float(score), 6) for score in top_scores.tolist()]
@@ -451,39 +751,81 @@ def feature_guided_frame_proposal(
         return {
             "proposal_backend": "uniform",
             "feature_cache_used": True,
-            "query_raw": str(query or ""),
+            "query_raw": str(normalized_query or query or ""),
             "query_normalized": normalized_query,
             "query_source": str(query_source or "model"),
+            "query_package": normalized_package,
+            "query_rendering": query_rendering,
             "proposal_candidate_count": 0,
             "proposal_candidate_frame_indices": candidate_global_indices,
             "proposal_candidate_frame_scores": candidate_frame_scores,
             "proposal_candidate_windows": [],
             "selected_frame_indices": [],
             "selected_frame_scores": [],
+            "adaptive_num_frames": 0,
             "proposal_fallback_reason": "empty_candidate_windows",
         }
-
-    selected_window = candidate_windows[0]
-    selected_indices_sorted = sorted(
-        selected_window["frame_indices"],
-        key=lambda index: float(scores[int(index - start_index)].item()),
-        reverse=True,
-    )[: max(1, int(num_frames))]
-    selected_indices = sorted(int(index) for index in selected_indices_sorted)
-    selected_scores = [round(float(scores[int(index - start_index)].item()), 6) for index in selected_indices]
+    adaptive_num_frames, adaptive_meta = _compute_dynamic_num_frames(
+        window_span_sec=max(float(end_sec) - float(start_sec), 1e-6),
+        candidate_frame_scores=candidate_frame_scores,
+        candidate_windows=candidate_windows,
+        requested_num_frames=requested_num_frames,
+        max_num_frames=8,
+    )
+    candidate_index_tensor = torch.tensor([int(index - start_index) for index in candidate_global_indices], dtype=torch.long)
+    candidate_embeddings = search_embeddings.index_select(0, candidate_index_tensor)
+    candidate_timestamps = torch.tensor(
+        [float(index) / max(float(fps), 1e-6) for index in candidate_global_indices],
+        dtype=torch.float32,
+    )
+    candidate_score_tensor = torch.tensor(candidate_frame_scores, dtype=torch.float32)
+    dpp_kernel = _build_dpp_kernel(
+        candidate_embeddings=candidate_embeddings,
+        candidate_scores=candidate_score_tensor,
+        candidate_timestamps=candidate_timestamps,
+        alpha=6.0,
+        tau_sec=2.0,
+    )
+    try:
+        selected_candidate_positions = _greedy_map_dpp(dpp_kernel, num_select=adaptive_num_frames)
+        selected_indices = sorted(int(candidate_global_indices[index]) for index in selected_candidate_positions)
+        selected_scores = [
+            round(float(scores[int(index - start_index)].item()), 6)
+            for index in selected_indices
+        ]
+        proposal_backend = "siglip_dpp"
+        fallback_reason = None
+    except Exception:
+        selected_indices = sorted(candidate_global_indices[:adaptive_num_frames])
+        selected_scores = [
+            round(float(scores[int(index - start_index)].item()), 6)
+            for index in selected_indices
+        ]
+        proposal_backend = "feature_topk"
+        fallback_reason = "dpp_failure"
     return {
-        "proposal_backend": "feature_topk",
+        "proposal_backend": proposal_backend,
         "feature_cache_used": True,
-        "query_raw": str(query or ""),
+        "query_raw": str(normalized_query or query or ""),
         "query_normalized": normalized_query,
         "query_source": str(query_source or "model"),
+        "query_package": normalized_package,
+        "query_rendering": query_rendering,
         "proposal_candidate_count": len(candidate_windows),
         "proposal_candidate_frame_indices": candidate_global_indices,
         "proposal_candidate_frame_scores": candidate_frame_scores,
         "proposal_candidate_windows": candidate_windows,
         "selected_frame_indices": selected_indices,
         "selected_frame_scores": selected_scores,
-        "proposal_fallback_reason": None,
+        "adaptive_num_frames": int(adaptive_num_frames),
+        "adaptive_frame_budget_meta": adaptive_meta,
+        "proposal_dpp_kernel_meta": {
+            "alpha": 6.0,
+            "tau_sec": 2.0,
+            "candidate_count": int(len(candidate_global_indices)),
+            "selection_count": int(len(selected_indices)),
+        },
+        "proposal_fallback_reason": fallback_reason,
     }
 
 
@@ -493,6 +835,8 @@ class SiglipFeatureEncoder:
     processor: Any
     device: str = "cpu"
     model_name: str = ""
+    max_text_cache_size: int = 4096
+    _text_feature_cache: "OrderedDict[str, torch.Tensor]" = field(default_factory=OrderedDict)
 
     @classmethod
     def from_pretrained(
@@ -547,16 +891,40 @@ class SiglipFeatureEncoder:
         return _l2_normalize(features.detach().cpu())
 
     def encode_texts(self, texts: Sequence[str]) -> torch.Tensor:
-        inputs = self.processor(text=list(texts), return_tensors="pt", padding=True)
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-        with torch.no_grad():
-            if hasattr(self.model, "get_text_features"):
-                features = self.model.get_text_features(**inputs)
-            else:
-                outputs = self.model(**inputs)
-                features = outputs
-        features = coerce_encoder_feature_tensor(
-            features,
-            preferred_keys=("text_embeds", "pooler_output", "last_hidden_state", "hidden_states"),
-        )
-        return _l2_normalize(features.detach().cpu())
+        normalized_texts = [str(text) for text in texts]
+        if not normalized_texts:
+            return torch.empty((0, 0), dtype=torch.float32)
+
+        missing_texts: List[str] = []
+        seen_missing = set()
+        for text in normalized_texts:
+            if text in self._text_feature_cache:
+                self._text_feature_cache.move_to_end(text)
+                continue
+            if text in seen_missing:
+                continue
+            seen_missing.add(text)
+            missing_texts.append(text)
+
+        if missing_texts:
+            inputs = self.processor(text=missing_texts, return_tensors="pt", padding=True)
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
+            with torch.no_grad():
+                if hasattr(self.model, "get_text_features"):
+                    features = self.model.get_text_features(**inputs)
+                else:
+                    outputs = self.model(**inputs)
+                    features = outputs
+            features = coerce_encoder_feature_tensor(
+                features,
+                preferred_keys=("text_embeds", "pooler_output", "last_hidden_state", "hidden_states"),
+            )
+            features = _l2_normalize(features.detach().cpu())
+            for text, feature in zip(missing_texts, features):
+                self._text_feature_cache[text] = feature.clone()
+                self._text_feature_cache.move_to_end(text)
+                while len(self._text_feature_cache) > max(1, int(self.max_text_cache_size)):
+                    self._text_feature_cache.popitem(last=False)
+
+        stacked_features = [self._text_feature_cache[text] for text in normalized_texts]
+        return torch.stack(stacked_features, dim=0)

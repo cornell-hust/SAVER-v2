@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Full SAVER pipeline:
-#   1. 如果缺失，则构建 agent_train / oracle_sft / prepared_sft
+#   1. 如果缺失，则构建 runtime_train / runtime_test / sft_train(.teacher)
 #   2. 预建 .frame_cache / .feature_cache
 #   3. 多卡训练 SFT，并在每个 epoch 后做 rollout 评估
 #   4. 用 proposal runtime 跑批量 rollout、离线打分、汇总
@@ -33,6 +33,7 @@ DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
 EXP_ROOT="${EXP_ROOT:-${DATA_ROOT}/Wmh/ideas/idea2_v2}"
 DATA_UTILS_DIR="${DATA_UTILS_DIR:-${CODE_DIR}/data_utils}"
 configure_experiment_layout "${CODE_DIR}" "${EXP_ROOT}" "${DATA_UTILS_DIR}"
+LOG_DIR="${LOG_DIR:-${DEFAULT_PIPELINE_LOG_DIR}}"
 configure_script_logging "00_full_pipeline"
 # 预处理类 json/jsonl/json summary 固定放在 code/data_utils；
 # checkpoint / rollout / train artifacts 继续走 ckpt/<EXP_NAME>。
@@ -40,6 +41,10 @@ ANNOTATION_DIR="${ANNOTATION_DIR:-${DEFAULT_ANNOTATION_DIR}}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${DEFAULT_ARTIFACT_DIR}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DEFAULT_CHECKPOINT_DIR}}"
 ROLLOUT_ROOT="${ROLLOUT_ROOT:-${DEFAULT_ROLLOUT_ROOT}}"
+SFT_EVAL_OUTPUT_DIR="${SFT_EVAL_OUTPUT_DIR:-${DEFAULT_SFT_EVAL_DIR}}"
+SFT_LOG_DIR="${SFT_LOG_DIR:-${DEFAULT_SFT_LOG_DIR}}"
+RL_LOG_DIR="${RL_LOG_DIR:-${DEFAULT_RL_LOG_DIR}}"
+ROLLOUT_LOG_DIR="${ROLLOUT_LOG_DIR:-${DEFAULT_ROLLOUT_LOG_DIR}}"
 # 模型目录，默认假设 Qwen3-VL 权重放在这里。
 MODEL_ROOT="${MODEL_ROOT:-${DATA_ROOT}/Wmh/MLLMs}"
 
@@ -48,22 +53,28 @@ MODEL_ROOT="${MODEL_ROOT:-${DATA_ROOT}/Wmh/MLLMs}"
 # 如果你已经手工准备过这些文件，可以直接指向已有文件。
 # -----------------------------
 CANONICAL_JSONL="${CANONICAL_JSONL:-${DATA_UTILS_DIR}/msad_saver_with_qwen.jsonl}"
-AGENT_TRAIN_JSONL="${AGENT_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_agent_train.jsonl}"
-ORACLE_JSONL="${ORACLE_JSONL:-${DATA_UTILS_DIR}/msad_saver_oracle_sft.jsonl}"
-PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.jsonl}"
-TEACHER_PREPARED_TRAIN_JSONL="${TEACHER_PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.teacher.jsonl}"
+LEGACY_AGENT_TRAIN_JSONL="${AGENT_TRAIN_JSONL:-}"
+LEGACY_ORACLE_JSONL="${ORACLE_JSONL:-}"
+LEGACY_PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL:-}"
+LEGACY_TEACHER_PREPARED_TRAIN_JSONL="${TEACHER_PREPARED_TRAIN_JSONL:-}"
+RUNTIME_TRAIN_JSONL="${RUNTIME_TRAIN_JSONL:-${LEGACY_AGENT_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_runtime_train.jsonl}}"
+RUNTIME_TEST_JSONL="${RUNTIME_TEST_JSONL:-${DATA_UTILS_DIR}/msad_saver_runtime_test.jsonl}"
+SFT_TRAIN_JSONL="${SFT_TRAIN_JSONL:-${LEGACY_PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_sft_train.jsonl}}"
+TEACHER_SFT_TRAIN_JSONL="${TEACHER_SFT_TRAIN_JSONL:-${LEGACY_TEACHER_PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_sft_train.teacher.jsonl}}"
+SFT_TRAIN_METADATA_JSON="${SFT_TRAIN_METADATA_JSON:-${SFT_TRAIN_JSONL}.meta.json}"
+TEACHER_SFT_TRAIN_METADATA_JSON="${TEACHER_SFT_TRAIN_METADATA_JSON:-${TEACHER_SFT_TRAIN_JSONL}.meta.json}"
 
 # -----------------------------
 # 模型与输出
 # MODEL_PATH 是 SFT 初始模型；SFT_OUTPUT_DIR 会作为后续 rollout 和 RL 的默认输入。
 # -----------------------------
 MODEL_PATH="${MODEL_PATH:-${MODEL_ROOT}/qwen3-vl-8b-Instruct}"
-SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${CHECKPOINT_DIR}/saver_sft_qwen3vl_8b_eval_ddp}"
-RL_OUTPUT_DIR="${RL_OUTPUT_DIR:-${CHECKPOINT_DIR}/saver_cea_grpo_v1}"
+SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${DEFAULT_SFT_CHECKPOINT_DIR}/saver_sft_qwen3vl_8b_eval_ddp}"
+RL_OUTPUT_DIR="${RL_OUTPUT_DIR:-${DEFAULT_RL_CHECKPOINT_DIR}/saver_cea_grpo_v1}"
 
 # -----------------------------
 # 通用数据过滤与容错
-# EVAL_SPLIT 默认用 test。现在推荐直接用全量 ORACLE_JSONL + split 过滤。
+# EVAL_SPLIT 默认用 test。runtime builder 会把 canonical JSONL 拆成 runtime_train/runtime_test。
 # -----------------------------
 TRAIN_SPLIT="${TRAIN_SPLIT:-train}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
@@ -86,7 +97,7 @@ VALIDATION_MAX_EXAMPLES="${VALIDATION_MAX_EXAMPLES:-0}"
 # -----------------------------
 BUILD_FRAME_CACHE="${BUILD_FRAME_CACHE:-1}"
 BUILD_FEATURE_CACHE="${BUILD_FEATURE_CACHE:-auto}"
-FRAME_CACHE_DATA="${FRAME_CACHE_DATA:-${ORACLE_JSONL}}"
+FRAME_CACHE_DATA="${FRAME_CACHE_DATA:-${LEGACY_ORACLE_JSONL:-}}"
 FRAME_CACHE_INCLUDE_SPLITS="${FRAME_CACHE_INCLUDE_SPLITS:-${TRAIN_SPLIT},${EVAL_SPLIT}}"
 FRAME_CACHE_VIDEO_FPS="${FRAME_CACHE_VIDEO_FPS:-2.0}"
 FRAME_CACHE_MAX_FRAMES="${FRAME_CACHE_MAX_FRAMES:-256}"
@@ -121,6 +132,19 @@ TEACHER_JUDGE_OVERWRITE_EXISTING="${TEACHER_JUDGE_OVERWRITE_EXISTING:-0}"
 MAX_TEACHER_DISAGREEMENT_CASES="${MAX_TEACHER_DISAGREEMENT_CASES:-50}"
 
 # -----------------------------
+# 推荐统一预算
+# 训练、epoch-end eval、外部 rollout 默认共用这组预算；
+# 需要单独覆盖时，再改各 stage 的专属变量。
+# -----------------------------
+PIPELINE_MAX_IMAGE_SIDE="${PIPELINE_MAX_IMAGE_SIDE:-640}"
+PIPELINE_MAX_IMAGE_PIXELS="${PIPELINE_MAX_IMAGE_PIXELS:-0}"
+PIPELINE_MAX_TOTAL_IMAGES="${PIPELINE_MAX_TOTAL_IMAGES:-28}"
+PIPELINE_MAX_SEQ_LENGTH="${PIPELINE_MAX_SEQ_LENGTH:-6144}"
+PIPELINE_KEEP_RECENT_TEXT_MESSAGES="${PIPELINE_KEEP_RECENT_TEXT_MESSAGES:-20}"
+PIPELINE_NUM_PREVIEW_FRAMES="${PIPELINE_NUM_PREVIEW_FRAMES:-8}"
+PIPELINE_PREVIEW_SAMPLING_FPS="${PIPELINE_PREVIEW_SAMPLING_FPS:-}"
+
+# -----------------------------
 # Stage 3: SFT
 # 最常改:
 #   - SFT_NPROC_PER_NODE
@@ -130,7 +154,7 @@ MAX_TEACHER_DISAGREEMENT_CASES="${MAX_TEACHER_DISAGREEMENT_CASES:-50}"
 #   - SFT_MAX_TOTAL_IMAGES / SFT_MAX_IMAGE_SIDE
 # -----------------------------
 SFT_NPROC_PER_NODE="${SFT_NPROC_PER_NODE:-4}"
-SFT_INLINE_ROLLOUT_EVAL="${SFT_INLINE_ROLLOUT_EVAL:-0}"
+SFT_INLINE_ROLLOUT_EVAL="${SFT_INLINE_ROLLOUT_EVAL:-1}"
 SFT_LEARNING_RATE="${SFT_LEARNING_RATE:-1e-5}"
 SFT_NUM_TRAIN_EPOCHS="${SFT_NUM_TRAIN_EPOCHS:-2.0}"
 SFT_PER_DEVICE_TRAIN_BATCH_SIZE="${SFT_PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
@@ -139,25 +163,24 @@ SFT_LOGGING_STEPS="${SFT_LOGGING_STEPS:-5}"
 SFT_ATTN_IMPLEMENTATION="${SFT_ATTN_IMPLEMENTATION:-flash_attention_3}"
 # 设为 0 表示评完整个 EVAL_SPLIT，不传 --eval-max-records。
 SFT_EVAL_MAX_RECORDS="${SFT_EVAL_MAX_RECORDS:-0}"
-SFT_EVAL_ROLLOUT_MAX_TURNS="${SFT_EVAL_ROLLOUT_MAX_TURNS:-12}"
+SFT_EVAL_ROLLOUT_MAX_TURNS="${SFT_EVAL_ROLLOUT_MAX_TURNS:-14}"
 SFT_EVAL_MAX_NEW_TOKENS_PER_TURN="${SFT_EVAL_MAX_NEW_TOKENS_PER_TURN:-256}"
-SFT_EVAL_MAX_TOTAL_IMAGES="${SFT_EVAL_MAX_TOTAL_IMAGES:-24}"
+SFT_EVAL_MAX_TOTAL_IMAGES="${SFT_EVAL_MAX_TOTAL_IMAGES:-${PIPELINE_MAX_TOTAL_IMAGES}}"
 SFT_EVAL_ATTACH_REFERENCE_DIAGNOSTICS="${SFT_EVAL_ATTACH_REFERENCE_DIAGNOSTICS:-0}"
 SFT_EVAL_DIAGNOSTIC_VERIFIER_BACKEND="${SFT_EVAL_DIAGNOSTIC_VERIFIER_BACKEND:-${SFT_EVAL_VERIFIER_BACKEND:-heuristic}}"
 SFT_EVAL_PROGRESS_EVERY="${SFT_EVAL_PROGRESS_EVERY:-1}"
-# 以下三个是训练时的显存/信息裁剪开关。
-# 默认全关，优先保留性能。
+# epoch-end rollout eval 会自动继承 SFT_MAX_IMAGE_SIDE / SFT_MAX_IMAGE_PIXELS。
 #   - SFT_MAX_IMAGE_SIDE: 等比缩放图片最长边
 #   - SFT_MAX_IMAGE_PIXELS: 等比缩放到目标像素数上限
 #   - SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES: 仅保留最近 N 条 tool 图片
 #   - SFT_MAX_TOTAL_IMAGES: 每个样本保留的总图片数上限
 #   - SFT_MAX_SEQ_LENGTH / SFT_KEEP_RECENT_TEXT_MESSAGES: 文本预算控制
-SFT_MAX_IMAGE_SIDE="${SFT_MAX_IMAGE_SIDE:-0}"
-SFT_MAX_IMAGE_PIXELS="${SFT_MAX_IMAGE_PIXELS:-0}"
+SFT_MAX_IMAGE_SIDE="${SFT_MAX_IMAGE_SIDE:-${PIPELINE_MAX_IMAGE_SIDE}}"
+SFT_MAX_IMAGE_PIXELS="${SFT_MAX_IMAGE_PIXELS:-${PIPELINE_MAX_IMAGE_PIXELS}}"
 SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES="${SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES:-0}"
-SFT_MAX_TOTAL_IMAGES="${SFT_MAX_TOTAL_IMAGES:-24}"
-SFT_MAX_SEQ_LENGTH="${SFT_MAX_SEQ_LENGTH:-4096}"
-SFT_KEEP_RECENT_TEXT_MESSAGES="${SFT_KEEP_RECENT_TEXT_MESSAGES:-12}"
+SFT_MAX_TOTAL_IMAGES="${SFT_MAX_TOTAL_IMAGES:-${PIPELINE_MAX_TOTAL_IMAGES}}"
+SFT_MAX_SEQ_LENGTH="${SFT_MAX_SEQ_LENGTH:-${PIPELINE_MAX_SEQ_LENGTH}}"
+SFT_KEEP_RECENT_TEXT_MESSAGES="${SFT_KEEP_RECENT_TEXT_MESSAGES:-${PIPELINE_KEEP_RECENT_TEXT_MESSAGES}}"
 SFT_DATALOADER_NUM_WORKERS="${SFT_DATALOADER_NUM_WORKERS:-4}"
 SFT_DATALOADER_PREFETCH_FACTOR="${SFT_DATALOADER_PREFETCH_FACTOR:-2}"
 SFT_DATALOADER_PERSISTENT_WORKERS="${SFT_DATALOADER_PERSISTENT_WORKERS:-1}"
@@ -169,16 +192,19 @@ SFT_DATALOADER_PERSISTENT_WORKERS="${SFT_DATALOADER_PERSISTENT_WORKERS:-1}"
 # -----------------------------
 ROLLOUT_RUN_NAME="${ROLLOUT_RUN_NAME:-sft_rollout_eval}"
 ROLLOUT_RUN_DIR="${ROLLOUT_RUN_DIR:-${ROLLOUT_ROOT}/${ROLLOUT_RUN_NAME}}"
+ROLLOUT_NPROC_PER_NODE="${ROLLOUT_NPROC_PER_NODE:-${SFT_NPROC_PER_NODE:-1}}"
 ROLLOUT_START_INDEX="${ROLLOUT_START_INDEX:-0}"
 # 设为 0 表示从 ROLLOUT_START_INDEX 开始一路跑到该 split 结束，不截断。
 ROLLOUT_COUNT="${ROLLOUT_COUNT:-0}"
-ROLLOUT_MAX_TURNS="${ROLLOUT_MAX_TURNS:-12}"
+ROLLOUT_MAX_TURNS="${ROLLOUT_MAX_TURNS:-14}"
 ROLLOUT_PROGRESS_EVERY="${ROLLOUT_PROGRESS_EVERY:-5}"
 ROLLOUT_TORCH_DTYPE="${ROLLOUT_TORCH_DTYPE:-auto}"
 ROLLOUT_DEVICE_MAP="${ROLLOUT_DEVICE_MAP:-auto}"
 ROLLOUT_ATTN_IMPLEMENTATION="${ROLLOUT_ATTN_IMPLEMENTATION:-flash_attention_3}"
 ROLLOUT_MAX_NEW_TOKENS="${ROLLOUT_MAX_NEW_TOKENS:-256}"
-ROLLOUT_MAX_TOTAL_IMAGES="${ROLLOUT_MAX_TOTAL_IMAGES:-24}"
+ROLLOUT_MAX_IMAGE_SIDE="${ROLLOUT_MAX_IMAGE_SIDE:-${PIPELINE_MAX_IMAGE_SIDE}}"
+ROLLOUT_MAX_IMAGE_PIXELS="${ROLLOUT_MAX_IMAGE_PIXELS:-${PIPELINE_MAX_IMAGE_PIXELS}}"
+ROLLOUT_MAX_TOTAL_IMAGES="${ROLLOUT_MAX_TOTAL_IMAGES:-${PIPELINE_MAX_TOTAL_IMAGES}}"
 # 采样开关。评估更稳时通常设 0；想看更多策略多样性时设 1。
 ROLLOUT_DO_SAMPLE="${ROLLOUT_DO_SAMPLE:-0}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.7}"
@@ -210,15 +236,15 @@ RL_NPROC_PER_NODE="${RL_NPROC_PER_NODE:-4}"
 RL_REFERENCE_MODEL_PATH="${RL_REFERENCE_MODEL_PATH:-${SFT_OUTPUT_DIR}}"
 # 设为 0 表示评完整个 EVAL_SPLIT，不传 --eval-max-records。
 RL_EVAL_MAX_RECORDS="${RL_EVAL_MAX_RECORDS:-0}"
-RL_EVAL_ROLLOUT_MAX_TURNS="${RL_EVAL_ROLLOUT_MAX_TURNS:-12}"
+RL_EVAL_ROLLOUT_MAX_TURNS="${RL_EVAL_ROLLOUT_MAX_TURNS:-14}"
 RL_EVAL_MAX_NEW_TOKENS_PER_TURN="${RL_EVAL_MAX_NEW_TOKENS_PER_TURN:-256}"
-RL_EVAL_MAX_TOTAL_IMAGES="${RL_EVAL_MAX_TOTAL_IMAGES:-24}"
+RL_EVAL_MAX_TOTAL_IMAGES="${RL_EVAL_MAX_TOTAL_IMAGES:-${PIPELINE_MAX_TOTAL_IMAGES}}"
 RL_EVAL_ATTACH_REFERENCE_DIAGNOSTICS="${RL_EVAL_ATTACH_REFERENCE_DIAGNOSTICS:-0}"
 RL_EVAL_DIAGNOSTIC_VERIFIER_BACKEND="${RL_EVAL_DIAGNOSTIC_VERIFIER_BACKEND:-${RL_EVAL_VERIFIER_BACKEND:-heuristic}}"
 RL_NUM_ITERATIONS="${RL_NUM_ITERATIONS:-3}"
 RL_ROLLOUT_COUNT="${RL_ROLLOUT_COUNT:-16}"
 RL_NUM_GENERATIONS="${RL_NUM_GENERATIONS:-4}"
-RL_ROLLOUT_MAX_TURNS="${RL_ROLLOUT_MAX_TURNS:-12}"
+RL_ROLLOUT_MAX_TURNS="${RL_ROLLOUT_MAX_TURNS:-14}"
 RL_POLICY_MAX_NEW_TOKENS="${RL_POLICY_MAX_NEW_TOKENS:-256}"
 RL_POLICY_DO_SAMPLE="${RL_POLICY_DO_SAMPLE:-1}"
 RL_POLICY_TEMPERATURE="${RL_POLICY_TEMPERATURE:-0.7}"
@@ -255,12 +281,12 @@ RL_PER_DEVICE_TRAIN_BATCH_SIZE="${RL_PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 RL_GRADIENT_ACCUMULATION_STEPS="${RL_GRADIENT_ACCUMULATION_STEPS:-16}"
 RL_ATTN_IMPLEMENTATION="${RL_ATTN_IMPLEMENTATION:-flash_attention_3}"
 RL_LOGGING_STEPS="${RL_LOGGING_STEPS:-10}"
-RL_MAX_IMAGE_SIDE="${RL_MAX_IMAGE_SIDE:-0}"
-RL_MAX_IMAGE_PIXELS="${RL_MAX_IMAGE_PIXELS:-0}"
+RL_MAX_IMAGE_SIDE="${RL_MAX_IMAGE_SIDE:-${PIPELINE_MAX_IMAGE_SIDE}}"
+RL_MAX_IMAGE_PIXELS="${RL_MAX_IMAGE_PIXELS:-${PIPELINE_MAX_IMAGE_PIXELS}}"
 RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES="${RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES:-0}"
-RL_MAX_TOTAL_IMAGES="${RL_MAX_TOTAL_IMAGES:-24}"
-RL_MAX_SEQ_LENGTH="${RL_MAX_SEQ_LENGTH:-4096}"
-RL_KEEP_RECENT_TEXT_MESSAGES="${RL_KEEP_RECENT_TEXT_MESSAGES:-12}"
+RL_MAX_TOTAL_IMAGES="${RL_MAX_TOTAL_IMAGES:-${PIPELINE_MAX_TOTAL_IMAGES}}"
+RL_MAX_SEQ_LENGTH="${RL_MAX_SEQ_LENGTH:-${PIPELINE_MAX_SEQ_LENGTH}}"
+RL_KEEP_RECENT_TEXT_MESSAGES="${RL_KEEP_RECENT_TEXT_MESSAGES:-${PIPELINE_KEEP_RECENT_TEXT_MESSAGES}}"
 RL_DATALOADER_NUM_WORKERS="${RL_DATALOADER_NUM_WORKERS:-8}"
 RL_DATALOADER_PREFETCH_FACTOR="${RL_DATALOADER_PREFETCH_FACTOR:-4}"
 RL_DATALOADER_PERSISTENT_WORKERS="${RL_DATALOADER_PERSISTENT_WORKERS:-1}"
@@ -428,16 +454,33 @@ epoch_resume_epoch_index() {
 }
 
 rollout_eval_metrics_path_for_epoch() {
-  local output_dir="$1"
+  local rollout_eval_output_dir="$1"
   local epoch_index="$2"
-  printf '%s\n' "${output_dir}/rollout_eval/epoch_$(printf '%03d' "${epoch_index}")/metrics.json"
+  printf '%s\n' "${rollout_eval_output_dir}/epoch_$(printf '%03d' "${epoch_index}")/metrics.json"
+}
+
+legacy_rollout_eval_metrics_path_for_epoch() {
+  local rollout_eval_output_dir="$1"
+  local epoch_index="$2"
+  printf '%s\n' "${rollout_eval_output_dir}/rollout_eval/epoch_$(printf '%03d' "${epoch_index}")/metrics.json"
+}
+
+rollout_eval_metrics_exist_for_epoch() {
+  local rollout_eval_output_dir="$1"
+  local epoch_index="$2"
+  local metrics_path=""
+  local legacy_metrics_path=""
+
+  metrics_path="$(rollout_eval_metrics_path_for_epoch "${rollout_eval_output_dir}" "${epoch_index}")"
+  legacy_metrics_path="$(legacy_rollout_eval_metrics_path_for_epoch "${rollout_eval_output_dir}" "${epoch_index}")"
+  [[ -f "${metrics_path}" || -f "${legacy_metrics_path}" ]]
 }
 
 list_pending_sft_rollout_eval_checkpoints() {
   local output_dir="$1"
+  local rollout_eval_output_dir="$2"
   local candidate=""
   local epoch_index=""
-  local metrics_path=""
   local base_name=""
 
   for candidate in "${output_dir}"/epoch_resume/epoch_*; do
@@ -450,8 +493,7 @@ list_pending_sft_rollout_eval_checkpoints() {
       continue
     fi
     epoch_index="${BASH_REMATCH[1]}"
-    metrics_path="$(rollout_eval_metrics_path_for_epoch "${output_dir}" "${epoch_index}")"
-    if [[ ! -f "${metrics_path}" ]]; then
+    if ! rollout_eval_metrics_exist_for_epoch "${rollout_eval_output_dir}" "${epoch_index}"; then
       printf '%s\n' "${candidate}"
     fi
   done
@@ -459,13 +501,14 @@ list_pending_sft_rollout_eval_checkpoints() {
 
 run_pending_sft_rollout_evals() {
   local output_dir="$1"
+  local rollout_eval_output_dir="$2"
   local pending_checkpoints=()
   local checkpoint_dir=""
 
   while IFS= read -r checkpoint_dir; do
     [[ -n "${checkpoint_dir}" ]] || continue
     pending_checkpoints+=("${checkpoint_dir}")
-  done < <(list_pending_sft_rollout_eval_checkpoints "${output_dir}")
+  done < <(list_pending_sft_rollout_eval_checkpoints "${output_dir}" "${rollout_eval_output_dir}")
 
   if [[ "${#pending_checkpoints[@]}" == "0" ]]; then
     echo "  - No pending external SFT rollout eval checkpoints."
@@ -525,7 +568,9 @@ build_stage3_sft_cmd() {
     --include-splits "${TRAIN_SPLIT}"
     --model-path "${MODEL_PATH}"
     --output-dir "${SFT_OUTPUT_DIR}"
-    --eval-data "${ORACLE_JSONL}"
+    --log-dir "${SFT_LOG_DIR}"
+    --rollout-eval-output-dir "${SFT_EVAL_OUTPUT_DIR}"
+    --eval-data "${RUNTIME_TEST_JSONL}"
     --eval-data-root "${DATA_ROOT}"
     --eval-include-splits "${EVAL_SPLIT}"
     --eval-rollout-max-turns "${SFT_EVAL_ROLLOUT_MAX_TURNS}"
@@ -541,7 +586,11 @@ build_stage3_sft_cmd() {
     --dataloader-num-workers "${SFT_DATALOADER_NUM_WORKERS}"
     --dataloader-prefetch-factor "${SFT_DATALOADER_PREFETCH_FACTOR}"
     --logging-steps "${SFT_LOGGING_STEPS}"
+    --num-preview-frames "${PIPELINE_NUM_PREVIEW_FRAMES}"
   )
+  if [[ -n "${PIPELINE_PREVIEW_SAMPLING_FPS}" ]]; then
+    SFT_STAGE3_CMD+=(--preview-sampling-fps "${PIPELINE_PREVIEW_SAMPLING_FPS}")
+  fi
   if [[ -n "${resume_path}" ]]; then
     SFT_STAGE3_CMD+=(--resume-from-checkpoint "${resume_path}")
   fi
@@ -549,6 +598,8 @@ build_stage3_sft_cmd() {
     SFT_STAGE3_CMD+=(--resume-rollout-eval-only)
   elif [[ "${SFT_INLINE_ROLLOUT_EVAL}" == "1" ]]; then
     SFT_STAGE3_CMD+=(--inline-rollout-eval)
+  else
+    SFT_STAGE3_CMD+=(--defer-rollout-eval)
   fi
   if [[ "${SFT_DATALOADER_PERSISTENT_WORKERS}" == "1" ]]; then
     SFT_STAGE3_CMD+=(--dataloader-persistent-workers)
@@ -627,6 +678,16 @@ resolve_toggle() {
   esac
 }
 
+summary_output_with_suffix() {
+  local base_path="$1"
+  local suffix="$2"
+  if [[ "${base_path}" == *.json ]]; then
+    printf '%s.%s.json\n' "${base_path%.json}" "${suffix}"
+    return 0
+  fi
+  printf '%s.%s\n' "${base_path}" "${suffix}"
+}
+
 resolve_effective_teacher_judge_model_path() {
   local enable_value="${1:-auto}"
   local explicit_path="${2:-}"
@@ -666,7 +727,6 @@ resolve_effective_teacher_judge_model_path() {
   esac
 }
 
-mkdir -p "${ANNOTATION_DIR}" "${ARTIFACT_DIR}" "${CHECKPOINT_DIR}" "${ROLLOUT_RUN_DIR}"
 cd "${CODE_DIR}"
 
 EFFECTIVE_TEACHER_JUDGE_MODEL_PATH="$(
@@ -685,130 +745,125 @@ else
 fi
 
 echo "[Stage 1/5] Build data artifacts if missing"
-# 这三个文件只要存在就跳过:
-#   - AGENT_TRAIN_JSONL
-#   - ORACLE_JSONL
-#   - PREPARED_TRAIN_JSONL
-# 如果你改了上游 canonical 数据，记得删掉旧文件后再跑。
-if [[ -f "${AGENT_TRAIN_JSONL}" ]]; then
-  echo "  - Skip agent_train build, file exists: ${AGENT_TRAIN_JSONL}"
-else
-  echo "  - Building agent_train view: ${AGENT_TRAIN_JSONL}"
-  cmd=(
-    python convert_to_saver_agent.py
-    --input "${CANONICAL_JSONL}"
-    --output "${AGENT_TRAIN_JSONL}"
-    --adapter "${ADAPTER}"
-    --mode agent_train
-    --include-splits "${TRAIN_SPLIT}"
-  )
-  if [[ "${SKIP_INVALID_JSONL_LINES}" == "1" ]]; then
-    cmd+=(--skip-invalid-jsonl-lines)
-  fi
-  "${cmd[@]}"
+stage1_targets=(
+  "${RUNTIME_TRAIN_JSONL}"
+  "${RUNTIME_TEST_JSONL}"
+  "${SFT_TRAIN_JSONL}"
+  "${SFT_TRAIN_METADATA_JSON}"
+)
+if [[ -n "${EFFECTIVE_TEACHER_JUDGE_MODEL_PATH}" ]]; then
+  stage1_targets+=("${TEACHER_SFT_TRAIN_JSONL}" "${TEACHER_SFT_TRAIN_METADATA_JSON}")
 fi
 
-if [[ -f "${ORACLE_JSONL}" ]]; then
-  echo "  - Skip oracle_sft build, file exists: ${ORACLE_JSONL}"
-else
-  echo "  - Building oracle_sft view: ${ORACLE_JSONL}"
-  cmd=(
-    python convert_to_saver_agent.py
-    --input "${CANONICAL_JSONL}"
-    --output "${ORACLE_JSONL}"
-    --adapter "${ADAPTER}"
-    --mode oracle_sft
-  )
-  if [[ "${SKIP_INVALID_JSONL_LINES}" == "1" ]]; then
-    cmd+=(--skip-invalid-jsonl-lines)
+stage1_missing_targets=()
+for target_path in "${stage1_targets[@]}"; do
+  if [[ ! -f "${target_path}" ]]; then
+    stage1_missing_targets+=("${target_path}")
   fi
-  "${cmd[@]}"
-fi
+done
 
-if [[ -f "${PREPARED_TRAIN_JSONL}" ]]; then
-  echo "  - Skip prepared SFT build, file exists: ${PREPARED_TRAIN_JSONL}"
+if [[ "${#stage1_missing_targets[@]}" == "0" ]]; then
+  echo "  - Skip simplified data build; all runtime/SFT artifacts already exist."
 else
-  echo "  - Preparing SFT data: ${PREPARED_TRAIN_JSONL}"
-  cmd=(
-    python train_saver_sft.py
-    --data "${AGENT_TRAIN_JSONL}"
+  echo "  - Building simplified runtime/SFT artifacts"
+  build_data_cmd=(
+    python build_saver_data.py
+    --input "${CANONICAL_JSONL}"
+    --runtime-train-output "${RUNTIME_TRAIN_JSONL}"
+    --runtime-test-output "${RUNTIME_TEST_JSONL}"
+    --sft-train-output "${SFT_TRAIN_JSONL}"
     --data-root "${DATA_ROOT}"
-    --include-splits "${TRAIN_SPLIT}"
-    --prepare-output "${PREPARED_TRAIN_JSONL}"
-    --prepare-only
-    --validate-prepared-data
+    --adapter "${ADAPTER}"
+    --train-splits "${TRAIN_SPLIT}"
+    --test-splits "${EVAL_SPLIT}"
+    --validate-sft-data
     --progress-every "${PREPARE_PROGRESS_EVERY}"
+    --num-preview-frames "${PIPELINE_NUM_PREVIEW_FRAMES}"
   )
+  if [[ -n "${PIPELINE_PREVIEW_SAMPLING_FPS}" ]]; then
+    build_data_cmd+=(--preview-sampling-fps "${PIPELINE_PREVIEW_SAMPLING_FPS}")
+  fi
   if [[ "${SKIP_INVALID_JSONL_LINES}" == "1" ]]; then
-    cmd+=(--skip-invalid-jsonl-lines)
+    build_data_cmd+=(--skip-invalid-jsonl-lines)
   fi
   if [[ "${VALIDATE_MATERIALIZATION}" == "1" ]]; then
-    cmd+=(--validate-materialization)
+    build_data_cmd+=(--validate-materialization)
   fi
   if [[ "${VALIDATION_MAX_EXAMPLES}" != "0" ]]; then
-    cmd+=(--validation-max-examples "${VALIDATION_MAX_EXAMPLES}")
+    build_data_cmd+=(--validation-max-examples "${VALIDATION_MAX_EXAMPLES}")
   fi
   if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
-    cmd+=(
+    build_data_cmd+=(
       --proposal-model-path "${PROPOSAL_MODEL_PATH}"
       --proposal-torch-dtype "${PROPOSAL_TORCH_DTYPE}"
     )
     if [[ -n "${PROPOSAL_DEVICE}" ]]; then
-      cmd+=(--proposal-device "${PROPOSAL_DEVICE}")
+      build_data_cmd+=(--proposal-device "${PROPOSAL_DEVICE}")
     fi
   fi
-  "${cmd[@]}"
-fi
-
-EFFECTIVE_PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL}"
-if [[ -n "${EFFECTIVE_TEACHER_JUDGE_MODEL_PATH}" ]]; then
-  if [[ -f "${TEACHER_PREPARED_TRAIN_JSONL}" ]]; then
-    echo "  - Skip teacher prepared SFT build, file exists: ${TEACHER_PREPARED_TRAIN_JSONL}"
-  else
-    echo "  - Annotating teacher prepared SFT: ${TEACHER_PREPARED_TRAIN_JSONL}"
-    teacher_cmd=(
-      python annotate_teacher_judge_sft.py
-      --input "${PREPARED_TRAIN_JSONL}"
-      --output "${TEACHER_PREPARED_TRAIN_JSONL}"
-      --include-splits "${TRAIN_SPLIT}"
-      --model-path "${EFFECTIVE_TEACHER_JUDGE_MODEL_PATH}"
-      --input-mode "${TEACHER_JUDGE_INPUT_MODE}"
-      --torch-dtype "${TEACHER_JUDGE_TORCH_DTYPE}"
-      --device-map "${TEACHER_JUDGE_DEVICE_MAP}"
-      --max-new-tokens "${TEACHER_JUDGE_MAX_NEW_TOKENS}"
-      --max-images "${TEACHER_JUDGE_MAX_IMAGES}"
-      --progress-every "${TEACHER_JUDGE_PROGRESS_EVERY}"
+  if [[ -n "${EFFECTIVE_TEACHER_JUDGE_MODEL_PATH}" ]]; then
+    build_data_cmd+=(
+      --teacher-output "${TEACHER_SFT_TRAIN_JSONL}"
+      --teacher-judge-model-path "${EFFECTIVE_TEACHER_JUDGE_MODEL_PATH}"
+      --teacher-judge-input-mode "${TEACHER_JUDGE_INPUT_MODE}"
+      --teacher-judge-torch-dtype "${TEACHER_JUDGE_TORCH_DTYPE}"
+      --teacher-judge-device-map "${TEACHER_JUDGE_DEVICE_MAP}"
+      --teacher-judge-max-new-tokens "${TEACHER_JUDGE_MAX_NEW_TOKENS}"
+      --teacher-judge-max-images "${TEACHER_JUDGE_MAX_IMAGES}"
+      --teacher-judge-topk-frames-per-view "${TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW}"
     )
-    if [[ "${SKIP_INVALID_JSONL_LINES}" == "1" ]]; then
-      teacher_cmd+=(--skip-invalid-jsonl-lines)
-    fi
     if [[ -n "${TEACHER_JUDGE_ATTN_IMPLEMENTATION}" ]]; then
-      teacher_cmd+=(--attn-implementation "${TEACHER_JUDGE_ATTN_IMPLEMENTATION}")
+      build_data_cmd+=(--teacher-judge-attn-implementation "${TEACHER_JUDGE_ATTN_IMPLEMENTATION}")
     fi
     if [[ "${TEACHER_JUDGE_OVERWRITE_EXISTING}" == "1" ]]; then
-      teacher_cmd+=(--overwrite-existing)
+      build_data_cmd+=(--teacher-judge-overwrite-existing)
     fi
-    "${teacher_cmd[@]}"
   fi
-  EFFECTIVE_PREPARED_TRAIN_JSONL="${TEACHER_PREPARED_TRAIN_JSONL}"
+  "${build_data_cmd[@]}"
+fi
+
+EFFECTIVE_PREPARED_TRAIN_JSONL="${SFT_TRAIN_JSONL}"
+if [[ -n "${EFFECTIVE_TEACHER_JUDGE_MODEL_PATH}" ]]; then
+  EFFECTIVE_PREPARED_TRAIN_JSONL="${TEACHER_SFT_TRAIN_JSONL}"
 fi
 
 echo "[Stage 2/5] Build frame cache / feature cache"
 if resolve_toggle "${BUILD_FRAME_CACHE}" "1"; then
-  frame_cmd=(
-    python build_frame_cache.py
-    --data "${FRAME_CACHE_DATA}"
-    --data-root "${DATA_ROOT}"
-    --include-splits "${FRAME_CACHE_INCLUDE_SPLITS}"
-    --cache-video-fps "${FRAME_CACHE_VIDEO_FPS}"
-    --max-cache-frames "${FRAME_CACHE_MAX_FRAMES}"
-    --progress-every "${FRAME_CACHE_PROGRESS_EVERY}"
-    --summary-output "${FRAME_CACHE_SUMMARY_OUTPUT}"
-  )
-  if [[ "${FRAME_CACHE_OVERWRITE}" == "1" ]]; then
-    frame_cmd+=(--overwrite)
+  frame_cache_data_paths=()
+  frame_cache_splits=()
+  if [[ -n "${FRAME_CACHE_DATA}" ]]; then
+    frame_cache_data_paths+=("${FRAME_CACHE_DATA}")
+    frame_cache_splits+=("${FRAME_CACHE_INCLUDE_SPLITS}")
+  else
+    frame_cache_data_paths+=("${RUNTIME_TRAIN_JSONL}" "${RUNTIME_TEST_JSONL}")
+    frame_cache_splits+=("${TRAIN_SPLIT}" "${EVAL_SPLIT}")
   fi
-  "${frame_cmd[@]}"
+  for cache_index in "${!frame_cache_data_paths[@]}"; do
+    frame_summary_output="${FRAME_CACHE_SUMMARY_OUTPUT}"
+    if [[ "${#frame_cache_data_paths[@]}" -gt 1 ]]; then
+      frame_summary_label="${frame_cache_splits[$cache_index]}"
+      frame_summary_label="${frame_summary_label//,/__}"
+      frame_summary_label="${frame_summary_label// /}"
+      [[ -n "${frame_summary_label}" ]] || frame_summary_label="part${cache_index}"
+      frame_summary_output="$(summary_output_with_suffix "${FRAME_CACHE_SUMMARY_OUTPUT}" "${frame_summary_label}")"
+    fi
+    frame_cmd=(
+      python build_frame_cache.py
+      --data "${frame_cache_data_paths[$cache_index]}"
+      --data-root "${DATA_ROOT}"
+      --cache-video-fps "${FRAME_CACHE_VIDEO_FPS}"
+      --max-cache-frames "${FRAME_CACHE_MAX_FRAMES}"
+      --progress-every "${FRAME_CACHE_PROGRESS_EVERY}"
+      --summary-output "${frame_summary_output}"
+    )
+    if [[ -n "${frame_cache_splits[$cache_index]}" ]]; then
+      frame_cmd+=(--include-splits "${frame_cache_splits[$cache_index]}")
+    fi
+    if [[ "${FRAME_CACHE_OVERWRITE}" == "1" ]]; then
+      frame_cmd+=(--overwrite)
+    fi
+    "${frame_cmd[@]}"
+  done
 else
   echo "  - Skip frame cache stage (BUILD_FRAME_CACHE=${BUILD_FRAME_CACHE})"
 fi
@@ -818,21 +873,42 @@ if resolve_toggle "${BUILD_FEATURE_CACHE}" "${PROPOSAL_MODEL_PATH}"; then
     echo "BUILD_FEATURE_CACHE is enabled, but PROPOSAL_MODEL_PATH is empty." >&2
     exit 1
   fi
-  feature_cmd=(
-    python build_feature_cache.py
-    --data "${FEATURE_CACHE_DATA}"
-    --data-root "${DATA_ROOT}"
-    --include-splits "${FEATURE_CACHE_INCLUDE_SPLITS}"
-    --model-path "${PROPOSAL_MODEL_PATH}"
-    --torch-dtype "${PROPOSAL_TORCH_DTYPE}"
-    --device "${FEATURE_CACHE_DEVICE}"
-    --progress-every "${FEATURE_CACHE_PROGRESS_EVERY}"
-    --summary-output "${FEATURE_CACHE_SUMMARY_OUTPUT}"
-  )
-  if [[ "${FEATURE_CACHE_OVERWRITE}" == "1" ]]; then
-    feature_cmd+=(--overwrite)
+  feature_cache_data_paths=()
+  feature_cache_splits=()
+  if [[ -n "${FEATURE_CACHE_DATA}" ]]; then
+    feature_cache_data_paths+=("${FEATURE_CACHE_DATA}")
+    feature_cache_splits+=("${FEATURE_CACHE_INCLUDE_SPLITS}")
+  else
+    feature_cache_data_paths+=("${RUNTIME_TRAIN_JSONL}" "${RUNTIME_TEST_JSONL}")
+    feature_cache_splits+=("${TRAIN_SPLIT}" "${EVAL_SPLIT}")
   fi
-  "${feature_cmd[@]}"
+  for cache_index in "${!feature_cache_data_paths[@]}"; do
+    feature_summary_output="${FEATURE_CACHE_SUMMARY_OUTPUT}"
+    if [[ "${#feature_cache_data_paths[@]}" -gt 1 ]]; then
+      feature_summary_label="${feature_cache_splits[$cache_index]}"
+      feature_summary_label="${feature_summary_label//,/__}"
+      feature_summary_label="${feature_summary_label// /}"
+      [[ -n "${feature_summary_label}" ]] || feature_summary_label="part${cache_index}"
+      feature_summary_output="$(summary_output_with_suffix "${FEATURE_CACHE_SUMMARY_OUTPUT}" "${feature_summary_label}")"
+    fi
+    feature_cmd=(
+      python build_feature_cache.py
+      --data "${feature_cache_data_paths[$cache_index]}"
+      --data-root "${DATA_ROOT}"
+      --model-path "${PROPOSAL_MODEL_PATH}"
+      --torch-dtype "${PROPOSAL_TORCH_DTYPE}"
+      --device "${FEATURE_CACHE_DEVICE}"
+      --progress-every "${FEATURE_CACHE_PROGRESS_EVERY}"
+      --summary-output "${feature_summary_output}"
+    )
+    if [[ -n "${feature_cache_splits[$cache_index]}" ]]; then
+      feature_cmd+=(--include-splits "${feature_cache_splits[$cache_index]}")
+    fi
+    if [[ "${FEATURE_CACHE_OVERWRITE}" == "1" ]]; then
+      feature_cmd+=(--overwrite)
+    fi
+    "${feature_cmd[@]}"
+  done
 else
   if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
     echo "  - Skip feature cache stage (BUILD_FEATURE_CACHE=${BUILD_FEATURE_CACHE})"
@@ -841,7 +917,7 @@ else
   fi
 fi
 
-echo "[Stage 3/5] Multi-GPU SFT with deferred epoch-end rollout evaluation by default and external recovery fallback"
+echo "[Stage 3/5] Multi-GPU SFT with immediate epoch-end rollout evaluation by default and deferred recovery fallback"
 RESOLVED_SFT_MODEL_PATH=""
 if is_complete_model_checkpoint_dir "${SFT_OUTPUT_DIR}"; then
   RESOLVED_SFT_MODEL_PATH="${SFT_OUTPUT_DIR}"
@@ -852,8 +928,7 @@ else
   LATEST_SFT_EPOCH_RESUME_PENDING=0
   if [[ -n "${LATEST_SFT_EPOCH_RESUME_DIR}" ]]; then
     LATEST_SFT_EPOCH_INDEX="$(epoch_resume_epoch_index "${LATEST_SFT_EPOCH_RESUME_DIR}" || true)"
-    LATEST_SFT_EVAL_METRICS_PATH="$(rollout_eval_metrics_path_for_epoch "${SFT_OUTPUT_DIR}" "${LATEST_SFT_EPOCH_INDEX}")"
-    if [[ ! -f "${LATEST_SFT_EVAL_METRICS_PATH}" ]]; then
+    if ! rollout_eval_metrics_exist_for_epoch "${SFT_EVAL_OUTPUT_DIR}" "${LATEST_SFT_EPOCH_INDEX}"; then
       LATEST_SFT_EPOCH_RESUME_PENDING=1
       echo "  - Recover missing epoch-end rollout eval from ${LATEST_SFT_EPOCH_RESUME_DIR}"
       build_stage3_sft_cmd "${LATEST_SFT_EPOCH_RESUME_DIR}" 1
@@ -890,8 +965,7 @@ else
     LATEST_SFT_EPOCH_RESUME_DIR="$(resolve_latest_sft_epoch_resume_dir "${SFT_OUTPUT_DIR}" || true)"
     if [[ -n "${LATEST_SFT_EPOCH_RESUME_DIR}" ]]; then
       LATEST_SFT_EPOCH_INDEX="$(epoch_resume_epoch_index "${LATEST_SFT_EPOCH_RESUME_DIR}" || true)"
-      LATEST_SFT_EVAL_METRICS_PATH="$(rollout_eval_metrics_path_for_epoch "${SFT_OUTPUT_DIR}" "${LATEST_SFT_EPOCH_INDEX}")"
-      if [[ -f "${LATEST_SFT_EVAL_METRICS_PATH}" && "$(checkpoint_has_remaining_training "${LATEST_SFT_EPOCH_RESUME_DIR}")" != "1" ]]; then
+      if rollout_eval_metrics_exist_for_epoch "${SFT_EVAL_OUTPUT_DIR}" "${LATEST_SFT_EPOCH_INDEX}" && [[ "$(checkpoint_has_remaining_training "${LATEST_SFT_EPOCH_RESUME_DIR}")" != "1" ]]; then
         RESOLVED_SFT_MODEL_PATH="${LATEST_SFT_EPOCH_RESUME_DIR}"
       fi
     fi
@@ -906,7 +980,7 @@ else
   echo "  - Resolved Stage 3 checkpoint: ${RESOLVED_SFT_MODEL_PATH}"
 fi
 
-run_pending_sft_rollout_evals "${SFT_OUTPUT_DIR}"
+run_pending_sft_rollout_evals "${SFT_OUTPUT_DIR}" "${SFT_EVAL_OUTPUT_DIR}"
 
 EFFECTIVE_RL_REFERENCE_MODEL_PATH="${RL_REFERENCE_MODEL_PATH}"
 if [[ "${EFFECTIVE_RL_REFERENCE_MODEL_PATH}" == "${SFT_OUTPUT_DIR}" ]]; then
@@ -933,9 +1007,14 @@ if [[ "${need_batch_rollout}" == "0" && "${need_score_rollout}" == "0" && "${nee
   echo "  - Skip rollout, score, and summary; all Stage 3 artifacts already exist."
 else
   if [[ "${need_batch_rollout}" == "1" ]]; then
+    batch_cmd_prefix=(python)
+    if [[ "${ROLLOUT_NPROC_PER_NODE}" != "1" ]]; then
+      batch_cmd_prefix=(torchrun --standalone --nproc_per_node="${ROLLOUT_NPROC_PER_NODE}")
+    fi
     batch_cmd=(
-      python batch_run_saver_rollout.py
-      --data "${ORACLE_JSONL}"
+      "${batch_cmd_prefix[@]}"
+      batch_run_saver_rollout.py
+      --data "${RUNTIME_TEST_JSONL}"
       --data-root "${DATA_ROOT}"
       --include-splits "${EVAL_SPLIT}"
       --start-index "${ROLLOUT_START_INDEX}"
@@ -946,10 +1025,16 @@ else
       --torch-dtype "${ROLLOUT_TORCH_DTYPE}"
       --device-map "${ROLLOUT_DEVICE_MAP}"
       --max-new-tokens "${ROLLOUT_MAX_NEW_TOKENS}"
+      --max-image-side "${ROLLOUT_MAX_IMAGE_SIDE}"
+      --max-image-pixels "${ROLLOUT_MAX_IMAGE_PIXELS}"
       --max-total-images "${ROLLOUT_MAX_TOTAL_IMAGES}"
+      --num-preview-frames "${PIPELINE_NUM_PREVIEW_FRAMES}"
       --output "${RAW_ROLLOUT_OUTPUT}"
       --progress-every "${ROLLOUT_PROGRESS_EVERY}"
     )
+    if [[ -n "${PIPELINE_PREVIEW_SAMPLING_FPS}" ]]; then
+      batch_cmd+=(--preview-sampling-fps "${PIPELINE_PREVIEW_SAMPLING_FPS}")
+    fi
     if [[ -n "${ROLLOUT_ATTN_IMPLEMENTATION}" ]]; then
       batch_cmd+=(--attn-implementation "${ROLLOUT_ATTN_IMPLEMENTATION}")
     fi
@@ -999,7 +1084,7 @@ else
       python score_saver_rollout.py
       --input "${RAW_ROLLOUT_OUTPUT}"
       --output "${SCORED_ROLLOUT_OUTPUT}"
-      --data "${ORACLE_JSONL}"
+      --data "${RUNTIME_TEST_JSONL}"
       --data-root "${DATA_ROOT}"
       --progress-every "${ROLLOUT_PROGRESS_EVERY}"
     )
@@ -1043,7 +1128,7 @@ else
     python summarize_saver_scores.py \
       --input "${SCORED_ROLLOUT_OUTPUT}" \
       --output "${ROLLOUT_SUMMARY_OUTPUT}" \
-      --data "${ORACLE_JSONL}" \
+      --data "${RUNTIME_TEST_JSONL}" \
       --data-root "${DATA_ROOT}" \
       --max-teacher-disagreement-cases "${MAX_TEACHER_DISAGREEMENT_CASES}"
   else
@@ -1066,13 +1151,14 @@ fi
 rl_cmd=(
   "${rl_launcher[@]}"
   train_saver_rl.py
-  --data "${AGENT_TRAIN_JSONL}"
+  --data "${RUNTIME_TRAIN_JSONL}"
   --data-root "${DATA_ROOT}"
   --include-splits "${TRAIN_SPLIT}"
   --model-path "${RESOLVED_SFT_MODEL_PATH}"
   --reference-model-path "${EFFECTIVE_RL_REFERENCE_MODEL_PATH}"
   --output-dir "${RL_OUTPUT_DIR}"
-  --eval-data "${ORACLE_JSONL}"
+  --log-dir "${RL_LOG_DIR}"
+  --eval-data "${RUNTIME_TEST_JSONL}"
   --eval-data-root "${DATA_ROOT}"
   --eval-include-splits "${EVAL_SPLIT}"
   --eval-rollout-max-turns "${RL_EVAL_ROLLOUT_MAX_TURNS}"
@@ -1109,7 +1195,11 @@ rl_cmd=(
   --dataloader-num-workers "${RL_DATALOADER_NUM_WORKERS}"
   --dataloader-prefetch-factor "${RL_DATALOADER_PREFETCH_FACTOR}"
   --logging-steps "${RL_LOGGING_STEPS}"
+  --num-preview-frames "${PIPELINE_NUM_PREVIEW_FRAMES}"
 )
+if [[ -n "${PIPELINE_PREVIEW_SAMPLING_FPS}" ]]; then
+  rl_cmd+=(--preview-sampling-fps "${PIPELINE_PREVIEW_SAMPLING_FPS}")
+fi
 if [[ -n "${PROPOSAL_MODEL_PATH}" ]]; then
   rl_cmd+=(
     --proposal-model-path "${PROPOSAL_MODEL_PATH}"

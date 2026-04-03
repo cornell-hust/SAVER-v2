@@ -259,7 +259,7 @@ class TrainSaverSftTests(unittest.TestCase):
         self.assertEqual(args.max_total_images, 24)
         self.assertEqual(args.eval_max_new_tokens_per_turn, 256)
         self.assertEqual(args.eval_max_total_images, 24)
-        self.assertEqual(args.eval_rollout_max_turns, 12)
+        self.assertEqual(args.eval_rollout_max_turns, 14)
 
     def test_build_rollout_eval_config_passes_proposal_runtime_fields(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
@@ -289,6 +289,32 @@ class TrainSaverSftTests(unittest.TestCase):
         self.assertEqual(str(config.proposal_model_path), "/models/siglip_base")
         self.assertEqual(config.proposal_torch_dtype, "bfloat16")
         self.assertEqual(config.proposal_device, "cuda:1")
+
+    def test_build_rollout_eval_config_inherits_training_resize_budgets(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--max-image-side",
+                "640",
+                "--max-image-pixels",
+                "307200",
+            ]
+        )
+
+        config = train_saver_sft._build_rollout_eval_config(
+            args,
+            config=train_saver_sft._build_config(args),
+        )
+
+        self.assertEqual(config.max_image_side, 640)
+        self.assertEqual(config.max_image_pixels, 307200)
 
     def test_build_prepared_sft_examples_attaches_proposal_runtime_to_multimodal_cache(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
@@ -333,7 +359,7 @@ class TrainSaverSftTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(args.eval_rollout_max_turns, 12)
+        self.assertEqual(args.eval_rollout_max_turns, 14)
         self.assertEqual(args.eval_max_new_tokens_per_turn, 256)
 
     def test_parse_args_accepts_resume_recovery_flags(self):
@@ -354,7 +380,7 @@ class TrainSaverSftTests(unittest.TestCase):
         self.assertEqual(args.resume_from_checkpoint, "/tmp/sft_out/epoch_resume/epoch_001")
         self.assertTrue(args.resume_rollout_eval_only)
 
-    def test_parse_args_accepts_inline_rollout_eval_flag(self):
+    def test_parse_args_defaults_to_inline_rollout_eval(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
 
         args = train_saver_sft.parse_args(
@@ -365,11 +391,27 @@ class TrainSaverSftTests(unittest.TestCase):
                 "/tmp/sft_out",
                 "--eval-data",
                 "/tmp/eval.jsonl",
-                "--inline-rollout-eval",
             ]
         )
 
         self.assertTrue(args.inline_rollout_eval)
+
+    def test_parse_args_can_defer_rollout_eval_explicitly(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        args = train_saver_sft.parse_args(
+            [
+                "--prepared-data",
+                "/tmp/prepared.jsonl",
+                "--output-dir",
+                "/tmp/sft_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--defer-rollout-eval",
+            ]
+        )
+
+        self.assertFalse(args.inline_rollout_eval)
 
     def test_resolve_resume_epoch_index_from_epoch_resume_dir_name(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
@@ -679,6 +721,56 @@ class TrainSaverSftTests(unittest.TestCase):
         self.assertEqual(run_config["output_dir"], str(output_dir))
         self.assertAlmostEqual(summary["train_loss"], 0.123, places=6)
         self.assertEqual(summary["num_examples"], 1)
+
+    def test_main_passes_explicit_log_dir_and_rollout_eval_output_dir_to_weighted_sft(self):
+        self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")
+
+        prepared_example = {
+            "video_id": "prepared_case",
+            "split": "train",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                {"role": "user", "content": [{"type": "text", "text": "user"}]},
+            ],
+            "target_response": "<answer>{}</answer>",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prepared_path = root / "prepared.jsonl"
+            prepared_path.write_text(json.dumps(prepared_example) + "\n", encoding="utf-8")
+            output_dir = root / "sft_out"
+            log_dir = root / "logs" / "sft"
+            rollout_eval_output_dir = root / "eval" / "sft_epoch_end"
+            argv = [
+                "train_saver_sft.py",
+                "--prepared-data",
+                str(prepared_path),
+                "--output-dir",
+                str(output_dir),
+                "--log-dir",
+                str(log_dir),
+                "--eval-data",
+                str(root / "eval.jsonl"),
+                "--rollout-eval-output-dir",
+                str(rollout_eval_output_dir),
+            ]
+
+            with patch.object(sys, "argv", argv), patch.object(
+                train_saver_sft,
+                "run_weighted_sft",
+                return_value={"ok": True, "train_loss": 0.123},
+            ) as mocked_run_weighted_sft:
+                train_saver_sft.main()
+
+            run_config_path = log_dir / "train_saver_sft_run_config.json"
+            summary_path = log_dir / "train_saver_sft_summary.json"
+            self.assertTrue(run_config_path.exists())
+            self.assertTrue(summary_path.exists())
+
+        kwargs = mocked_run_weighted_sft.call_args.kwargs
+        self.assertEqual(kwargs["log_dir"], str(log_dir))
+        self.assertEqual(kwargs["rollout_eval_output_dir"], str(rollout_eval_output_dir))
 
     def test_main_can_annotate_verify_examples_with_teacher_judge_before_training(self):
         self.assertIsNotNone(train_saver_sft, "train_saver_sft.py is missing")

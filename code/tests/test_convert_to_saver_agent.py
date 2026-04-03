@@ -213,7 +213,7 @@ class ConvertToSaverAgentUnitTests(unittest.TestCase):
         }
 
         converted = ctsa.convert_record(record, mode="agent_train")
-        self.assertEqual(converted["schema_version"], "saver_agent.v1")
+        self.assertEqual(converted["schema_version"], "saver_agent.v2")
         self.assertEqual(converted["structured_target"]["existence"], "anomaly")
         self.assertEqual(converted["structured_target"]["category"], "robbery")
         self.assertEqual(converted["tool_io"]["allowed_tools"][0], "scan_timeline")
@@ -275,6 +275,57 @@ class ConvertToSaverAgentUnitTests(unittest.TestCase):
         self.assertEqual(queries[0]["alignment_source"], "weak_alignment")
         self.assertIn("ev1", queries[0]["linked_moment_ids"])
         self.assertIn("ev2", queries[0]["linked_moment_ids"])
+
+    def test_oracle_sft_seek_evidence_steps_emit_query_package(self):
+        record = {
+            "video_id": "sample_query_package",
+            "file_name": "sample_query_package.mp4",
+            "video_path": "data/sample_query_package.mp4",
+            "source_dataset": "MSAD",
+            "source_split": "anomaly_training",
+            "split": "train",
+            "frame_index_base": 1,
+            "video_meta": {"fps": 10.0, "width": 1280, "height": 720, "total_frames": 120, "duration_sec": 12.0},
+            "scene": {"scenario": "shop"},
+            "key_objects": ["person in a red shirt being attacked by the person in a black shirt"],
+            "label": {"is_anomaly": True, "category": "assault", "severity": 4, "hard_normal": False},
+            "temporal": {
+                "anomaly_interval_frames": [41, 90],
+                "precursor_interval_frames": [21, 40],
+                "earliest_alert_frame": 41,
+            },
+            "evidence": {
+                "evidence_moments": [
+                    {
+                        "moment_id": "ev1",
+                        "start_frame": 21,
+                        "end_frame": 40,
+                        "role": "precursor",
+                        "description": "A person in red approaches a person in black before the assault.",
+                    },
+                    {
+                        "moment_id": "ev2",
+                        "start_frame": 41,
+                        "end_frame": 50,
+                        "role": "trigger",
+                        "description": "The person in red attacks the person in black and the victim falls.",
+                    },
+                ]
+            },
+            "counterfactual": {"type": "remove_actor_interaction", "text": "No interaction, no assault."},
+            "language": {"summary": "An assault happens.", "rationale": "The attacker in red hits the victim in black."},
+            "qa_pairs": [],
+            "provenance": {"annotation_status": "qwen_preannotated"},
+            "qwen_preannotation": {"model_name": "Qwen3-VL-32B-Instruct"},
+        }
+
+        converted = ctsa.convert_record(record, mode="oracle_sft")
+        seek_steps = [step for step in converted["oracle_sft"]["trajectory"] if step.get("tool") == "seek_evidence"]
+
+        self.assertGreaterEqual(len(seek_steps), 1)
+        self.assertIn("query_package", seek_steps[0]["arguments"])
+        self.assertIn("event_cue", seek_steps[0]["arguments"]["query_package"])
+        self.assertIn("key_objects", seek_steps[0]["arguments"]["query_package"])
 
     def test_agent_train_conversion_downgrades_non_strict_precursor_roles(self):
         record = {

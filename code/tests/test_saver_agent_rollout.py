@@ -228,7 +228,7 @@ class SaverAgentRolloutRunnerTests(unittest.TestCase):
 
         turn = result["turns"][0]
         self.assertEqual(turn["tool_name"], "seek_evidence")
-        self.assertEqual(turn["proposal_backend"], "feature_topk")
+        self.assertEqual(turn["proposal_backend"], "siglip_dpp")
         self.assertEqual(turn["proposal_query_normalized"], "person in red shirt")
         self.assertTrue(turn["feature_cache_used"])
         self.assertEqual(turn["proposal_selected_frame_indices"], [2, 3])
@@ -427,8 +427,9 @@ class SaverAgentRolloutRunnerTests(unittest.TestCase):
             result = runner.run_episode(item, policy, initial_state=SaverEnvironmentState())
 
         verify_turn = result["turns"][1]
-        self.assertEqual(result["terminated_reason"], "answered")
+        self.assertEqual(result["terminated_reason"], "finalized")
         self.assertEqual(result["final_answer"]["existence"], "anomaly")
+        self.assertEqual(result["final_answer_source"], "finalize_case")
         self.assertEqual(verify_turn["verifier_primary_status"], "complete")
         self.assertEqual(verify_turn["verifier_recommended_action"], "finalize")
         self.assertEqual(verify_turn["verifier_verified_window_ids"], ["w0001"])
@@ -540,6 +541,32 @@ class SaverAgentRolloutRunnerTests(unittest.TestCase):
         self.assertEqual(result["terminated_reason"], "max_turns")
         self.assertIsNone(result["final_answer"])
         self.assertEqual(result["num_turns"], 1)
+
+    def test_runner_treats_finalize_case_as_terminal_and_populates_final_answer(self):
+        self.assertIsNotNone(ADAPTER_MODULE, "saver_agent.adapter module is missing")
+        self.assertIsNotNone(ROLLOUT_MODULE, "saver_agent.rollout module is missing")
+
+        runner = ROLLOUT_MODULE.SaverRolloutRunner(
+            environment=SaverVideoInteraction(),
+            adapter=ADAPTER_MODULE.TimeSearchRolloutAdapter(),
+            max_turns=1,
+        )
+        policy = ROLLOUT_MODULE.ReplayPolicy(
+            [
+                '<think>finalize</think><tool_call>{"name":"finalize_case","arguments":{"existence":"anomaly","category":"assault"}}</tool_call>',
+                '<think>done</think><answer>{"existence":"normal"}</answer>',
+            ]
+        )
+
+        result = runner.run_episode(self.item, policy, initial_state=SaverEnvironmentState())
+
+        self.assertEqual(result["terminated_reason"], "finalized")
+        self.assertEqual(result["final_answer"]["existence"], "anomaly")
+        self.assertEqual(result["final_answer"]["category"], "assault")
+        self.assertEqual(result["final_answer_source"], "finalize_case")
+        self.assertEqual(result["num_turns"], 1)
+        self.assertEqual(result["turns"][0]["tool_name"], "finalize_case")
+        self.assertTrue(result["termination_trace"]["final_answer_present"])
 
     def test_runner_appends_parse_error_observation_for_invalid_response(self):
         self.assertIsNotNone(ADAPTER_MODULE, "saver_agent.adapter module is missing")

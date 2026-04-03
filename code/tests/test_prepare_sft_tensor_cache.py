@@ -49,6 +49,10 @@ class PrepareSFTTensorCacheTests(unittest.TestCase):
             "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
             encoding="utf-8",
         )
+        Path(str(path) + ".meta.json").write_text(
+            json.dumps({"schema_version": 1, "preview": {}, "prompt": {}}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _fake_payload(*args, **kwargs):
@@ -57,6 +61,18 @@ class PrepareSFTTensorCacheTests(unittest.TestCase):
             "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
             "labels": torch.tensor([[-100, 2, 3]], dtype=torch.long),
         }
+
+    def test_resolve_num_workers_auto_scales_with_cpu_count_and_shards(self):
+        self.assertIsNotNone(prepare_sft_tensor_cache, "prepare_sft_tensor_cache.py is missing")
+
+        with patch("prepare_sft_tensor_cache.os.cpu_count", return_value=40):
+            workers = prepare_sft_tensor_cache._resolve_num_workers(
+                requested_num_workers=0,
+                num_examples=100,
+                num_shards=8,
+            )
+
+        self.assertEqual(workers, 5)
 
     def test_default_mode_preserves_legacy_manifest_and_summary_names(self):
         self.assertIsNotNone(prepare_sft_tensor_cache, "prepare_sft_tensor_cache.py is missing")
@@ -232,6 +248,72 @@ class PrepareSFTTensorCacheTests(unittest.TestCase):
             self.assertEqual(summary["num_examples_total"], 4)
             self.assertEqual(summary["num_built"], 0)
             self.assertEqual(summary["num_skipped_existing"], 2)
+
+    def test_parallel_mode_uses_executor_and_preserves_summary(self):
+        self.assertIsNotNone(prepare_sft_tensor_cache, "prepare_sft_tensor_cache.py is missing")
+
+        class _FakeExecutor:
+            created = False
+
+            def __init__(self, *, max_workers, initializer=None, initargs=()):
+                self.max_workers = max_workers
+                self.initializer = initializer
+                self.initargs = initargs
+                _FakeExecutor.created = True
+
+            def __enter__(self):
+                if self.initializer is not None:
+                    self.initializer(*self.initargs)
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def map(self, fn, iterable, chunksize=1):
+                for item in iterable:
+                    yield fn(item)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prepared_data = root / "prepared.jsonl"
+            output_dir = root / "tensor_cache"
+            self._write_prepared_data(prepared_data, num_examples=4)
+
+            with patch.object(prepare_sft_tensor_cache, "_PROCESS_POOL_EXECUTOR", _FakeExecutor), patch.object(
+                prepare_sft_tensor_cache, "_load_processor", return_value=object()
+            ), patch.object(
+                prepare_sft_tensor_cache, "build_processor_signature", return_value="fake_signature"
+            ), patch.object(
+                prepare_sft_tensor_cache,
+                "build_processor_signature_summary",
+                return_value={"processor_class": "FakeProcessor"},
+            ), patch.object(
+                prepare_sft_tensor_cache,
+                "materialize_example_for_training",
+                side_effect=lambda example, resolver=None: dict(example),
+            ), patch.object(
+                prepare_sft_tensor_cache,
+                "build_sft_tensor_cache_payload",
+                side_effect=self._fake_payload,
+            ):
+                prepare_sft_tensor_cache.main(
+                    [
+                        "--prepared-data",
+                        str(prepared_data),
+                        "--output-dir",
+                        str(output_dir),
+                        "--progress-every",
+                        "0",
+                        "--num-workers",
+                        "2",
+                    ]
+                )
+
+            self.assertTrue(_FakeExecutor.created)
+            summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["num_examples"], 4)
+            self.assertEqual(summary["num_built"], 4)
+            self.assertEqual(summary["num_workers"], 2)
 
     def test_invalid_shard_index_raises(self):
         self.assertIsNotNone(prepare_sft_tensor_cache, "prepare_sft_tensor_cache.py is missing")

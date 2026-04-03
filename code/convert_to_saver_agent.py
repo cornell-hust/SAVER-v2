@@ -25,11 +25,16 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from split_utils import parse_include_splits
 from saver_agent.categories import CANONICAL_POLICY_CATEGORIES, canonicalize_saver_category
-from saver_agent.proposal import build_proposal_supervision, select_query_for_moment
+from saver_agent.proposal import (
+    build_proposal_supervision,
+    normalize_query_package,
+    normalize_query_text,
+    select_query_for_moment,
+)
 from saver_agent.self_verification import build_policy_self_verification_payload
 
 
-SCHEMA_VERSION = "saver_agent.v1"
+SCHEMA_VERSION = "saver_agent.v2"
 ALLOWED_TOOLS = [
     "scan_timeline",
     "seek_evidence",
@@ -599,6 +604,123 @@ class CanonicalSaverAdapter:
             f"{target_text}"
         )
 
+    @staticmethod
+    def _select_proposal_query_group(
+        moment: Dict[str, Any],
+        *,
+        proposal_supervision: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(proposal_supervision, dict):
+            return None
+        moment_id = str(moment.get("moment_id") or "")
+        role = str(moment.get("role") or "")
+        moment_tokens = {
+            token
+            for token in normalize_query_text(f"{moment.get('description') or ''} {role}").split()
+            if token
+        }
+        best_group: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+        for query_group in proposal_supervision.get("queries") or []:
+            linked_moment_ids = {str(value) for value in query_group.get("linked_moment_ids") or [] if value}
+            linked_roles = {str(value) for value in query_group.get("linked_roles") or [] if value}
+            if moment_id and linked_moment_ids and moment_id not in linked_moment_ids and role not in linked_roles:
+                continue
+            score = 0.0
+            if moment_id and moment_id in linked_moment_ids:
+                score += 4.0
+            if role and role in linked_roles:
+                score += 2.0
+            best_entry_score = 0.0
+            for entry in query_group.get("normalized_queries") or []:
+                text = str(entry.get("text") or "").strip()
+                if not text:
+                    continue
+                query_tokens = {
+                    token
+                    for token in normalize_query_text(text).split()
+                    if token
+                }
+                overlap = len(query_tokens & moment_tokens) / float(max(len(query_tokens), 1)) if query_tokens else 0.0
+                best_entry_score = max(best_entry_score, float(entry.get("weight") or 0.0) + overlap)
+            score += best_entry_score
+            if score > best_score:
+                best_score = score
+                best_group = dict(query_group)
+        return best_group
+
+    @staticmethod
+    def _generic_hypothesis_for_role(role: str) -> str:
+        if role == "precursor":
+            return "suspected pre-anomaly cue"
+        if role in {"trigger", "peak_action"}:
+            return "suspected actionable event"
+        if role == "confirmation":
+            return "suspected anomaly confirmation"
+        if role == "normal_check":
+            return "check whether this interval remains normal"
+        if role == "context":
+            return "suspected anomaly context"
+        return "suspected anomaly evidence"
+
+    def _build_generic_query_package(
+        self,
+        base: Dict[str, Any],
+        *,
+        role: str,
+        query_text: str,
+        query_source: str,
+        key_objects: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        scene_context = str((base.get("scene") or {}).get("scenario") or "").strip()
+        return normalize_query_package(
+            {
+                "event_cue": str(query_text or "").strip(),
+                "key_objects": list(key_objects or []),
+                "scene_context": scene_context,
+                "hypothesis": self._generic_hypothesis_for_role(role),
+                "negative_constraints": [],
+                "rewrite_reason": str(query_source or "role_fallback"),
+            },
+            fallback_query=str(query_text or "").strip(),
+            fallback_scene_context=scene_context,
+            rewrite_reason=str(query_source or "role_fallback"),
+        )
+
+    def _build_query_package_for_moment(
+        self,
+        base: Dict[str, Any],
+        *,
+        moment: Dict[str, Any],
+        query_text: str,
+        query_source: str,
+        proposal_supervision: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        role = str(moment.get("role") or "")
+        query_group = self._select_proposal_query_group(moment, proposal_supervision=proposal_supervision)
+        normalized_entries = list((query_group or {}).get("normalized_queries") or [])
+        event_candidates = [
+            str(entry.get("text") or "").strip()
+            for entry in normalized_entries
+            if str(entry.get("kind") or "").strip() == "event_relation" and str(entry.get("text") or "").strip()
+        ]
+        key_object_candidates = [
+            str(entry.get("text") or "").strip()
+            for entry in normalized_entries
+            if str(entry.get("kind") or "").strip() in {"object", "attribute_object"}
+            and str(entry.get("text") or "").strip()
+        ]
+        event_cue = event_candidates[0] if event_candidates else str(query_text or "").strip()
+        if not key_object_candidates and query_text and query_text != event_cue:
+            key_object_candidates = [str(query_text).strip()]
+        return self._build_generic_query_package(
+            base,
+            role=role,
+            query_text=event_cue or str(query_text or "").strip(),
+            query_source=query_source,
+            key_objects=key_object_candidates[:4],
+        )
+
     def _build_oracle_sft(self, base: Dict[str, Any]) -> Dict[str, Any]:
         trajectory: List[Dict[str, Any]] = []
         language = base.get("language") or {}
@@ -663,6 +785,7 @@ class CanonicalSaverAdapter:
             def append_real_seek(moment: Dict[str, Any]) -> None:
                 runtime_ref = append_step(
                     self._seek_evidence_step(
+                        base,
                         moment,
                         category=category,
                         proposal_supervision=proposal_supervision,
@@ -963,6 +1086,7 @@ class CanonicalSaverAdapter:
 
     def _seek_evidence_step(
         self,
+        base: Dict[str, Any],
         moment: Dict[str, Any],
         *,
         category: str,
@@ -975,10 +1099,18 @@ class CanonicalSaverAdapter:
             proposal_supervision=proposal_supervision,
             fallback_query=fallback_query,
         )
+        query_package = self._build_query_package_for_moment(
+            base,
+            moment=moment,
+            query_text=query_text,
+            query_source=query_source,
+            proposal_supervision=proposal_supervision,
+        )
         return {
             "tool": "seek_evidence",
             "arguments": {
                 "query": query_text,
+                "query_package": query_package,
                 "start_sec": moment["start_sec"],
                 "end_sec": moment["end_sec"],
                 "moment_id": moment["moment_id"],
@@ -1015,6 +1147,7 @@ class CanonicalSaverAdapter:
                     "start_sec": precursor_interval[0],
                     "end_sec": precursor_interval[1],
                     "role": "precursor",
+                    "query_source": "oracle_role_fallback",
                 }
             )
         candidate_specs.extend(
@@ -1024,24 +1157,28 @@ class CanonicalSaverAdapter:
                     "start_sec": anomaly_start + 0.15 * anomaly_span,
                     "end_sec": anomaly_start + 0.55 * anomaly_span,
                     "role": "peak_action",
+                    "query_source": "oracle_role_fallback",
                 },
                 {
                     "query": self._query_for_role("confirmation", category),
                     "start_sec": max(anomaly_start, anomaly_end - max(0.35 * anomaly_span, 0.5)),
                     "end_sec": anomaly_end,
                     "role": "confirmation",
+                    "query_source": "oracle_role_fallback",
                 },
                 {
                     "query": "look for broader temporal context around the suspected anomaly",
                     "start_sec": max(0.0, anomaly_start - max(0.15 * anomaly_span, 0.5)),
                     "end_sec": min(duration, anomaly_end + max(0.15 * anomaly_span, 0.5)),
                     "role": "context",
+                    "query_source": "oracle_context_broad",
                 },
                 {
                     "query": "look for the full temporal context of the suspected anomaly",
                     "start_sec": anomaly_start,
                     "end_sec": anomaly_end,
                     "role": "context",
+                    "query_source": "oracle_context_full",
                 },
             ]
         )
@@ -1063,9 +1200,16 @@ class CanonicalSaverAdapter:
                     "tool": "seek_evidence",
                     "arguments": {
                         "query": spec["query"],
+                        "query_package": self._build_generic_query_package(
+                            base,
+                            role=str(spec.get("role") or ""),
+                            query_text=str(spec["query"]),
+                            query_source=str(spec.get("query_source") or "oracle_role_fallback"),
+                        ),
                         "start_sec": start_sec,
                         "end_sec": end_sec,
                         "role": spec.get("role"),
+                        "query_source": spec.get("query_source"),
                     },
                 }
             )
@@ -1095,6 +1239,12 @@ class CanonicalSaverAdapter:
                     "tool": "seek_evidence",
                     "arguments": {
                         "query": f"check whether segment {idx + 1} contains any actionable anomaly evidence or supports a normal conclusion",
+                        "query_package": self._build_generic_query_package(
+                            base,
+                            role="normal_check",
+                            query_text=f"check whether segment {idx + 1} contains any actionable anomaly evidence or supports a normal conclusion",
+                            query_source="oracle_normal_search",
+                        ),
                         "start_sec": start_sec,
                         "end_sec": end_sec,
                         "role": "normal_check",

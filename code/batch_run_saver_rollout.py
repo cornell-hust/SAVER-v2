@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -20,6 +21,8 @@ from saver_agent.config import (
     SaverAgentConfig,
 )
 from saver_agent.dataset import SaverAgentDataset
+from saver_agent.experiment_logging import resolve_experiment_log_dir, utc_timestamp, write_json
+from saver_agent.offline_scoring import load_rollout_records
 from saver_agent.proposal import SiglipFeatureEncoder
 from saver_agent.qwen_policy import DEFAULT_MODEL_PATH, QwenGenerationPolicy
 from saver_agent.qwen_verifier import DEFAULT_VERIFIER_MODEL_PATH, QwenSelfVerifier
@@ -52,7 +55,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Number of samples to roll out from start-index. Use 0 to run until the end of the filtered dataset.",
     )
-    parser.add_argument("--max-turns", type=int, default=12, help="Maximum rollout turns per sample.")
+    parser.add_argument("--max-turns", type=int, default=14, help="Maximum rollout turns per sample.")
     parser.add_argument(
         "--policy-backend",
         choices=["replay", "qwen"],
@@ -90,6 +93,18 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_TOTAL_VISUAL_BUDGET,
         help="Optional hard cap on total images preserved in the rollout prompt. 0 keeps all images.",
     )
+    parser.add_argument(
+        "--max-image-side",
+        type=int,
+        default=0,
+        help="Optional rollout-time max image side length in pixels. 0 disables resizing.",
+    )
+    parser.add_argument(
+        "--max-image-pixels",
+        type=int,
+        default=0,
+        help="Optional rollout-time max image area in pixels. 0 disables resizing.",
+    )
     parser.add_argument("--do-sample", action="store_true", help="Enable sampling for Qwen policy.")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
     parser.add_argument("--top-p", type=float, default=None, help="Sampling top-p.")
@@ -121,6 +136,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Batch rollout output path (.jsonl, .json, or directory).",
     )
+    parser.add_argument("--log-dir", default="", help="Optional directory for batch rollout logs.")
     parser.add_argument("--num-shards", type=int, default=0, help="Optional number of shard workers.")
     parser.add_argument("--shard-index", type=int, default=-1, help="Optional shard index for this process.")
     parser.add_argument("--progress-every", type=int, default=1, help="Log rollout progress every N local samples.")
@@ -260,6 +276,8 @@ def _build_qwen_policy(args: argparse.Namespace, *, runtime: Any) -> QwenGenerat
         attn_implementation=args.attn_implementation or None,
         max_new_tokens=args.max_new_tokens,
         max_total_images=(args.max_total_images if int(args.max_total_images) > 0 else args.total_visual_budget),
+        max_image_side=args.max_image_side,
+        max_image_pixels=args.max_image_pixels,
         do_sample=args.do_sample,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -318,12 +336,76 @@ def _save_batch_results(records: List[Dict[str, Any]], output_path: Path) -> Non
         file_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _wait_for_sharded_outputs(
+    output_path: str | Path,
+    *,
+    expected_counts: List[int],
+    timeout_sec: float = 1800.0,
+    poll_interval_sec: float = 1.0,
+) -> None:
+    base_output_path = Path(output_path)
+    deadline = time.time() + max(1.0, float(timeout_sec))
+    shard_status: Dict[str, str] = {}
+    num_shards = len(expected_counts)
+    while time.time() < deadline:
+        all_ready = True
+        shard_status.clear()
+        for shard_index, expected_count in enumerate(expected_counts):
+            shard_output_path = sharded_output_path(
+                base_output_path,
+                num_shards=num_shards,
+                shard_index=shard_index,
+            )
+            if not shard_output_path.exists():
+                all_ready = False
+                shard_status[str(shard_output_path)] = "missing"
+                continue
+            try:
+                shard_records, _ = load_rollout_records(shard_output_path)
+            except Exception as exc:
+                all_ready = False
+                shard_status[str(shard_output_path)] = f"unreadable: {exc}"
+                continue
+            if len(shard_records) != int(expected_count):
+                all_ready = False
+                shard_status[str(shard_output_path)] = f"records={len(shard_records)}/{int(expected_count)}"
+                continue
+            shard_status[str(shard_output_path)] = "ready"
+        if all_ready:
+            return
+        time.sleep(max(0.05, float(poll_interval_sec)))
+    raise TimeoutError(
+        "Timed out while waiting for sharded batch-rollout outputs to become ready: "
+        + json.dumps(shard_status, ensure_ascii=False)
+    )
+
+
+def _merge_sharded_outputs(output_path: str | Path, *, num_shards: int) -> List[Dict[str, Any]]:
+    base_output_path = Path(output_path)
+    if int(num_shards) <= 1:
+        records, _ = load_rollout_records(base_output_path)
+        return records
+    merged_records: List[Dict[str, Any]] = []
+    for shard_index in range(int(num_shards)):
+        shard_output_path = sharded_output_path(
+            base_output_path,
+            num_shards=int(num_shards),
+            shard_index=shard_index,
+        )
+        shard_records, _ = load_rollout_records(shard_output_path)
+        merged_records.extend(shard_records)
+    merged_records.sort(key=lambda record: (int(record.get("dataset_index", 0) or 0), str(record.get("video_id") or "")))
+    _save_batch_results(merged_records, base_output_path)
+    return merged_records
+
+
 def main() -> None:
     args = parse_args()
     if args.policy_backend == "replay" and not args.response:
         raise SystemExit("At least one --response is required for replay rollout.")
 
     runtime = distributed_runtime_from_env()
+    log_dir = resolve_experiment_log_dir(args.log_dir, fallback_paths=[args.output])
     shard_spec = resolve_shard_spec(num_shards=args.num_shards, shard_index=args.shard_index, runtime=runtime)
     config = _build_config(args)
     dataset = SaverAgentDataset(
@@ -343,6 +425,23 @@ def main() -> None:
     output_path = sharded_output_path(args.output, num_shards=shard_spec.num_shards, shard_index=shard_spec.shard_index)
     effective_policy_device_map = resolve_inference_device_map(args.device_map, runtime=runtime)
     effective_verifier_device_map = resolve_inference_device_map(args.verifier_device_map, runtime=runtime)
+    if runtime.is_main_process and log_dir is not None:
+        write_json(
+            log_dir / "batch_run_saver_rollout_run_config.json",
+            {
+                "timestamp_utc": utc_timestamp(),
+                "data": args.data,
+                "data_root": args.data_root,
+                "include_splits": parse_include_splits(args.include_splits) or [],
+                "output": args.output,
+                "log_dir": str(log_dir),
+                "policy_backend": args.policy_backend,
+                "model_path": args.model_path,
+                "proposal_model_path": args.proposal_model_path,
+                "max_turns": int(args.max_turns),
+                "max_new_tokens": int(args.max_new_tokens),
+            },
+        )
 
     runtime_log(
         "batch rollout startup: "
@@ -406,6 +505,34 @@ def main() -> None:
 
     _save_batch_results(results, output_path)
     runtime_log(f"saved {len(results)} rollout records to {output_path}", runtime=runtime)
+    merged_result_count = len(results)
+    if shard_spec.is_sharded and runtime.is_main_process:
+        expected_counts = [
+            len(shard_sequence(indices, num_shards=shard_spec.num_shards, shard_index=shard_index))
+            for shard_index in range(int(shard_spec.num_shards))
+        ]
+        _wait_for_sharded_outputs(
+            args.output,
+            expected_counts=expected_counts,
+        )
+        merged_records = _merge_sharded_outputs(args.output, num_shards=shard_spec.num_shards)
+        merged_result_count = len(merged_records)
+        runtime_log(
+            f"merged {merged_result_count} sharded rollout records into {args.output}",
+            runtime=runtime,
+            main_process_only=True,
+        )
+    if runtime.is_main_process and log_dir is not None:
+        write_json(
+            log_dir / "batch_run_saver_rollout_summary.json",
+            {
+                "timestamp_utc": utc_timestamp(),
+                "output_path": str(args.output if shard_spec.is_sharded else output_path),
+                "num_results": int(merged_result_count),
+                "num_local_indices": len(local_indices),
+                "num_shards": int(shard_spec.num_shards),
+            },
+        )
 
 
 if __name__ == "__main__":

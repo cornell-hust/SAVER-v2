@@ -189,6 +189,40 @@ class SaverAgentRewardTests(unittest.TestCase):
         self.assertLess(retry_reward["components"]["invalid_attempt_penalty"], 0.0)
         self.assertLess(retry_reward["total_reward"], clean_reward["total_reward"])
 
+    def test_reward_accepts_finalized_case_as_terminal_decision_artifact(self):
+        reward = score_rollout_trace(
+            {
+                "terminated_reason": "finalized",
+                "num_turns": 2,
+                "final_answer": None,
+                "state": {"finalized_case": {"existence": "anomaly", "category": "assault"}},
+                "turns": [
+                    {
+                        "step_index": 1,
+                        "tool_name": "verify_hypothesis",
+                        "verifier_primary_status": "complete",
+                        "verifier_alert_status": "justified",
+                        "verifier_recommended_action": "finalize",
+                        "verifier_derived_scores": {
+                            "sufficiency": 0.9,
+                            "necessity": 0.7,
+                            "consistency": 0.9,
+                            "alertability": 0.8,
+                            "counterfactual_faithfulness": 0.75,
+                        },
+                    },
+                    {
+                        "step_index": 2,
+                        "tool_name": "finalize_case",
+                        "valid_action": True,
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(reward["components"]["decision_reward"], 1.0)
+        self.assertGreaterEqual(reward["components"]["protocol_reward"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

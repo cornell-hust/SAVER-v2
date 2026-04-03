@@ -20,6 +20,40 @@ class FullPipelineScriptTests(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+    def _write_fake_torchrun(self, fake_bin: Path) -> None:
+        fake_torchrun = textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import os
+            import sys
+            from pathlib import Path
+
+            log_path = Path(os.environ["FAKE_CMD_LOG"])
+            argv = sys.argv[1:]
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write("torchrun " + " ".join(argv) + "\\n")
+
+            filtered = []
+            skip_next = False
+            for arg in argv:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg in {"--standalone", "--no-python"}:
+                    continue
+                if arg in {"--nproc_per_node", "--nnodes", "--node_rank", "--master_addr", "--master_port"}:
+                    skip_next = True
+                    continue
+                if arg.startswith("--nproc_per_node="):
+                    continue
+                filtered.append(arg)
+
+            python_bin = Path(sys.argv[0]).with_name("python")
+            os.execv(str(python_bin), [str(python_bin), *filtered])
+            """
+        )
+        self._write_executable(fake_bin / "torchrun", fake_torchrun)
+
     def _write_complete_checkpoint(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         (path / "adapter_config.json").write_text("{}", encoding="utf-8")
@@ -59,7 +93,7 @@ class FullPipelineScriptTests(unittest.TestCase):
         summary_exists: bool = False,
         teacher_model_exists: bool = False,
         extra_env: dict[str, str] | None = None,
-    ) -> tuple[subprocess.CompletedProcess[str], str, str]:
+    ) -> tuple[subprocess.CompletedProcess[str], str, str, dict[str, str]]:
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             exp_root = base / "exp"
@@ -69,30 +103,32 @@ class FullPipelineScriptTests(unittest.TestCase):
             annotation_dir = data_utils_dir
             if exp_name:
                 run_base_dir = experiment_base_dir / exp_name
-                artifact_dir = run_base_dir / "train_artifacts"
                 checkpoint_dir = run_base_dir / "checkpoints"
-                rollout_dir = run_base_dir / "rollouts" / "sft_rollout_eval"
+                sft_checkpoint_root = checkpoint_dir / "sft"
+                rl_checkpoint_root = checkpoint_dir / "rl"
+                sft_eval_dir = run_base_dir / "eval" / "sft_epoch_end"
+                rollout_dir = run_base_dir / "eval" / "batch_rollout" / "sft_rollout_eval"
             else:
-                artifact_dir = exp_root / "train_artifacts"
                 checkpoint_dir = exp_root / "checkpoints"
-                rollout_dir = exp_root / "rollouts" / "sft_rollout_eval"
+                sft_checkpoint_root = checkpoint_dir / "sft"
+                rl_checkpoint_root = checkpoint_dir / "rl"
+                sft_eval_dir = exp_root / "eval" / "sft_epoch_end"
+                rollout_dir = exp_root / "eval" / "batch_rollout" / "sft_rollout_eval"
             model_root = base / "models"
-            sft_output_dir = checkpoint_dir / "saver_sft_qwen3vl_8b_eval_ddp"
+            sft_output_dir = sft_checkpoint_root / "saver_sft_qwen3vl_8b_eval_ddp"
+            rl_output_dir = rl_checkpoint_root / "saver_cea_grpo_v1"
             raw_rollout_output = rollout_dir / "rollouts.raw.jsonl"
             scored_rollout_output = rollout_dir / "rollouts.scored.jsonl"
             rollout_summary_output = rollout_dir / "summary.json"
 
             annotation_dir.mkdir(parents=True, exist_ok=True)
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            rollout_dir.mkdir(parents=True, exist_ok=True)
             (model_root / "qwen3-vl-8b-Instruct").mkdir(parents=True, exist_ok=True)
             if teacher_model_exists:
                 (model_root / "Qwen3-VL-32B-Instruct").mkdir(parents=True, exist_ok=True)
 
-            self._touch_jsonl(annotation_dir / "msad_saver_agent_train.jsonl")
-            self._touch_jsonl(annotation_dir / "msad_saver_oracle_sft.jsonl")
-            self._touch_jsonl(data_utils_dir / "msad_saver_agent_train.prepared_sft.jsonl")
+            self._touch_jsonl(annotation_dir / "msad_saver_runtime_train.jsonl")
+            self._touch_jsonl(annotation_dir / "msad_saver_runtime_test.jsonl")
+            self._touch_jsonl(data_utils_dir / "msad_saver_sft_train.jsonl")
 
             if sft_root_complete:
                 self._write_complete_checkpoint(sft_output_dir)
@@ -113,7 +149,7 @@ class FullPipelineScriptTests(unittest.TestCase):
                     num_train_epochs=sft_resume_num_train_epochs,
                 )
             if sft_eval_epoch_exists is not None:
-                eval_metrics_path = sft_output_dir / "rollout_eval" / f"epoch_{sft_eval_epoch_exists:03d}" / "metrics.json"
+                eval_metrics_path = sft_eval_dir / f"epoch_{sft_eval_epoch_exists:03d}" / "metrics.json"
                 eval_metrics_path.parent.mkdir(parents=True, exist_ok=True)
                 eval_metrics_path.write_text("{}", encoding="utf-8")
 
@@ -180,7 +216,8 @@ class FullPipelineScriptTests(unittest.TestCase):
                     )
 
                 def write_rollout_eval_metrics(output_dir: str, resume_path: str) -> None:
-                    if not output_dir or not resume_path:
+                    eval_output_dir = arg_value("--rollout-eval-output-dir") or output_dir
+                    if not eval_output_dir or not resume_path:
                         return
                     resume_dir = Path(resume_path)
                     epoch_index = 0
@@ -192,11 +229,21 @@ class FullPipelineScriptTests(unittest.TestCase):
                             epoch_index = 0
                     if epoch_index <= 0:
                         epoch_index = 1
-                    metrics_path = Path(output_dir) / "rollout_eval" / f"epoch_{epoch_index:03d}" / "metrics.json"
+                    metrics_path = Path(eval_output_dir) / f"epoch_{epoch_index:03d}" / "metrics.json"
                     metrics_path.parent.mkdir(parents=True, exist_ok=True)
                     metrics_path.write_text("{}", encoding="utf-8")
 
-                if script_name == "train_saver_sft.py":
+                if script_name == "build_saver_data.py":
+                    prepared_output = arg_value("--sft-train-output")
+                    write_file(arg_value("--runtime-train-output"), "{}\\n")
+                    write_file(arg_value("--runtime-test-output"), "{}\\n")
+                    write_file(prepared_output, "{}\\n")
+                    write_file(prepared_output + ".meta.json", "{\\\"schema_version\\\": 1, \\\"preview\\\": {}, \\\"prompt\\\": {}}")
+                    teacher_output = arg_value("--teacher-output")
+                    if teacher_output:
+                        write_file(teacher_output, "{}\\n")
+                        write_file(teacher_output + ".meta.json", "{\\\"schema_version\\\": 1, \\\"preview\\\": {}, \\\"prompt\\\": {}, \\\"teacher_annotated\\\": true}")
+                elif script_name == "train_saver_sft.py":
                     if "--resume-rollout-eval-only" in args:
                         write_rollout_eval_metrics(arg_value("--output-dir"), arg_value("--resume-from-checkpoint"))
                     else:
@@ -217,6 +264,7 @@ class FullPipelineScriptTests(unittest.TestCase):
                 """
             )
             self._write_executable(fake_bin / "python", fake_python)
+            self._write_fake_torchrun(fake_bin)
 
             env = os.environ.copy()
             env.update(
@@ -243,10 +291,18 @@ class FullPipelineScriptTests(unittest.TestCase):
                 capture_output=True,
                 check=False,
             )
-            return result, log_path.read_text(encoding="utf-8"), str(sft_output_dir)
+            details = {
+                "sft_output_dir": str(sft_output_dir),
+                "rl_output_dir": str(rl_output_dir),
+                "rollout_dir": str(rollout_dir),
+                "sft_eval_dir": str(sft_eval_dir),
+                "legacy_artifacts_dir": str(run_base_dir / "train_artifacts") if exp_name else str(exp_root / "train_artifacts"),
+                "legacy_rollouts_dir": str(run_base_dir / "rollouts") if exp_name else str(exp_root / "rollouts"),
+            }
+            return result, log_path.read_text(encoding="utf-8"), str(sft_output_dir), details
 
     def test_full_pipeline_skips_sft_and_stage3_when_prior_artifacts_are_complete(self):
-        result, log_text, sft_output_dir = self._run_pipeline(
+        result, log_text, sft_output_dir, _ = self._run_pipeline(
             sft_checkpoint_step=1200,
             raw_rollout_exists=True,
             scored_rollout_exists=True,
@@ -258,13 +314,22 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertNotIn("batch_run_saver_rollout.py", log_text)
         self.assertNotIn("score_saver_rollout.py", log_text)
         self.assertNotIn("summarize_saver_scores.py", log_text)
+
+    def test_full_pipeline_uses_torchrun_for_stage4_batch_rollout_when_rollout_nproc_gt_one(self):
+        result, log_text, sft_output_dir, _ = self._run_pipeline(
+            sft_checkpoint_step=1200,
+            extra_env={"ROLLOUT_NPROC_PER_NODE": "4"},
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
+        self.assertIn("torchrun --standalone --nproc_per_node=4 batch_run_saver_rollout.py", log_text)
         self.assertIn("train_saver_rl.py", log_text)
         self.assertIn(f"--model-path {sft_output_dir}/checkpoint-1200", log_text)
         self.assertIn(f"--reference-model-path {sft_output_dir}/checkpoint-1200", log_text)
         self.assertIn("--cea-local-verifier-backend self_teacher", log_text)
 
     def test_full_pipeline_skips_sft_but_resumes_stage3_before_rl_when_rollout_artifacts_missing(self):
-        result, log_text, sft_output_dir = self._run_pipeline(
+        result, log_text, sft_output_dir, _ = self._run_pipeline(
             sft_checkpoint_step=800,
             raw_rollout_exists=False,
             scored_rollout_exists=False,
@@ -283,7 +348,7 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertIn(f"--model-path {sft_output_dir}/checkpoint-800", log_text)
 
     def test_full_pipeline_replays_missing_sft_rollout_eval_from_epoch_resume_checkpoint(self):
-        result, log_text, sft_output_dir = self._run_pipeline(
+        result, log_text, sft_output_dir, _ = self._run_pipeline(
             sft_resume_epoch=1,
             sft_resume_num_train_epochs=1.0,
             raw_rollout_exists=True,
@@ -299,7 +364,7 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertNotIn("score_saver_rollout.py", log_text)
 
     def test_full_pipeline_runs_external_eval_after_fresh_sft_training(self):
-        result, log_text, sft_output_dir = self._run_pipeline(
+        result, log_text, sft_output_dir, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=True,
             scored_rollout_exists=True,
@@ -307,13 +372,13 @@ class FullPipelineScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
-        self.assertEqual(log_text.count("train_saver_sft.py"), 2)
+        self.assertEqual(log_text.count("train_saver_sft.py"), 1)
         self.assertIn(f"--output-dir {sft_output_dir}", log_text)
-        self.assertNotIn("--inline-rollout-eval", log_text)
-        self.assertIn("--resume-rollout-eval-only", log_text)
+        self.assertIn("--inline-rollout-eval", log_text)
+        self.assertNotIn("--resume-rollout-eval-only", log_text)
 
     def test_full_pipeline_replays_missing_eval_then_resumes_remaining_sft_epochs(self):
-        result, log_text, sft_output_dir = self._run_pipeline(
+        result, log_text, sft_output_dir, _ = self._run_pipeline(
             sft_resume_epoch=1,
             sft_resume_num_train_epochs=2.0,
             raw_rollout_exists=True,
@@ -327,7 +392,7 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertIn(f"--resume-from-checkpoint {sft_output_dir}/epoch_resume/epoch_001", log_text)
 
     def test_full_pipeline_resumes_sft_training_from_latest_checkpoint(self):
-        result, log_text, sft_output_dir = self._run_pipeline(
+        result, log_text, sft_output_dir, _ = self._run_pipeline(
             sft_checkpoint_step=640,
             sft_checkpoint_epoch=0.5,
             raw_rollout_exists=True,
@@ -338,11 +403,11 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
         self.assertIn("train_saver_sft.py", log_text)
         self.assertIn(f"--resume-from-checkpoint {sft_output_dir}/checkpoint-640", log_text)
-        self.assertNotIn("--inline-rollout-eval", log_text)
-        self.assertIn("--resume-rollout-eval-only", log_text)
+        self.assertIn("--inline-rollout-eval", log_text)
+        self.assertNotIn("--resume-rollout-eval-only", log_text)
 
     def test_full_pipeline_passes_sft_text_budget_flags_when_overridden(self):
-        result, log_text, _ = self._run_pipeline(
+        result, log_text, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=True,
             scored_rollout_exists=True,
@@ -359,7 +424,7 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertIn("--keep-recent-text-messages 16", log_text)
 
     def test_full_pipeline_passes_eval_budget_flags_by_default(self):
-        result, log_text, _ = self._run_pipeline(
+        result, log_text, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=True,
             scored_rollout_exists=True,
@@ -368,25 +433,45 @@ class FullPipelineScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
         self.assertIn("--eval-max-new-tokens-per-turn 256", log_text)
-        self.assertIn("--eval-max-total-images 24", log_text)
-        self.assertNotIn("--inline-rollout-eval", log_text)
+        self.assertIn("--eval-max-total-images 28", log_text)
+        self.assertIn("--max-image-side 640", log_text)
+        self.assertIn("--max-total-images 28", log_text)
+        self.assertIn("--max-seq-length 6144", log_text)
+        self.assertIn("--keep-recent-text-messages 20", log_text)
+        self.assertIn("--inline-rollout-eval", log_text)
+        self.assertNotIn("--defer-rollout-eval", log_text)
 
-    def test_full_pipeline_can_reenable_inline_rollout_eval_explicitly(self):
-        result, log_text, _ = self._run_pipeline(
+    def test_full_pipeline_passes_rollout_resize_budget_flags_by_default(self):
+        result, log_text, _, _ = self._run_pipeline(
+            sft_root_complete=False,
+            raw_rollout_exists=False,
+            scored_rollout_exists=False,
+            summary_exists=False,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
+        self.assertIn("batch_run_saver_rollout.py", log_text)
+        self.assertIn("--max-image-side 640", log_text)
+        self.assertIn("--max-image-pixels 0", log_text)
+        self.assertIn("--max-total-images 28", log_text)
+
+    def test_full_pipeline_can_defer_inline_rollout_eval_explicitly(self):
+        result, log_text, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=True,
             scored_rollout_exists=True,
             summary_exists=True,
             extra_env={
-                "SFT_INLINE_ROLLOUT_EVAL": "1",
+                "SFT_INLINE_ROLLOUT_EVAL": "0",
             },
         )
 
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
-        self.assertIn("--inline-rollout-eval", log_text)
+        self.assertIn("--defer-rollout-eval", log_text)
+        self.assertNotIn("--inline-rollout-eval", log_text)
 
     def test_full_pipeline_builds_caches_and_passes_proposal_runtime_when_enabled(self):
-        result, log_text, _ = self._run_pipeline(
+        result, log_text, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=False,
             scored_rollout_exists=False,
@@ -407,7 +492,7 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertLess(log_text.index("train_saver_sft.py"), log_text.index("batch_run_saver_rollout.py"))
 
     def test_full_pipeline_uses_experiment_name_to_relocate_outputs(self):
-        result, log_text, sft_output_dir = self._run_pipeline(
+        result, log_text, sft_output_dir, details = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=False,
             scored_rollout_exists=False,
@@ -418,13 +503,17 @@ class FullPipelineScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
-        self.assertIn("/data_utils/msad_saver_agent_train.prepared_sft.jsonl", log_text)
-        self.assertNotIn("/runs/exp1/train_artifacts/msad_saver_agent_train.prepared_sft.jsonl", log_text)
+        self.assertIn("/data_utils/msad_saver_sft_train.jsonl", log_text)
+        self.assertNotIn("/runs/exp1/train_artifacts/msad_saver_sft_train.jsonl", log_text)
         self.assertIn(f"--output-dir {sft_output_dir}", log_text)
-        self.assertIn("/runs/exp1/rollouts/sft_rollout_eval/rollouts.raw.jsonl", log_text)
+        self.assertIn("/runs/exp1/eval/batch_rollout/sft_rollout_eval/rollouts.raw.jsonl", log_text)
+        self.assertIn("/runs/exp1/eval/sft_epoch_end", log_text)
+        self.assertIn("/runs/exp1/logs/sft", log_text)
+        self.assertFalse(Path(details["legacy_artifacts_dir"]).exists())
+        self.assertFalse(Path(details["legacy_rollouts_dir"]).exists())
 
     def test_full_pipeline_keeps_cache_summaries_in_data_utils_even_with_experiment_name(self):
-        result, log_text, _ = self._run_pipeline(
+        result, log_text, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=False,
             scored_rollout_exists=False,
@@ -438,13 +527,15 @@ class FullPipelineScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
-        self.assertIn("/data_utils/frame_cache_summary.json", log_text)
-        self.assertIn("/data_utils/feature_cache_summary.json", log_text)
+        self.assertIn("/data_utils/frame_cache_summary.train.json", log_text)
+        self.assertIn("/data_utils/frame_cache_summary.test.json", log_text)
+        self.assertIn("/data_utils/feature_cache_summary.train.json", log_text)
+        self.assertIn("/data_utils/feature_cache_summary.test.json", log_text)
         self.assertNotIn("/runs/exp1/train_artifacts/frame_cache_summary.json", log_text)
         self.assertNotIn("/runs/exp1/train_artifacts/feature_cache_summary.json", log_text)
 
     def test_full_pipeline_auto_enables_teacher_when_default_teacher_model_exists(self):
-        result, log_text, _ = self._run_pipeline(
+        result, log_text, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=False,
             scored_rollout_exists=False,
@@ -455,14 +546,14 @@ class FullPipelineScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
         self.assertIn("Qwen3-VL-32B-Instruct", log_text)
         self.assertIn("--prepared-data", log_text)
-        self.assertIn("msad_saver_agent_train.prepared_sft.teacher.jsonl", log_text)
+        self.assertIn("msad_saver_sft_train.teacher.jsonl", log_text)
         self.assertIn("score_saver_rollout.py", log_text)
         self.assertIn("--teacher-judge-model-path", log_text)
         self.assertIn("train_saver_rl.py", log_text)
         self.assertIn("--teacher-judge-local-alpha 0.5", log_text)
 
     def test_full_pipeline_runs_teacher_annotation_and_propagates_teacher_args_when_enabled(self):
-        result, log_text, _ = self._run_pipeline(
+        result, log_text, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=False,
             scored_rollout_exists=False,
@@ -477,14 +568,14 @@ class FullPipelineScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, msg=result.stdout + "\n" + result.stderr)
-        self.assertIn("msad_saver_agent_train.prepared_sft.teacher.jsonl", log_text)
+        self.assertIn("msad_saver_sft_train.teacher.jsonl", log_text)
         self.assertIn("--teacher-judge-model-path /tmp/fake_teacher", log_text)
         self.assertIn("--teacher-judge-input-mode multimodal_visual", log_text)
         self.assertIn("--max-teacher-disagreement-cases 7", log_text)
         self.assertIn("--teacher-judge-local-alpha 0.75", log_text)
 
     def test_full_pipeline_creates_script_log_under_experiment_logs(self):
-        result, _, _ = self._run_pipeline(
+        result, _, _, _ = self._run_pipeline(
             sft_root_complete=False,
             raw_rollout_exists=True,
             scored_rollout_exists=True,
@@ -498,7 +589,7 @@ class FullPipelineScriptTests(unittest.TestCase):
         match = re.search(r"script log: ([^\n]+\.log)", result.stdout)
         self.assertIsNotNone(match, msg=result.stdout)
         log_path = Path(match.group(1).strip())
-        self.assertIn("/runs/exp1/logs/", str(log_path))
+        self.assertIn("/runs/exp1/logs/pipeline/", str(log_path))
 
 
 if __name__ == "__main__":

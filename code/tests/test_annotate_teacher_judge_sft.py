@@ -17,7 +17,37 @@ except ModuleNotFoundError:
     annotate_teacher_judge_sft = None
 
 
+def _write_prepared_input(path: Path, rows: list[dict]) -> None:
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    Path(str(path) + ".meta.json").write_text(
+        json.dumps({"schema_version": 1, "preview": {}, "prompt": {}}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 class AnnotateTeacherJudgeSftCliTests(unittest.TestCase):
+    def test_resolve_teacher_judge_shard_indices_redistributes_only_verify_candidates(self):
+        self.assertIsNotNone(annotate_teacher_judge_sft, "annotate_teacher_judge_sft.py is missing")
+
+        rows = [
+            {"video_id": "nonverify_even_0", "target_action": "answer"},
+            {"video_id": "verify_0", "target_action": "tool_call", "tool_name": "verify_hypothesis"},
+            {"video_id": "verify_1", "target_action": "tool_call", "tool_name": "verify_hypothesis"},
+            {"video_id": "nonverify_odd_3", "target_action": "answer"},
+            {"video_id": "nonverify_even_4", "target_action": "answer"},
+            {"video_id": "verify_2", "target_action": "tool_call", "tool_name": "verify_hypothesis"},
+            {"video_id": "nonverify_even_6", "target_action": "answer"},
+            {"video_id": "verify_3", "target_action": "tool_call", "tool_name": "verify_hypothesis"},
+        ]
+
+        shard_indices = annotate_teacher_judge_sft._resolve_teacher_judge_shard_indices(rows, num_shards=2)
+
+        self.assertEqual(shard_indices[0], [0, 1, 4, 5, 6])
+        self.assertEqual(shard_indices[1], [2, 3, 7])
+
     def test_progress_visualizer_updates_rank_aware_scan_and_annotation_bars(self):
         self.assertIsNotNone(annotate_teacher_judge_sft, "annotate_teacher_judge_sft.py is missing")
 
@@ -139,10 +169,7 @@ class AnnotateTeacherJudgeSftCliTests(unittest.TestCase):
             root = Path(tmpdir)
             input_path = root / "prepared.jsonl"
             output_path = root / "prepared.teacher.jsonl"
-            input_path.write_text(
-                json.dumps(verify_example) + "\n" + json.dumps(answer_example) + "\n",
-                encoding="utf-8",
-            )
+            _write_prepared_input(input_path, [verify_example, answer_example])
 
             with patch.object(
                 annotate_teacher_judge_sft.QwenTeacherJudge,
@@ -198,7 +225,7 @@ class AnnotateTeacherJudgeSftCliTests(unittest.TestCase):
             root = Path(tmpdir)
             input_path = root / "prepared.jsonl"
             output_path = root / "prepared.teacher.jsonl"
-            input_path.write_text(json.dumps(verify_example) + "\n", encoding="utf-8")
+            _write_prepared_input(input_path, [verify_example])
 
             with patch.object(
                 annotate_teacher_judge_sft.QwenTeacherJudge,
@@ -262,10 +289,7 @@ class AnnotateTeacherJudgeSftCliTests(unittest.TestCase):
             root = Path(tmpdir)
             input_path = root / "prepared.jsonl"
             output_path = root / "prepared.teacher.jsonl"
-            input_path.write_text(
-                json.dumps(verify_example_a) + "\n" + json.dumps(verify_example_b) + "\n",
-                encoding="utf-8",
-            )
+            _write_prepared_input(input_path, [verify_example_a, verify_example_b])
 
             with patch.object(
                 annotate_teacher_judge_sft.QwenTeacherJudge,
@@ -324,6 +348,41 @@ class AnnotateTeacherJudgeSftCliTests(unittest.TestCase):
         self.assertEqual([row["video_id"] for row in merged_rows], ["v0", "v1", "v2", "v3"])
         self.assertEqual([row["video_id"] for row in persisted_rows], ["v0", "v1", "v2", "v3"])
 
+    def test_merge_sharded_outputs_restores_original_order_with_custom_verify_mapping(self):
+        self.assertIsNotNone(annotate_teacher_judge_sft, "annotate_teacher_judge_sft.py is missing")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_path = root / "prepared.teacher.jsonl"
+            shard0_path = root / "prepared.teacher.shard00-of-02.jsonl"
+            shard1_path = root / "prepared.teacher.shard01-of-02.jsonl"
+            shard0_path.write_text(
+                json.dumps({"video_id": "v0"}) + "\n"
+                + json.dumps({"video_id": "v1"}) + "\n"
+                + json.dumps({"video_id": "v4"}) + "\n",
+                encoding="utf-8",
+            )
+            shard1_path.write_text(
+                json.dumps({"video_id": "v2"}) + "\n" + json.dumps({"video_id": "v3"}) + "\n",
+                encoding="utf-8",
+            )
+
+            merged_rows = annotate_teacher_judge_sft._merge_sharded_outputs(
+                output_path,
+                total_rows=5,
+                num_shards=2,
+                shard_indices_by_shard=[[0, 1, 4], [2, 3]],
+            )
+
+            persisted_rows = [
+                json.loads(line)
+                for line in output_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual([row["video_id"] for row in merged_rows], ["v0", "v1", "v2", "v3", "v4"])
+        self.assertEqual([row["video_id"] for row in persisted_rows], ["v0", "v1", "v2", "v3", "v4"])
+
     def test_main_merges_sharded_outputs_automatically_in_distributed_mode(self):
         self.assertIsNotNone(annotate_teacher_judge_sft, "annotate_teacher_judge_sft.py is missing")
 
@@ -363,10 +422,7 @@ class AnnotateTeacherJudgeSftCliTests(unittest.TestCase):
             root = Path(tmpdir)
             input_path = root / "prepared.jsonl"
             output_path = root / "prepared.teacher.jsonl"
-            input_path.write_text(
-                json.dumps(verify_example_a) + "\n" + json.dumps(verify_example_b) + "\n",
-                encoding="utf-8",
-            )
+            _write_prepared_input(input_path, [verify_example_a, verify_example_b])
             shard1_path = root / "prepared.teacher.shard01-of-02.jsonl"
             shard1_path.write_text(
                 json.dumps(
@@ -456,10 +512,7 @@ class AnnotateTeacherJudgeSftCliTests(unittest.TestCase):
             root = Path(tmpdir)
             input_path = root / "prepared.jsonl"
             output_path = root / "prepared.teacher.jsonl"
-            input_path.write_text(
-                json.dumps(verify_example_a) + "\n" + json.dumps(verify_example_b) + "\n",
-                encoding="utf-8",
-            )
+            _write_prepared_input(input_path, [verify_example_a, verify_example_b])
             shard1_path = root / "prepared.teacher.shard01-of-02.jsonl"
             shard1_path.write_text(
                 json.dumps(

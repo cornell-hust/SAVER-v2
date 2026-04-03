@@ -70,6 +70,8 @@ class SaverAgentToolsTests(unittest.TestCase):
 
         scan_schema = next(tool for tool in get_tool_schemas() if tool["function"]["name"] == "scan_timeline")
         self.assertIn("stride_sec", scan_schema["function"]["parameters"]["properties"])
+        seek_schema = next(tool for tool in get_tool_schemas() if tool["function"]["name"] == "seek_evidence")
+        self.assertIn("query_package", seek_schema["function"]["parameters"]["properties"])
 
     def test_emit_alert_schema_requires_canonical_category(self):
         schema = next(tool for tool in get_tool_schemas() if tool["function"]["name"] == "emit_alert")
@@ -99,6 +101,36 @@ class SaverAgentToolsTests(unittest.TestCase):
         self.assertEqual(state.visited_windows[0]["selected_frame_count"], 6)
         self.assertEqual(state.visited_windows[0]["selected_timestamps"], [0.0, 2.0, 4.0, 6.0, 8.0, 9.0])
         self.assertEqual(state.evidence_ledger, [])
+
+    def test_seek_evidence_observation_exposes_window_and_moment_ids_for_later_verification(self):
+        message, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "seek_evidence",
+                    "arguments": {
+                        "query": "robbery trigger",
+                        "start_sec": 1.0,
+                        "end_sec": 4.0,
+                        "num_frames": 2,
+                        "moment_id": "ev1",
+                        "role": "trigger",
+                    },
+                }
+            },
+            self.multimodal_cache,
+            self.state,
+        )
+
+        footer_text = next(
+            item["text"]
+            for item in reversed(message["content"])
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+        self.assertEqual(state.evidence_ledger[0]["window_id"], "w0001")
+        self.assertEqual(state.evidence_ledger[0]["evidence_id"], "e0001")
+        self.assertIn('selected_window_ids=["w0001"]', footer_text)
+        self.assertIn('selected_evidence_moment_ids=["ev1"]', footer_text)
+        self.assertIn("evidence_id=e0001", footer_text)
 
     def test_emit_alert_and_finalize_case_update_environment_state(self):
         _, state = execute_tool_call(
@@ -624,6 +656,147 @@ class SaverAgentToolsTests(unittest.TestCase):
         self.assertEqual(verdict["best_effort_window_ids"], ["w0001"])
         self.assertEqual(state.active_evidence_window_ids, ["w0001"])
 
+    def test_verify_hypothesis_remaps_compact_legacy_window_ids_to_current_evidence_ledger(self):
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "scan_timeline",
+                    "arguments": {"start_sec": 0.0, "end_sec": 9.0, "num_frames": 4, "stride_sec": 2.0},
+                }
+            },
+            self.multimodal_cache,
+            self.state,
+        )
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "seek_evidence",
+                    "arguments": {
+                        "query": "robbery trigger",
+                        "start_sec": 1.0,
+                        "end_sec": 4.0,
+                        "num_frames": 2,
+                        "moment_id": "ev1",
+                    },
+                }
+            },
+            self.multimodal_cache,
+            state,
+        )
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "seek_evidence",
+                    "arguments": {
+                        "query": "robbery peak",
+                        "start_sec": 4.0,
+                        "end_sec": 8.0,
+                        "num_frames": 2,
+                        "moment_id": "ev2",
+                    },
+                }
+            },
+            self.multimodal_cache,
+            state,
+        )
+
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "verify_hypothesis",
+                    "arguments": {
+                        "verification_mode": "final_check",
+                        "claim": {"existence": "anomaly", "category": "robbery"},
+                        "selected_window_ids": ["w0001", "w0002"],
+                        "sufficiency_score": 0.8,
+                        "necessity_score": 0.5,
+                        "alertability_score": 0.7,
+                        "counterfactual_faithfulness": 0.6,
+                        "verification_decision": "sufficient",
+                        "recommended_action": "finalize",
+                    },
+                }
+            },
+            self.multimodal_cache,
+            state,
+        )
+
+        verdict = state.verification_records[-1]
+        self.assertEqual(verdict["requested_selected_window_ids"], ["w0001", "w0002"])
+        self.assertEqual(verdict["invalid_selected_window_ids"], [])
+        self.assertEqual(verdict["verified_window_ids"], ["w0002", "w0003"])
+        self.assertEqual(state.active_evidence_window_ids, ["w0002", "w0003"])
+
+    def test_verify_hypothesis_remaps_legacy_window_aliases_like_evidence_index_and_zero_based_window_id(self):
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "scan_timeline",
+                    "arguments": {"start_sec": 0.0, "end_sec": 9.0, "num_frames": 4, "stride_sec": 2.0},
+                }
+            },
+            self.multimodal_cache,
+            self.state,
+        )
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "seek_evidence",
+                    "arguments": {
+                        "query": "robbery trigger",
+                        "start_sec": 1.0,
+                        "end_sec": 4.0,
+                        "num_frames": 2,
+                        "moment_id": "ev1",
+                    },
+                }
+            },
+            self.multimodal_cache,
+            state,
+        )
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "seek_evidence",
+                    "arguments": {
+                        "query": "robbery peak",
+                        "start_sec": 4.0,
+                        "end_sec": 8.0,
+                        "num_frames": 2,
+                        "moment_id": "ev2",
+                    },
+                }
+            },
+            self.multimodal_cache,
+            state,
+        )
+
+        _, state = execute_tool_call(
+            {
+                "function": {
+                    "name": "verify_hypothesis",
+                    "arguments": {
+                        "verification_mode": "final_check",
+                        "claim": {"existence": "anomaly", "category": "robbery"},
+                        "selected_window_ids": ["w_0000000000", "evidence_1"],
+                        "sufficiency_score": 0.8,
+                        "necessity_score": 0.5,
+                        "alertability_score": 0.7,
+                        "counterfactual_faithfulness": 0.6,
+                        "verification_decision": "sufficient",
+                        "recommended_action": "finalize",
+                    },
+                }
+            },
+            self.multimodal_cache,
+            state,
+        )
+
+        verdict = state.verification_records[-1]
+        self.assertEqual(verdict["invalid_selected_window_ids"], [])
+        self.assertEqual(verdict["verified_window_ids"], ["w0002", "w0003"])
+        self.assertEqual(state.active_evidence_window_ids, ["w0002", "w0003"])
+
     def test_verify_hypothesis_resolves_evidence_moment_ids_to_matching_runtime_windows(self):
         _, state = execute_tool_call(
             {
@@ -809,10 +982,16 @@ class SaverAgentToolsTests(unittest.TestCase):
                 "function": {
                     "name": "seek_evidence",
                     "arguments": {
-                        "query": "person in red shirt",
+                        "query_package": {
+                            "event_cue": "person in red shirt",
+                            "key_objects": ["person in red shirt"],
+                            "scene_context": "shop aisle",
+                            "hypothesis": "suspected actor of interest",
+                            "negative_constraints": [],
+                            "rewrite_reason": "initial_search",
+                        },
                         "start_sec": 0.0,
                         "end_sec": 9.0,
-                        "num_frames": 2,
                     },
                 }
             },
@@ -822,9 +1001,10 @@ class SaverAgentToolsTests(unittest.TestCase):
 
         self.assertEqual(message["name"], "seek_evidence")
         entry = state.evidence_ledger[-1]
-        self.assertEqual(entry["proposal_backend"], "feature_topk")
+        self.assertEqual(entry["proposal_backend"], "siglip_dpp")
         self.assertTrue(entry["feature_cache_used"])
         self.assertEqual(entry["query_normalized"], "person in red shirt")
+        self.assertEqual(entry["query_package"]["rewrite_reason"], "initial_search")
         self.assertEqual(entry["selected_frame_indices"], [5, 6])
         self.assertGreaterEqual(entry["proposal_candidate_count"], 1)
         self.assertIsNone(entry.get("proposal_fallback_reason"))

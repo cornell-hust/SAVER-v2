@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import os
+import re
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, TypeVar
 
 
 T = TypeVar("T")
+
+_RUNTIME_LOG_LINE_PATTERN = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[(?:main|rank \d+/\d+)\](?: .*)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,10 @@ def runtime_prefix(runtime: Optional[DistributedRuntime] = None) -> str:
     return "[main]"
 
 
+def log_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def runtime_log(
     message: str,
     *,
@@ -145,7 +155,10 @@ def runtime_log(
     runtime = runtime or distributed_runtime_from_env()
     if main_process_only and not runtime.is_main_process:
         return
-    print(f"{runtime_prefix(runtime)} {message}", flush=True)
+    if _RUNTIME_LOG_LINE_PATTERN.match(str(message)):
+        print(str(message), flush=True)
+        return
+    print(f"[{log_timestamp()}] {runtime_prefix(runtime)} {message}", flush=True)
 
 
 def should_log_progress(completed: int, total: int, every: int) -> bool:

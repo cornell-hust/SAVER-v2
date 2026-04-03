@@ -138,8 +138,8 @@ class TrainSaverRlTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(args.rollout_max_turns, 12)
-        self.assertEqual(args.eval_rollout_max_turns, 12)
+        self.assertEqual(args.rollout_max_turns, 14)
+        self.assertEqual(args.eval_rollout_max_turns, 14)
         self.assertEqual(args.teacher_judge_input_mode, "auto")
         self.assertEqual(args.cea_local_verifier_backend, "self_teacher")
         self.assertEqual(args.policy_max_new_tokens, 256)
@@ -155,6 +155,10 @@ class TrainSaverRlTests(unittest.TestCase):
                 "/tmp/data.jsonl",
                 "--output-dir",
                 "/tmp/rl_out",
+                "--max-image-side",
+                "640",
+                "--max-image-pixels",
+                "307200",
                 "--max-total-images",
                 "18",
             ]
@@ -165,6 +169,8 @@ class TrainSaverRlTests(unittest.TestCase):
             train_saver_rl._build_policy("/models/policy_iter_1", args, runtime=runtime)
 
         _, kwargs = from_pretrained.call_args
+        self.assertEqual(kwargs["max_image_side"], 640)
+        self.assertEqual(kwargs["max_image_pixels"], 307200)
         self.assertEqual(kwargs["max_total_images"], 18)
 
     def test_parse_args_supports_teacher_anchor_policy_and_frame_budget(self):
@@ -338,6 +344,35 @@ class TrainSaverRlTests(unittest.TestCase):
         self.assertEqual(kwargs["max_total_images"], 44)
         self.assertEqual(kwargs["max_seq_length"], 4096)
         self.assertEqual(kwargs["keep_recent_text_messages"], 12)
+
+    def test_build_training_kwargs_passes_resize_budgets_into_rollout_eval_config(self):
+        self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")
+
+        args = train_saver_rl.parse_args(
+            [
+                "--data",
+                "/tmp/data.jsonl",
+                "--output-dir",
+                "/tmp/rl_out",
+                "--eval-data",
+                "/tmp/eval.jsonl",
+                "--max-image-side",
+                "640",
+                "--max-image-pixels",
+                "307200",
+            ]
+        )
+
+        kwargs = train_saver_rl.build_training_kwargs(
+            current_model_path="/models/policy_iter_1",
+            checkpoint_dir="/tmp/rl_out/iter_000/checkpoint",
+            args=args,
+            reference_model_path="/models/policy_reference",
+            config=train_saver_rl._build_config(args),
+        )
+
+        self.assertEqual(kwargs["rollout_eval_config"].max_image_side, 640)
+        self.assertEqual(kwargs["rollout_eval_config"].max_image_pixels, 307200)
 
     def test_build_training_kwargs_passes_dataloader_knobs(self):
         self.assertIsNotNone(train_saver_rl, "train_saver_rl.py is missing")

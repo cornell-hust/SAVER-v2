@@ -66,17 +66,37 @@ configure_experiment_layout() {
   DEFAULT_ANNOTATION_DIR="${default_annotation_dir}"
   if [[ -n "${exp_name}" ]]; then
     RUN_BASE_DIR="${experiment_base_dir}/${exp_name}"
-    DEFAULT_ARTIFACT_DIR="${RUN_BASE_DIR}/train_artifacts"
+    DEFAULT_ARTIFACT_DIR="${RUN_BASE_DIR}/artifacts"
     DEFAULT_CHECKPOINT_DIR="${RUN_BASE_DIR}/checkpoints"
-    DEFAULT_ROLLOUT_ROOT="${RUN_BASE_DIR}/rollouts"
-    DEFAULT_LOG_DIR="${RUN_BASE_DIR}/logs"
+    DEFAULT_SFT_CHECKPOINT_DIR="${DEFAULT_CHECKPOINT_DIR}/sft"
+    DEFAULT_RL_CHECKPOINT_DIR="${DEFAULT_CHECKPOINT_DIR}/rl"
+    DEFAULT_EVAL_ROOT="${RUN_BASE_DIR}/eval"
+    DEFAULT_SFT_EVAL_DIR="${DEFAULT_EVAL_ROOT}/sft_epoch_end"
+    DEFAULT_RL_EVAL_DIR="${DEFAULT_EVAL_ROOT}/rl"
+    DEFAULT_ROLLOUT_ROOT="${DEFAULT_EVAL_ROOT}/batch_rollout"
+    DEFAULT_LOG_ROOT="${RUN_BASE_DIR}/logs"
+    DEFAULT_PIPELINE_LOG_DIR="${DEFAULT_LOG_ROOT}/pipeline"
+    DEFAULT_SFT_LOG_DIR="${DEFAULT_LOG_ROOT}/sft"
+    DEFAULT_RL_LOG_DIR="${DEFAULT_LOG_ROOT}/rl"
+    DEFAULT_ROLLOUT_LOG_DIR="${DEFAULT_LOG_ROOT}/rollout"
+    DEFAULT_LOG_DIR="${DEFAULT_PIPELINE_LOG_DIR}"
     echo "[main] experiment output base: ${RUN_BASE_DIR}"
   else
     RUN_BASE_DIR=""
     DEFAULT_ARTIFACT_DIR="${default_annotation_dir}"
     DEFAULT_CHECKPOINT_DIR="${default_exp_root}/checkpoints"
-    DEFAULT_ROLLOUT_ROOT="${default_exp_root}/rollouts"
-    DEFAULT_LOG_DIR="${experiment_base_dir}/logs"
+    DEFAULT_SFT_CHECKPOINT_DIR="${DEFAULT_CHECKPOINT_DIR}/sft"
+    DEFAULT_RL_CHECKPOINT_DIR="${DEFAULT_CHECKPOINT_DIR}/rl"
+    DEFAULT_EVAL_ROOT="${default_exp_root}/eval"
+    DEFAULT_SFT_EVAL_DIR="${DEFAULT_EVAL_ROOT}/sft_epoch_end"
+    DEFAULT_RL_EVAL_DIR="${DEFAULT_EVAL_ROOT}/rl"
+    DEFAULT_ROLLOUT_ROOT="${DEFAULT_EVAL_ROOT}/batch_rollout"
+    DEFAULT_LOG_ROOT="${experiment_base_dir}/logs"
+    DEFAULT_PIPELINE_LOG_DIR="${DEFAULT_LOG_ROOT}/pipeline"
+    DEFAULT_SFT_LOG_DIR="${DEFAULT_LOG_ROOT}/sft"
+    DEFAULT_RL_LOG_DIR="${DEFAULT_LOG_ROOT}/rl"
+    DEFAULT_ROLLOUT_LOG_DIR="${DEFAULT_LOG_ROOT}/rollout"
+    DEFAULT_LOG_DIR="${DEFAULT_PIPELINE_LOG_DIR}"
   fi
 }
 
@@ -91,6 +111,30 @@ configure_script_logging() {
   timestamp="$(date +%Y%m%d_%H%M%S)"
   SCRIPT_LOG_FILE="${SCRIPT_LOG_FILE:-${LOG_DIR}/${script_name}.${timestamp}.log}"
   mkdir -p "$(dirname "${SCRIPT_LOG_FILE}")"
-  exec > >(tee -a "${SCRIPT_LOG_FILE}") 2>&1
+  exec > >(
+    python3 -c '
+import sys
+import re
+from datetime import datetime
+from pathlib import Path
+
+log_path = Path(sys.argv[1])
+log_path.parent.mkdir(parents=True, exist_ok=True)
+timestamp_prefix = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]")
+
+with log_path.open("a", encoding="utf-8") as handle:
+    for raw_line in sys.stdin:
+        line = raw_line.rstrip("\n")
+        if timestamp_prefix.match(line):
+            rendered = f"{line}\n"
+        else:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rendered = f"[{timestamp}] {line}\n"
+        sys.stdout.write(rendered)
+        sys.stdout.flush()
+        handle.write(rendered)
+        handle.flush()
+' "${SCRIPT_LOG_FILE}"
+  ) 2>&1
   echo "[main] script log: ${SCRIPT_LOG_FILE}"
 }

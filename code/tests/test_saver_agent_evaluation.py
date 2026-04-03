@@ -1,6 +1,8 @@
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -286,6 +288,133 @@ class SaverAgentEvaluationTests(unittest.TestCase):
 
         self.assertEqual(summary["num_records"], 1)
         self.assertEqual(captured["video_ids"], ["eval_vid"])
+
+    def test_run_rollout_evaluation_main_process_waits_for_delayed_scored_shard_outputs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            data_path = tmpdir_path / "data.jsonl"
+            data_path.write_text(
+                json.dumps(
+                    {
+                        "video_id": "eval_vid",
+                        "video_meta": {"fps": 1.0, "duration_sec": 4.0, "total_frames": 4},
+                        "structured_target": {"existence": "normal", "category": "normal", "severity": 0},
+                        "tool_io": {"oracle_windows_sec": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            created_delayed_sibling = threading.Event()
+
+            def fake_save_rollout_records(records, output_path, **kwargs):
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open("w", encoding="utf-8") as f:
+                    for record in records:
+                        f.write(json.dumps(record) + "\n")
+                if output_path.name == "part.rank00-of-02.jsonl":
+                    sibling_path = output_path.parent / "part.rank01-of-02.jsonl"
+
+                    def _write_sibling():
+                        time.sleep(0.1)
+                        sibling_path.write_text(json.dumps({"video_id": "eval_vid_rank1"}) + "\n", encoding="utf-8")
+                        created_delayed_sibling.set()
+
+                    threading.Thread(target=_write_sibling, daemon=True).start()
+
+            with patch("saver_agent.evaluation.SaverAgentDataset", _DummyDataset), patch(
+                "saver_agent.evaluation.SaverRolloutRunner", _DummyRunner
+            ), patch("saver_agent.evaluation._serialize_result", side_effect=lambda result: dict(result)), patch(
+                "saver_agent.evaluation.score_rollout_records",
+                side_effect=lambda records, **kwargs: list(records),
+            ), patch(
+                "saver_agent.evaluation.save_rollout_records",
+                side_effect=fake_save_rollout_records,
+            ), patch(
+                "saver_agent.evaluation.summarize_saver_metrics",
+                side_effect=lambda records, **kwargs: {"num_records": len(records)},
+            ), patch(
+                "saver_agent.evaluation.init_torch_distributed",
+                return_value=True,
+            ), patch(
+                "saver_agent.evaluation.distributed_barrier",
+                return_value=None,
+            ):
+                summary = run_rollout_evaluation(
+                    policy=object(),
+                    eval_config=RolloutEvaluationConfig(data_path=data_path),
+                    output_dir=tmpdir_path,
+                    epoch_index=0,
+                    runtime=DistributedRuntime(rank=0, world_size=2, local_rank=0),
+                )
+
+        self.assertTrue(created_delayed_sibling.is_set())
+        self.assertEqual(summary["num_records"], 2)
+
+    def test_run_rollout_evaluation_does_not_use_collective_barrier_after_local_scoring(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            data_path = tmpdir_path / "data.jsonl"
+            data_path.write_text(
+                json.dumps(
+                    {
+                        "video_id": "eval_vid",
+                        "video_meta": {"fps": 1.0, "duration_sec": 4.0, "total_frames": 4},
+                        "structured_target": {"existence": "normal", "category": "normal", "severity": 0},
+                        "tool_io": {"oracle_windows_sec": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def fake_save_rollout_records(records, output_path, **kwargs):
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open("w", encoding="utf-8") as f:
+                    for record in records:
+                        f.write(json.dumps(record) + "\n")
+                if output_path.name == "part.rank00-of-02.jsonl":
+                    sibling_path = output_path.parent / "part.rank01-of-02.jsonl"
+                    sibling_path.write_text(json.dumps({"video_id": "eval_vid_rank1"}) + "\n", encoding="utf-8")
+
+            barrier_calls = {"count": 0}
+
+            def fake_barrier(runtime=None):
+                barrier_calls["count"] += 1
+                if barrier_calls["count"] > 1:
+                    raise AssertionError("post-save rollout-eval synchronization must not use collective barrier")
+
+            with patch("saver_agent.evaluation.SaverAgentDataset", _DummyDataset), patch(
+                "saver_agent.evaluation.SaverRolloutRunner", _DummyRunner
+            ), patch("saver_agent.evaluation._serialize_result", side_effect=lambda result: dict(result)), patch(
+                "saver_agent.evaluation.score_rollout_records",
+                side_effect=lambda records, **kwargs: list(records),
+            ), patch(
+                "saver_agent.evaluation.save_rollout_records",
+                side_effect=fake_save_rollout_records,
+            ), patch(
+                "saver_agent.evaluation.summarize_saver_metrics",
+                side_effect=lambda records, **kwargs: {"num_records": len(records)},
+            ), patch(
+                "saver_agent.evaluation.init_torch_distributed",
+                return_value=True,
+            ), patch(
+                "saver_agent.evaluation.distributed_barrier",
+                side_effect=fake_barrier,
+            ):
+                summary = run_rollout_evaluation(
+                    policy=object(),
+                    eval_config=RolloutEvaluationConfig(data_path=data_path),
+                    output_dir=tmpdir_path,
+                    epoch_index=0,
+                    runtime=DistributedRuntime(rank=0, world_size=2, local_rank=0),
+                )
+
+        self.assertEqual(barrier_calls["count"], 1)
+        self.assertEqual(summary["num_records"], 2)
 
 
 if __name__ == "__main__":

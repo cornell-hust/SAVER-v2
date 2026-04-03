@@ -9,6 +9,7 @@ from convert_to_saver_agent import CanonicalSaverAdapter, ConverterConfig
 from saver_agent.adapter import TimeSearchRolloutAdapter
 from saver_agent.config import SaverAgentConfig
 from saver_agent.environment import SaverEnvironmentState, SaverVideoInteraction
+from saver_agent.proposal import normalize_query_text, render_query_package_texts, summarize_query_package
 from saver_agent.reward import ALERT_STATUS_REWARD, DEFAULT_COMPONENT_WEIGHTS, PRIMARY_STATUS_REWARD
 from saver_agent.self_verification import (
     DECISION_TO_PRIMARY_STATUS,
@@ -94,7 +95,11 @@ def _tool_reasoning_text(
         moment = _find_evidence_moment(record, arguments)
         role = str(arguments.get("role") or moment.get("role") or "evidence")
         description = str(moment.get("description") or "").strip()
-        query = str(arguments.get("query") or "").strip()
+        query = str(
+            arguments.get("query")
+            or summarize_query_package(arguments.get("query_package"))
+            or ""
+        ).strip()
         if description:
             return _clip_text(
                 f"The next useful clue is the {role} around {span_text}; I should inspect it to check whether {description.lower()}."
@@ -272,6 +277,19 @@ def _serialize_messages(
         )
         serialized_messages.append(serialized_message)
     return serialized_messages
+
+
+def _serialize_message(
+    message: Dict[str, Any],
+    *,
+    multimodal_cache: Dict[str, Any],
+) -> Dict[str, Any]:
+    serialized_message = copy.deepcopy(message)
+    serialized_message["content"] = _serialize_message_content(
+        list(message.get("content") or []),
+        multimodal_cache=multimodal_cache,
+    )
+    return serialized_message
 
 
 def _ensure_agent_train_view(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -456,6 +474,11 @@ def build_oracle_sft_examples(
     environment = SaverVideoInteraction()
     messages = adapter.build_initial_messages(item)
     multimodal_cache = item["multimodal_cache"]
+    serialized_messages = (
+        _serialize_messages(messages, multimodal_cache=multimodal_cache)
+        if serialize_messages
+        else None
+    )
     state = SaverEnvironmentState()
     oracle_sft = _ensure_oracle_sft(record)
     trajectory = list(oracle_sft.get("trajectory") or [])
@@ -493,14 +516,18 @@ def build_oracle_sft_examples(
             "target_action": "tool_call",
             "target_response": response_text,
             "messages": (
-                _serialize_messages(messages, multimodal_cache=multimodal_cache)
+                copy.deepcopy(serialized_messages)
                 if serialize_messages
                 else copy.deepcopy(messages)
             ),
             "sample_weight": normalized_sample_weight,
             "tool_name": tool_name,
             "proposal_supervision": (
-                _proposal_supervision_for_query(record, arguments.get("query", ""))
+                _proposal_supervision_for_query(
+                    record,
+                    arguments.get("query", ""),
+                    query_package=arguments.get("query_package"),
+                )
                 if tool_name == "seek_evidence"
                 else {}
             ),
@@ -516,11 +543,22 @@ def build_oracle_sft_examples(
             [True],
         )
         state = next_states[0]
-        messages.append(adapter.build_assistant_message(response_text))
+        assistant_message = adapter.build_assistant_message(response_text)
+        messages.append(assistant_message)
+        if serialized_messages is not None:
+            serialized_messages.append(copy.deepcopy(assistant_message))
         tool_message = next_obs[0]
         if isinstance(tool_message, dict) and tool_message.get("role") == "tool":
             tool_message = _apply_oracle_verifier_feedback(tool_message, step=step)
-            messages.append(adapter.adapt_tool_observation(tool_message, multimodal_cache))
+            adapted_tool_message = adapter.adapt_tool_observation(tool_message, multimodal_cache)
+            messages.append(adapted_tool_message)
+            if serialized_messages is not None:
+                serialized_messages.append(
+                    _serialize_message(
+                        adapted_tool_message,
+                        multimodal_cache=multimodal_cache,
+                    )
+                )
 
     if final_decision:
         examples.append(
@@ -532,7 +570,7 @@ def build_oracle_sft_examples(
                 "target_action": "answer",
                 "target_response": _assistant_answer_response(final_decision, record=record),
                 "messages": (
-                    _serialize_messages(messages, multimodal_cache=multimodal_cache)
+                    copy.deepcopy(serialized_messages)
                     if serialize_messages
                     else copy.deepcopy(messages)
                 ),
@@ -625,23 +663,58 @@ def _latest_alert_from_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _proposal_supervision_for_query(record: Dict[str, Any], query: str) -> Dict[str, Any]:
+def _proposal_supervision_for_query(
+    record: Dict[str, Any],
+    query: str,
+    *,
+    query_package: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     proposal_supervision = record.get("proposal_supervision") or {}
-    normalized_query = " ".join(str(query or "").strip().lower().split())
+    candidate_texts = set()
+    normalized_query = normalize_query_text(str(query or ""))
+    if normalized_query:
+        candidate_texts.add(normalized_query)
+    if isinstance(query_package, dict):
+        summary_query = normalize_query_text(summarize_query_package(query_package))
+        if summary_query:
+            candidate_texts.add(summary_query)
+        rendered = render_query_package_texts(query_package)
+        for entry in rendered.get("positive_texts") or []:
+            text = normalize_query_text(str(entry.get("text") or ""))
+            if text:
+                candidate_texts.add(text)
+
+    best_match: Dict[str, Any] = {}
+    best_score = 0.0
     for query_group in proposal_supervision.get("queries") or []:
         normalized_entries = list(query_group.get("normalized_queries") or [])
-        normalized_texts = {str(entry.get("text") or "") for entry in normalized_entries}
-        if normalized_query in normalized_texts:
-            return {
-                "query_id": query_group.get("query_id"),
-                "raw_text": query_group.get("raw_text"),
-                "normalized_queries": copy.deepcopy(normalized_entries),
-                "linked_moment_ids": list(query_group.get("linked_moment_ids") or []),
-                "linked_roles": list(query_group.get("linked_roles") or []),
-                "linked_windows_sec": copy.deepcopy(query_group.get("linked_windows_sec") or []),
-                "alignment_source": query_group.get("alignment_source"),
-            }
-    return {}
+        normalized_texts = {
+            normalize_query_text(str(entry.get("text") or ""))
+            for entry in normalized_entries
+            if str(entry.get("text") or "").strip()
+        }
+        overlap_count = len(candidate_texts & normalized_texts)
+        if overlap_count <= 0:
+            continue
+        weight_bonus = 0.0
+        for entry in normalized_entries:
+            text = normalize_query_text(str(entry.get("text") or ""))
+            if text in candidate_texts:
+                weight_bonus = max(weight_bonus, float(entry.get("weight") or 0.0))
+        score = float(overlap_count) + weight_bonus
+        if score <= best_score:
+            continue
+        best_score = score
+        best_match = {
+            "query_id": query_group.get("query_id"),
+            "raw_text": query_group.get("raw_text"),
+            "normalized_queries": copy.deepcopy(normalized_entries),
+            "linked_moment_ids": list(query_group.get("linked_moment_ids") or []),
+            "linked_roles": list(query_group.get("linked_roles") or []),
+            "linked_windows_sec": copy.deepcopy(query_group.get("linked_windows_sec") or []),
+            "alignment_source": query_group.get("alignment_source"),
+        }
+    return best_match
 
 
 def _proposal_metadata_from_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
@@ -918,7 +991,12 @@ def _build_self_teacher_search_counterfactual_group(
     current_support = 1.0 if current_selected_window_ids else 0.0
     preexisting_support = 1.0 if before_selected_window_ids else 0.0
     proposal_backend = str(anchor_turn.get("proposal_backend") or "")
-    proposal_quality_bonus = 0.10 if proposal_backend == "feature_topk" else 0.0
+    if proposal_backend == "siglip_dpp":
+        proposal_quality_bonus = 0.12
+    elif proposal_backend == "feature_topk":
+        proposal_quality_bonus = 0.10
+    else:
+        proposal_quality_bonus = 0.0
     coverage_gain = max(
         0.0,
         _state_clip_ratio_local(state_after, duration_sec=duration_sec)

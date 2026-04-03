@@ -37,6 +37,17 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "query_package": {
+                        "type": "object",
+                        "properties": {
+                            "event_cue": {"type": "string"},
+                            "key_objects": {"type": "array", "items": {"type": "string"}},
+                            "scene_context": {"type": "string"},
+                            "hypothesis": {"type": "string"},
+                            "negative_constraints": {"type": "array", "items": {"type": "string"}},
+                            "rewrite_reason": {"type": "string"},
+                        },
+                    },
                     "start_sec": {"type": "number"},
                     "end_sec": {"type": "number"},
                     "num_frames": {"type": "integer"},
@@ -46,7 +57,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "top_k_candidates": {"type": "integer"},
                     "candidate_merge_gap_sec": {"type": "number"},
                 },
-                "required": ["query", "start_sec", "end_sec"],
+                "required": ["start_sec", "end_sec"],
             },
         },
     },

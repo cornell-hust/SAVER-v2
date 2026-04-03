@@ -9,15 +9,24 @@ DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/mineru2-shared/zengweijun}"
 EXP_ROOT="${EXP_ROOT:-${DATA_ROOT}/Wmh/ideas/idea2_v2}"
 DATA_UTILS_DIR="${DATA_UTILS_DIR:-${CODE_DIR}/data_utils}"
 configure_experiment_layout "${CODE_DIR}" "${EXP_ROOT}" "${DATA_UTILS_DIR}"
+LOG_DIR="${LOG_DIR:-${DEFAULT_SFT_LOG_DIR}}"
 configure_script_logging "02_train_sft_with_rollout_eval"
 ANNOTATION_DIR="${ANNOTATION_DIR:-${DEFAULT_ANNOTATION_DIR}}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${DEFAULT_ARTIFACT_DIR}}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${DEFAULT_CHECKPOINT_DIR}}"
 MODEL_ROOT="${MODEL_ROOT:-${DATA_ROOT}/Wmh/MLLMs}"
 
-PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.jsonl}"
-TEACHER_PREPARED_TRAIN_JSONL="${TEACHER_PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.teacher.jsonl}"
-EVAL_DATA="${EVAL_DATA:-${DATA_UTILS_DIR}/msad_saver_oracle_sft.jsonl}"
+if [[ -n "${SFT_CHECKPOINT_DIR:-}" ]]; then
+  CHECKPOINT_DIR="${SFT_CHECKPOINT_DIR}"
+elif [[ -n "${CHECKPOINT_DIR:-}" ]]; then
+  CHECKPOINT_DIR="${CHECKPOINT_DIR}"
+else
+  CHECKPOINT_DIR="${DEFAULT_SFT_CHECKPOINT_DIR}"
+fi
+ROLLOUT_EVAL_OUTPUT_DIR="${ROLLOUT_EVAL_OUTPUT_DIR:-${DEFAULT_SFT_EVAL_DIR}}"
+
+PREPARED_TRAIN_JSONL="${PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_sft_train.jsonl}"
+TEACHER_PREPARED_TRAIN_JSONL="${TEACHER_PREPARED_TRAIN_JSONL:-${DATA_UTILS_DIR}/msad_saver_sft_train.teacher.jsonl}"
+EVAL_DATA="${EVAL_DATA:-${DATA_UTILS_DIR}/msad_saver_runtime_test.jsonl}"
 EVAL_INCLUDE_SPLITS="${EVAL_INCLUDE_SPLITS:-test}"
 MODEL_PATH="${MODEL_PATH:-${MODEL_ROOT}/qwen3-vl-8b-Instruct}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_DIR}/saver_sft_qwen3vl_8b_eval_ddp}"
@@ -50,7 +59,7 @@ ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_3}"
 
 # 设为 0 表示评完整个 eval 数据，不传 --eval-max-records。
 EVAL_MAX_RECORDS="${EVAL_MAX_RECORDS:-0}"
-EVAL_ROLLOUT_MAX_TURNS="${EVAL_ROLLOUT_MAX_TURNS:-12}"
+EVAL_ROLLOUT_MAX_TURNS="${EVAL_ROLLOUT_MAX_TURNS:-14}"
 EVAL_MAX_NEW_TOKENS_PER_TURN="${EVAL_MAX_NEW_TOKENS_PER_TURN:-256}"
 EVAL_MAX_TOTAL_IMAGES="${EVAL_MAX_TOTAL_IMAGES:-24}"
 EVAL_VERIFIER_BACKEND="${EVAL_VERIFIER_BACKEND:-heuristic}"
@@ -83,13 +92,31 @@ is_complete_model_checkpoint_dir() {
 }
 
 rollout_eval_metrics_path_for_epoch() {
-  local output_dir="$1"
+  local rollout_eval_output_dir="$1"
   local epoch_index="$2"
-  printf '%s\n' "${output_dir}/rollout_eval/epoch_$(printf '%03d' "${epoch_index}")/metrics.json"
+  printf '%s\n' "${rollout_eval_output_dir}/epoch_$(printf '%03d' "${epoch_index}")/metrics.json"
+}
+
+legacy_rollout_eval_metrics_path_for_epoch() {
+  local rollout_eval_output_dir="$1"
+  local epoch_index="$2"
+  printf '%s\n' "${rollout_eval_output_dir}/rollout_eval/epoch_$(printf '%03d' "${epoch_index}")/metrics.json"
+}
+
+rollout_eval_metrics_exist_for_epoch() {
+  local rollout_eval_output_dir="$1"
+  local epoch_index="$2"
+  local metrics_path=""
+  local legacy_metrics_path=""
+
+  metrics_path="$(rollout_eval_metrics_path_for_epoch "${rollout_eval_output_dir}" "${epoch_index}")"
+  legacy_metrics_path="$(legacy_rollout_eval_metrics_path_for_epoch "${rollout_eval_output_dir}" "${epoch_index}")"
+  [[ -f "${metrics_path}" || -f "${legacy_metrics_path}" ]]
 }
 
 run_pending_external_rollout_evals() {
   local output_dir="$1"
+  local rollout_eval_output_dir="$2"
   local checkpoint_dir=""
   local base_name=""
   local epoch_index=""
@@ -105,8 +132,7 @@ run_pending_external_rollout_evals() {
       continue
     fi
     epoch_index="${BASH_REMATCH[1]}"
-    metrics_path="$(rollout_eval_metrics_path_for_epoch "${output_dir}" "${epoch_index}")"
-    if [[ -f "${metrics_path}" ]]; then
+    if rollout_eval_metrics_exist_for_epoch "${rollout_eval_output_dir}" "${epoch_index}"; then
       continue
     fi
     eval_cmd=(
@@ -116,6 +142,8 @@ run_pending_external_rollout_evals() {
       --include-splits "${INCLUDE_SPLITS}"
       --model-path "${MODEL_PATH}"
       --output-dir "${OUTPUT_DIR}"
+      --log-dir "${LOG_DIR}"
+      --rollout-eval-output-dir "${ROLLOUT_EVAL_OUTPUT_DIR}"
       --eval-data "${EVAL_DATA}"
       --eval-data-root "${DATA_ROOT}"
       --eval-include-splits "${EVAL_INCLUDE_SPLITS}"
@@ -161,7 +189,6 @@ run_pending_external_rollout_evals() {
   done
 }
 
-mkdir -p "${CHECKPOINT_DIR}"
 cd "${CODE_DIR}"
 
 if [[ ! -f "${PREPARED_TRAIN_JSONL}" ]]; then
@@ -213,6 +240,8 @@ cmd=(
   --include-splits "${INCLUDE_SPLITS}"
   --model-path "${MODEL_PATH}"
   --output-dir "${OUTPUT_DIR}"
+  --log-dir "${LOG_DIR}"
+  --rollout-eval-output-dir "${ROLLOUT_EVAL_OUTPUT_DIR}"
   --eval-data "${EVAL_DATA}"
   --eval-data-root "${DATA_ROOT}"
   --eval-include-splits "${EVAL_INCLUDE_SPLITS}"
@@ -288,4 +317,4 @@ if [[ -n "${EVAL_PROPOSAL_MODEL_PATH}" ]]; then
 fi
 
 "${cmd[@]}"
-run_pending_external_rollout_evals "${OUTPUT_DIR}"
+run_pending_external_rollout_evals "${OUTPUT_DIR}" "${ROLLOUT_EVAL_OUTPUT_DIR}"

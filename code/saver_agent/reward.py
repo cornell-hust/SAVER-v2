@@ -102,9 +102,9 @@ def _count_invalid_attempts(rollout_trace: Dict[str, Any]) -> int:
 def _decision_reward(rollout_trace: Dict[str, Any]) -> float:
     final_answer = rollout_trace.get("final_answer")
     finalized_case = (rollout_trace.get("state") or {}).get("finalized_case")
-    has_structured_answer = isinstance(final_answer, dict)
     has_finalized_case = isinstance(finalized_case, dict)
-    return 1.0 if has_structured_answer and has_finalized_case else 0.0
+    has_terminal_decision = isinstance(final_answer, dict) or has_finalized_case
+    return 1.0 if has_terminal_decision and has_finalized_case else 0.0
 
 
 def _protocol_reward(rollout_trace: Dict[str, Any], verifier_turn: Optional[Dict[str, Any]]) -> float:
@@ -118,7 +118,9 @@ def _protocol_reward(rollout_trace: Dict[str, Any], verifier_turn: Optional[Dict
 
     has_verify = verify_turn_index is not None or verifier_turn is not None
     has_finalize_artifact = finalize_turn_index is not None or isinstance(state.get("finalized_case"), dict)
-    has_answer_artifact = answer_turn_index is not None and isinstance(final_answer, dict)
+    has_valid_explicit_answer = answer_turn_index is not None and isinstance(final_answer, dict)
+    has_implicit_terminal_answer = answer_turn_index is None and has_finalize_artifact
+    has_answer_artifact = has_valid_explicit_answer or has_implicit_terminal_answer
 
     if not has_answer_artifact:
         return -1.0 if not has_finalize_artifact else -0.5
@@ -128,6 +130,10 @@ def _protocol_reward(rollout_trace: Dict[str, Any], verifier_turn: Optional[Dict
         return -0.75
     if finalize_turn_index is not None and answer_turn_index is not None:
         if verify_turn_index is not None and verify_turn_index < finalize_turn_index < answer_turn_index:
+            return 1.0
+        return -1.0
+    if finalize_turn_index is not None:
+        if verify_turn_index is None or verify_turn_index < finalize_turn_index:
             return 1.0
         return -1.0
     if answer_turn_index is not None and verify_turn_index is not None and verify_turn_index < answer_turn_index:
@@ -163,7 +169,8 @@ def _self_verification_quality_reward(verifier_turn: Optional[Dict[str, Any]]) -
 def _efficiency_reward(rollout_trace: Dict[str, Any]) -> float:
     final_answer = rollout_trace.get("final_answer")
     finalized_case = (rollout_trace.get("state") or {}).get("finalized_case")
-    if not (isinstance(final_answer, dict) and isinstance(finalized_case, dict)):
+    has_terminal_decision = isinstance(final_answer, dict) or isinstance(finalized_case, dict)
+    if not (has_terminal_decision and isinstance(finalized_case, dict)):
         return 0.0
     num_turns = int(rollout_trace.get("num_turns") or 0)
     num_turns += _count_invalid_attempts(rollout_trace)

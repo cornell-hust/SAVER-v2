@@ -1,12 +1,12 @@
 # SAVER 命令行流程
 
-这个 README 只保留直接可运行的命令。
+这个 README 只保留当前代码主路径下直接可运行的命令。
 
 - 不使用 `scripts/*.sh`
-- 预处理产生的 `json/jsonl` 统一放在 [`data_utils`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code/data_utils)
-- 训练和 rollout 输出放在 `code/ckpt/<EXP_NAME>/...`
-- 默认主路径是 `self-verifying policy + 单 teacher judge`
-- legacy external verifier 只保留给 diagnostic，不再作为主训练/主评估路径
+- 预处理 `json/jsonl/json summary` 统一放在 [`data_utils`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code/data_utils)
+- 训练、rollout、日志输出放在 `code/ckpt/<EXP_NAME>/...`
+- 当前默认主路径是 `self-verifying policy + 单 teacher judge`
+- legacy external verifier 只保留给 diagnostic，不再作为主训练或主评估路径
 
 以下命令默认在 [`/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code) 目录执行。
 
@@ -28,20 +28,28 @@ export DATA_UTILS_DIR=$(pwd)/data_utils
 
 mkdir -p "${CKPT_DIR}" "${ROLLOUT_DIR}" "${DATA_UTILS_DIR}"
 
-export CANONICAL_JSONL=${PROJECT_ROOT}/benchmark_annotations/msad_saver_with_qwen.jsonl
+export CANONICAL_JSONL=${DATA_UTILS_DIR}/msad_saver_with_qwen.jsonl
 
-export AGENT_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_agent_train.jsonl
-export ORACLE_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_oracle_sft_train.jsonl
-export ORACLE_TEST_JSONL=${DATA_UTILS_DIR}/msad_saver_oracle_sft_test.jsonl
-export PREPARED_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.jsonl
-export PREPARED_TRAIN_TEACHER_JSONL=${DATA_UTILS_DIR}/msad_saver_agent_train.prepared_sft.teacher.jsonl
+export RUNTIME_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_runtime_train.jsonl
+export RUNTIME_TEST_JSONL=${DATA_UTILS_DIR}/msad_saver_runtime_test.jsonl
+export SFT_TRAIN_JSONL=${DATA_UTILS_DIR}/msad_saver_sft_train.jsonl
+export SFT_TRAIN_TEACHER_JSONL=${DATA_UTILS_DIR}/msad_saver_sft_train.teacher.jsonl
+export SFT_TRAIN_META_JSON=${SFT_TRAIN_JSONL}.meta.json
+export SFT_TRAIN_TEACHER_META_JSON=${SFT_TRAIN_TEACHER_JSONL}.meta.json
+export SFT_TENSOR_CACHE_DIR=${SFT_TRAIN_TEACHER_JSONL}.tensor_cache
 
 export MODEL_PATH=${MODEL_ROOT}/qwen3-vl-8b-Instruct
-export VERIFIER_MODEL_PATH=${MODEL_ROOT}/qwen3-vl-8b-Instruct
 export TEACHER_JUDGE_MODEL_PATH=${MODEL_ROOT}/Qwen3-VL-32B-Instruct
 export TEACHER_JUDGE_INPUT_MODE=auto
 export TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW=4
 export PROPOSAL_MODEL_PATH=${MODEL_ROOT}/siglip
+export NUM_PREVIEW_FRAMES=8
+
+export MAX_IMAGE_SIDE=640
+export MAX_IMAGE_PIXELS=0
+export MAX_TOTAL_IMAGES=28
+export MAX_SEQ_LENGTH=6144
+export KEEP_RECENT_TEXT_MESSAGES=20
 
 export TRAIN_SPLIT=train
 export EVAL_SPLIT=test
@@ -49,68 +57,112 @@ export EVAL_SPLIT=test
 
 常用变量：
 
-- `EXP_NAME`: 实验名，决定 `ckpt/<EXP_NAME>` 输出目录
-- `DATA_UTILS_DIR`: 预处理 `json/jsonl` 输出目录
+- `RUNTIME_TRAIN_JSONL`: episode-level 训练数据，供 RL 直接读取
+- `RUNTIME_TEST_JSONL`: episode-level 测试数据，供 rollout eval 和 batch rollout 直接读取
+- `SFT_TRAIN_JSONL`: step-level SFT 样本
+- `SFT_TRAIN_TEACHER_JSONL`: teacher 标注后的 step-level SFT 样本
+- `SFT_TRAIN_META_JSON` / `SFT_TRAIN_TEACHER_META_JSON`: prepared SFT sidecar metadata，后续 teacher/tensor cache/train 会校验它
+- `SFT_TENSOR_CACHE_DIR`: `prepare_sft_tensor_cache.py` 的输出目录
 - `MODEL_PATH`: policy 初始模型
-- `VERIFIER_MODEL_PATH`: 仅 diagnostic 路径使用的 legacy verifier 模型
-- `TEACHER_JUDGE_MODEL_PATH`: 训练期 teacher judge 模型，离线用于 SFT 标注和 RL verify turn 校准
-- `TEACHER_JUDGE_INPUT_MODE`: 推荐 `auto`，困难样本再升级到视觉 judge
-- `TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW`: 每个 `full / keep / drop / alert_prefix` 视角最多取多少帧
+- `TEACHER_JUDGE_MODEL_PATH`: 训练期 teacher judge 模型
+- `TEACHER_JUDGE_INPUT_MODE`: 推荐 `auto`
 - `PROPOSAL_MODEL_PATH`: proposal encoder，通常是 SigLIP
+- `MAX_IMAGE_SIDE` / `MAX_IMAGE_PIXELS` / `MAX_TOTAL_IMAGES` / `MAX_SEQ_LENGTH` / `KEEP_RECENT_TEXT_MESSAGES`: 推荐统一预算
 
-## 2. 数据预处理
+预算说明：
 
-### 2.1 canonical -> agent_train
+- `prepare_sft_tensor_cache.py`、`train_saver_sft.py`、`train_saver_rl.py` 应尽量共用同一组视觉与文本预算
+- `train_saver_sft.py` / `train_saver_rl.py` 的 epoch-end rollout eval 现在会自动继承训练命令里的 `--max-image-side` 和 `--max-image-pixels`
+- 外部 `batch_run_saver_rollout.py` / `run_saver_rollout.py` 需要显式传入同样的 `--max-image-side` / `--max-image-pixels`
 
-```bash
-python convert_to_saver_agent.py \
-  --input ../benchmark_annotations/msad_saver_with_qwen.jsonl \
-  --output data_utils/msad_saver_agent_all.jsonl \
-  --mode agent_train \
-  --adapter msad_saver_qwen \
-  --include-splits "train, test"
-```
+## 2. 一步生成主数据产物
 
-### 2.2 canonical -> oracle_sft_train train 和 test 都要
+当前推荐用一个入口直接从 `data_utils/msad_saver_with_qwen.jsonl` 生成 runtime、SFT、teacher SFT，以及对应的 `.meta.json` sidecar。
 
 ```bash
-python convert_to_saver_agent.py \
-  --input ../benchmark_annotations/msad_saver_with_qwen.jsonl \
-  --output data_utils/msad_saver_oracle_sft_train.jsonl \
-  --mode oracle_sft \
-  --adapter msad_saver_qwen \
-  --include-splits "train"
-```
-
-```bash
-python convert_to_saver_agent.py \
-  --input ../benchmark_annotations/msad_saver_with_qwen.jsonl \
-  --output data_utils/msad_saver_oracle_sft_test.jsonl \
-  --mode oracle_sft \
-  --adapter msad_saver_qwen \
-  --include-splits "test"
-```
-
-### 2.3 agent_train -> prepared_sft
-
-```bash
-python train_saver_sft.py \
-  --data data_utils/msad_saver_agent_all.jsonl \
+python build_saver_data.py \
+  --input data_utils/msad_saver_with_qwen.jsonl \
+  --runtime-train-output data_utils/msad_saver_runtime_train.jsonl \
+  --runtime-test-output data_utils/msad_saver_runtime_test.jsonl \
+  --sft-train-output data_utils/msad_saver_sft_train.jsonl \
+  --teacher-output data_utils/msad_saver_sft_train.teacher.jsonl \
   --data-root /mnt/shared-storage-user/mineru2-shared/zengweijun \
-  --include-splits "train" \
-  --prepare-output data_utils/msad_saver_agent_train.prepared_sft.jsonl \
-  --prepare-only \
-  --validate-prepared-data \
+  --adapter msad_saver_qwen \
+  --train-splits "train" \
+  --test-splits "test" \
+  --proposal-model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip \
+  --proposal-torch-dtype auto \
+  --validate-sft-data \
+  --teacher-judge-model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/Qwen3-VL-32B-Instruct \
+  --teacher-judge-input-mode auto \
+  --teacher-judge-torch-dtype auto \
+  --teacher-judge-device-map auto \
+  --teacher-judge-attn-implementation flash_attention_3 \
+  --teacher-judge-max-new-tokens 384 \
+  --teacher-judge-max-images 8 \
+  --teacher-judge-topk-frames-per-view "${TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW}" \
+  --teacher-judge-batch-size 2 \
+  --num-preview-frames "${NUM_PREVIEW_FRAMES}" \
   --progress-every 25
 ```
 
-### 2.4 prepared_sft -> teacher_judge prepared_sft
+```bash
+  python build_saver_data.py \
+    --input data_utils/msad_saver_with_qwen.jsonl \
+    --runtime-train-output data_utils/msad_saver_runtime_train.jsonl \
+    --runtime-test-output data_utils/msad_saver_runtime_test.jsonl \
+    --sft-train-output data_utils/msad_saver_sft_train.jsonl \
+    --data-root /mnt/shared-storage-user/mineru2-shared/zengweijun \
+    --adapter msad_saver_qwen \
+    --train-splits "train" \
+    --test-splits "test" \
+    --proposal-model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip \
+    --proposal-torch-dtype auto \
+    --validate-sft-data \
+    --num-preview-frames 8 \
+    --progress-every 25
+```
 
 ```bash
-python annotate_teacher_judge_sft.py \
-  --input data_utils/msad_saver_agent_train.prepared_sft.jsonl \
-  --output data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-  --include-splits "train" \
+torchrun --standalone --nproc_per_node=4 annotate_teacher_judge_sft.py \
+    --input data_utils/msad_saver_sft_train.jsonl \
+    --output data_utils/msad_saver_sft_train.teacher.jsonl \
+    --include-splits "train" \
+    --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/Qwen3-VL-32B-Instruct \
+    --input-mode auto \
+    --torch-dtype auto \
+    --device-map auto \
+    --attn-implementation flash_attention_3 \
+    --max-new-tokens 384 \
+    --max-images 8 \
+    --topk-frames-per-view 4 \
+    --batch-size 5 \
+    --progress-every 25
+```
+
+这一步会直接生成 6 个主文件：
+
+- `msad_saver_runtime_train.jsonl`
+- `msad_saver_runtime_test.jsonl`
+- `msad_saver_sft_train.jsonl`
+- `msad_saver_sft_train.jsonl.meta.json`
+- `msad_saver_sft_train.teacher.jsonl`
+- `msad_saver_sft_train.teacher.jsonl.meta.json`
+
+说明：
+
+- `runtime_*` 是 episode-level 数据，保留 rollout、eval、RL 所需的结构化字段和 oracle 轨迹
+- `sft_train` 是最终 step-level SFT 样本
+- `sft_train.teacher` 是 teacher 标注并重加权后的最终 SFT 样本
+- 两个 `.meta.json` 会记录 preview/prompt 配置；后续 `annotate_teacher_judge_sft.py`、`prepare_sft_tensor_cache.py`、`train_saver_sft.py` 都会检查它
+
+如果只想在已有 `SFT_TRAIN_JSONL` 上重跑 teacher 标注，可以单独执行：
+
+```bash
+torchrun --standalone --nproc_per_node=4 annotate_teacher_judge_sft.py \
+  --input "${SFT_TRAIN_JSONL}" \
+  --output "${SFT_TRAIN_TEACHER_JSONL}" \
+  --include-splits "${TRAIN_SPLIT}" \
   --model-path "${TEACHER_JUDGE_MODEL_PATH}" \
   --input-mode "${TEACHER_JUDGE_INPUT_MODE}" \
   --torch-dtype auto \
@@ -118,105 +170,10 @@ python annotate_teacher_judge_sft.py \
   --attn-implementation flash_attention_3 \
   --max-new-tokens 384 \
   --max-images 8 \
-  --topk-frames-per-view 4 \
+  --topk-frames-per-view "${TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW}" \
+  --batch-size 3 \
   --progress-every 25
 ```
-
-```bash
-torchrun --standalone --nproc_per_node=4 annotate_teacher_judge_sft.py \
-  --input data_utils/msad_saver_agent_train.prepared_sft.jsonl \
-  --output data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-  --include-splits "train" \
-  --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/Qwen3-VL-32B-Instruct \
-  --input-mode auto \
-  --torch-dtype auto \
-  --device-map auto \
-  --attn-implementation flash_attention_3 \
-  --max-new-tokens 384 \
-  --max-images 8 \
-  --topk-frames-per-view 4 \
-  --batch-size 2 \
-  --progress-every 25
-
-```
-
-### 2.5 teacher prepared_sft -> tensor cache
-
-```bash
-python prepare_sft_tensor_cache.py \
-  --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-  --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct \
-  --include-splits train \
-  --max-seq-length 4096 \
-  --keep-recent-text-messages 12 \
-  --max-image-side 0 \
-  --max-image-pixels 0 \
-  --keep-recent-tool-image-messages 0 \
-  --max-total-images 0
-```
-
-  python prepare_sft_tensor_cache.py \
-    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-    --include-splits train \
-    --num-shards 4 \
-    --shard-index 0 &
-
-  python prepare_sft_tensor_cache.py \
-    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-    --include-splits train \
-    --num-shards 4 \
-    --shard-index 1 &
-
-  python prepare_sft_tensor_cache.py \
-    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-    --include-splits train \
-    --num-shards 4 \
-    --shard-index 2 &
-
-  python prepare_sft_tensor_cache.py \
-    --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-    --include-splits train \
-    --num-shards 4 \
-    --shard-index 3 &
-
-  wait
-
-  for i in $(seq 0 3); do
-    python prepare_sft_tensor_cache.py \
-      --prepared-data data_utils/msad_saver_agent_train.prepared_sft.teacher.jsonl \
-      --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct \
-      --include-splits train \
-      --max-seq-length 4096 \
-      --keep-recent-text-messages 12 \
-      --max-image-side 0 \
-      --max-image-pixels 0 \
-      --keep-recent-tool-image-messages 0 \
-      --max-total-images 0 \
-      --frame-cache-max-cached-videos 128 \
-      --num-shards 4 \
-      --shard-index $i \
-      --progress-every 50 &
-  done
-  wait  
-
-这一阶段产物都在 [`data_utils`](/mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/ideas/idea2_v2/code/data_utils)：
-
-- `msad_saver_agent_train.jsonl`
-- `msad_saver_oracle_sft_train.jsonl`
-- `msad_saver_oracle_sft_test.jsonl`
-- `msad_saver_agent_train.prepared_sft.jsonl`
-- `msad_saver_agent_train.prepared_sft.teacher.jsonl`
-
-相关变量：
-
-- `CANONICAL_JSONL`
-- `AGENT_TRAIN_JSONL`
-- `ORACLE_TRAIN_JSONL`
-- `ORACLE_TEST_JSONL`
-- `PREPARED_TRAIN_JSONL`
-- `PREPARED_TRAIN_TEACHER_JSONL`
-- `TRAIN_SPLIT`
-- `EVAL_SPLIT`
 
 ## 3. 构建 `.frame_cache`
 
@@ -224,26 +181,26 @@ python prepare_sft_tensor_cache.py \
 
 ```bash
 python build_frame_cache.py \
-  --data data_utils/msad_saver_oracle_sft_train.jsonl \
-  --data-root /mnt/shared-storage-user/mineru2-shared/zengweijun \
-  --include-splits "train" \
+  --data "${RUNTIME_TRAIN_JSONL}" \
+  --data-root "${DATA_ROOT}" \
+  --include-splits "${TRAIN_SPLIT}" \
   --cache-video-fps 2.0 \
   --max-cache-frames 256 \
   --progress-every 50 \
-  --summary-output data_utils/frame_cache_train_summary.json
+  --summary-output "${DATA_UTILS_DIR}/frame_cache_train_summary.json"
 ```
 
 ### 3.2 test
 
 ```bash
 python build_frame_cache.py \
-  --data data_utils/msad_saver_oracle_sft_test.jsonl \
-  --data-root /mnt/shared-storage-user/mineru2-shared/zengweijun \
-  --include-splits "test" \
+  --data "${RUNTIME_TEST_JSONL}" \
+  --data-root "${DATA_ROOT}" \
+  --include-splits "${EVAL_SPLIT}" \
   --cache-video-fps 2.0 \
   --max-cache-frames 256 \
   --progress-every 50 \
-  --summary-output data_utils/frame_cache_test_summary.json
+  --summary-output "${DATA_UTILS_DIR}/frame_cache_test_summary.json"
 ```
 
 相关变量：
@@ -258,28 +215,28 @@ python build_frame_cache.py \
 
 ```bash
 python build_feature_cache.py \
-  --data data_utils/msad_saver_oracle_sft_train.jsonl \
-  --data-root /mnt/shared-storage-user/mineru2-shared/zengweijun \
-  --include-splits "train" \
-  --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip \
+  --data "${RUNTIME_TRAIN_JSONL}" \
+  --data-root "${DATA_ROOT}" \
+  --include-splits "${TRAIN_SPLIT}" \
+  --model-path "${PROPOSAL_MODEL_PATH}" \
   --torch-dtype auto \
   --device cuda:0 \
   --progress-every 25 \
-  --summary-output data_utils/feature_cache_train_summary.json
+  --summary-output "${DATA_UTILS_DIR}/feature_cache_train_summary.json"
 ```
 
 ### 4.2 test
 
 ```bash
 python build_feature_cache.py \
-  --data data_utils/msad_saver_oracle_sft_test.jsonl \
-  --data-root /mnt/shared-storage-user/mineru2-shared/zengweijun \
-  --include-splits "test" \
-  --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/siglip \
+  --data "${RUNTIME_TEST_JSONL}" \
+  --data-root "${DATA_ROOT}" \
+  --include-splits "${EVAL_SPLIT}" \
+  --model-path "${PROPOSAL_MODEL_PATH}" \
   --torch-dtype auto \
   --device cuda:0 \
   --progress-every 25 \
-  --summary-output data_utils/feature_cache_test_summary.json
+  --summary-output "${DATA_UTILS_DIR}/feature_cache_test_summary.json"
 ```
 
 相关变量：
@@ -289,85 +246,108 @@ python build_feature_cache.py \
 - `--torch-dtype`
 - `--overwrite`
 
-## 5. SFT
+## 5. 构建 SFT tensor cache
+
+推荐先用 teacher 版 SFT 样本构建 tensor cache，再喂给 SFT 训练。
+
+```bash
+python prepare_sft_tensor_cache.py \
+  --prepared-data data_utils/msad_saver_sft_train.teacher.jsonl \
+  --output-dir data_utils/msad_saver_sft_train.teacher.jsonl.tensor_cache \
+  --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct \
+  --include-splits "train" \
+  --max-seq-length "${MAX_SEQ_LENGTH}" \
+  --keep-recent-text-messages "${KEEP_RECENT_TEXT_MESSAGES}" \
+  --max-image-side "${MAX_IMAGE_SIDE}" \
+  --max-image-pixels "${MAX_IMAGE_PIXELS}" \
+  --keep-recent-tool-image-messages 0 \
+  --max-total-images "${MAX_TOTAL_IMAGES}" \
+  --frame-cache-max-cached-videos 128 \
+  --progress-every 50
+```
+
+8 分片并行示例：
+
+```bash
+export TENSOR_CACHE_NUM_SHARDS=8
+export TENSOR_CACHE_NUM_WORKERS=4
+
+for i in $(seq 0 7); do
+  python prepare_sft_tensor_cache.py \
+    --prepared-data data_utils/msad_saver_sft_train.teacher.jsonl \
+    --output-dir data_utils/msad_saver_sft_train.teacher.jsonl.tensor_cache \
+    --model-path /mnt/shared-storage-user/mineru2-shared/zengweijun/Wmh/MLLMs/qwen3-vl-8b-Instruct \
+   --include-splits "train" \
+    --max-seq-length 6144 \
+    --keep-recent-text-messages 20 \
+    --max-image-side 640 \
+    --keep-recent-tool-image-messages 0 \
+    --max-total-images 28 \
+    --frame-cache-max-cached-videos 128 \
+    --num-shards 8 \
+    --shard-index "${i}" \
+    --num-workers 5 \
+    --progress-every 50 &
+done
+wait
+echo "完成..."
+```
+
+说明：
+
+- `MAX_IMAGE_PIXELS` 不要留空；如果不限制就显式设成 `0`，否则 shell 续行时很容易把下一行参数吃掉
+- 40 核 CPU 上，`8 shards x 4 workers` 是比较稳的起点；如果机器更空闲，可以试 `num-workers=0` 让脚本按 CPU 自动分配
+
+## 6. SFT
 
 4 卡训练直接用 `torchrun`。如果只是单卡调试，把 `torchrun --nproc_per_node=4` 改成 `python` 即可。
 
 ```bash
 export SFT_OUTPUT_DIR=${CKPT_DIR}/saver_sft_qwen3vl_8b_eval_ddp
 
-export SFT_NPROC_PER_NODE=4
-export SFT_LEARNING_RATE=1e-5
-export SFT_NUM_TRAIN_EPOCHS=2.0
-export SFT_PER_DEVICE_TRAIN_BATCH_SIZE=1
-export SFT_GRADIENT_ACCUMULATION_STEPS=16
-export SFT_EVAL_ROLLOUT_MAX_TURNS=12
-
-export SFT_MAX_IMAGE_SIDE=0
-export SFT_MAX_IMAGE_PIXELS=0
-export SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES=0
-export SFT_MAX_TOTAL_IMAGES=0
-export SFT_MAX_SEQ_LENGTH=4096
-export SFT_KEEP_RECENT_TEXT_MESSAGES=12
-
-export SFT_DATALOADER_NUM_WORKERS=4
-export SFT_DATALOADER_PREFETCH_FACTOR=2
-
-torchrun --nproc_per_node=${SFT_NPROC_PER_NODE} train_saver_sft.py \
-  --prepared-data "${PREPARED_TRAIN_TEACHER_JSONL}" \
+torchrun --nproc_per_node=4 train_saver_sft.py \
+  --prepared-data "${SFT_TRAIN_TEACHER_JSONL}" \
+  --tensor-cache-dir "${SFT_TENSOR_CACHE_DIR}" \
   --include-splits "${TRAIN_SPLIT}" \
   --model-path "${MODEL_PATH}" \
   --output-dir "${SFT_OUTPUT_DIR}" \
-  --eval-data "${ORACLE_TEST_JSONL}" \
+  --eval-data "${RUNTIME_TEST_JSONL}" \
   --eval-data-root "${DATA_ROOT}" \
-  --eval-rollout-max-turns "${SFT_EVAL_ROLLOUT_MAX_TURNS}" \
+  --eval-include-splits "${EVAL_SPLIT}" \
+  --eval-rollout-max-turns 14 \
+  --eval-max-new-tokens-per-turn 256 \
+  --eval-max-total-images "${MAX_TOTAL_IMAGES}" \
   --eval-progress-every 1 \
+  --eval-proposal-model-path "${PROPOSAL_MODEL_PATH}" \
+  --eval-proposal-torch-dtype auto \
   --lora \
   --bf16 \
   --gradient-checkpointing \
-  --per-device-train-batch-size "${SFT_PER_DEVICE_TRAIN_BATCH_SIZE}" \
-  --gradient-accumulation-steps "${SFT_GRADIENT_ACCUMULATION_STEPS}" \
-  --learning-rate "${SFT_LEARNING_RATE}" \
-  --num-train-epochs "${SFT_NUM_TRAIN_EPOCHS}" \
-  --max-image-side "${SFT_MAX_IMAGE_SIDE}" \
-  --max-image-pixels "${SFT_MAX_IMAGE_PIXELS}" \
-  --keep-recent-tool-image-messages "${SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES}" \
-  --max-total-images "${SFT_MAX_TOTAL_IMAGES}" \
-  --max-seq-length "${SFT_MAX_SEQ_LENGTH}" \
-  --keep-recent-text-messages "${SFT_KEEP_RECENT_TEXT_MESSAGES}" \
-  --dataloader-num-workers "${SFT_DATALOADER_NUM_WORKERS}" \
-  --dataloader-prefetch-factor "${SFT_DATALOADER_PREFETCH_FACTOR}" \
+  --per-device-train-batch-size 1 \
+  --gradient-accumulation-steps 16 \
+  --learning-rate 1e-5 \
+  --num-train-epochs 2.0 \
+  --max-image-side "${MAX_IMAGE_SIDE}" \
+  --max-image-pixels "${MAX_IMAGE_PIXELS}" \
+  --keep-recent-tool-image-messages 0 \
+  --max-total-images "${MAX_TOTAL_IMAGES}" \
+  --max-seq-length "${MAX_SEQ_LENGTH}" \
+  --keep-recent-text-messages "${KEEP_RECENT_TEXT_MESSAGES}" \
+  --dataloader-num-workers 4 \
+  --dataloader-prefetch-factor 2 \
   --dataloader-persistent-workers \
   --attn-implementation flash_attention_3 \
   --logging-steps 5
 ```
 
-如果你要给 epoch-end eval 显式附加 reference-conditioned diagnostic，再额外加：
+说明：
 
-```bash
-  --eval-attach-reference-diagnostics \
-  --eval-verifier-backend heuristic
-```
+- 默认主路径不附加 external verifier
+- `--eval-data` 现在直接读取 `runtime_test.jsonl`
+- epoch-end rollout eval 会自动复用这里的 `--max-image-side` / `--max-image-pixels`
+- epoch-end eval 建议保持 deferred / external 路径，不要再回到高显存的 inline 主路径
 
-相关变量：
-
-- `SFT_OUTPUT_DIR`
-- `SFT_NPROC_PER_NODE`
-- `SFT_LEARNING_RATE`
-- `SFT_NUM_TRAIN_EPOCHS`
-- `SFT_PER_DEVICE_TRAIN_BATCH_SIZE`
-- `SFT_GRADIENT_ACCUMULATION_STEPS`
-- `SFT_EVAL_ROLLOUT_MAX_TURNS`
-- `SFT_MAX_IMAGE_SIDE`
-- `SFT_MAX_IMAGE_PIXELS`
-- `SFT_KEEP_RECENT_TOOL_IMAGE_MESSAGES`
-- `SFT_MAX_TOTAL_IMAGES`
-- `SFT_MAX_SEQ_LENGTH`
-- `SFT_KEEP_RECENT_TEXT_MESSAGES`
-- `SFT_DATALOADER_NUM_WORKERS`
-- `SFT_DATALOADER_PREFETCH_FACTOR`
-
-## 6. Batch Rollout
+## 7. Batch Rollout
 
 ```bash
 export ROLLOUT_NAME=sft_rollout_eval
@@ -377,12 +357,12 @@ export RAW_ROLLOUT_JSONL=${ROLLOUT_RUN_DIR}/rollouts.raw.jsonl
 mkdir -p "${ROLLOUT_RUN_DIR}"
 
 python batch_run_saver_rollout.py \
-  --data "${ORACLE_TEST_JSONL}" \
+  --data "${RUNTIME_TEST_JSONL}" \
   --data-root "${DATA_ROOT}" \
   --include-splits "${EVAL_SPLIT}" \
   --start-index 0 \
   --count 0 \
-  --max-turns 12 \
+  --max-turns 14 \
   --policy-backend qwen \
   --model-path "${SFT_OUTPUT_DIR}" \
   --proposal-model-path "${PROPOSAL_MODEL_PATH}" \
@@ -391,7 +371,10 @@ python batch_run_saver_rollout.py \
   --torch-dtype auto \
   --device-map auto \
   --attn-implementation flash_attention_3 \
-  --max-new-tokens 512 \
+  --max-new-tokens 256 \
+  --max-image-side "${MAX_IMAGE_SIDE}" \
+  --max-image-pixels "${MAX_IMAGE_PIXELS}" \
+  --max-total-images "${MAX_TOTAL_IMAGES}" \
   --output "${RAW_ROLLOUT_JSONL}" \
   --progress-every 5
 ```
@@ -403,21 +386,7 @@ python batch_run_saver_rollout.py \
   --verifier-backend heuristic
 ```
 
-相关变量：
-
-- `ROLLOUT_NAME`
-- `RAW_ROLLOUT_JSONL`
-- `--count`: `0` 表示从 `start-index` 跑到该 split 结束
-- `--max-turns`
-- `--proposal-model-path`
-- `--proposal-device`
-- `--do-sample`
-- `--temperature`
-- `--top-p`
-- `--top-k`
-- `--repetition-penalty`
-
-## 7. Offline Score
+## 8. Offline Score
 
 ```bash
 export SCORED_ROLLOUT_JSONL=${ROLLOUT_RUN_DIR}/rollouts.scored.jsonl
@@ -425,7 +394,7 @@ export SCORED_ROLLOUT_JSONL=${ROLLOUT_RUN_DIR}/rollouts.scored.jsonl
 python score_saver_rollout.py \
   --input "${RAW_ROLLOUT_JSONL}" \
   --output "${SCORED_ROLLOUT_JSONL}" \
-  --data "${ORACLE_TEST_JSONL}" \
+  --data "${RUNTIME_TEST_JSONL}" \
   --data-root "${DATA_ROOT}" \
   --teacher-judge-model-path "${TEACHER_JUDGE_MODEL_PATH}" \
   --teacher-judge-input-mode "${TEACHER_JUDGE_INPUT_MODE}" \
@@ -442,25 +411,10 @@ python score_saver_rollout.py \
   --attach-reference-offline-verifier \
   --force-reverify \
   --verifier-backend heuristic \
-  --verifier-model-path "${VERIFIER_MODEL_PATH}"
+  --verifier-model-path "${MODEL_PATH}"
 ```
 
-相关变量：
-
-- `SCORED_ROLLOUT_JSONL`
-- `--attach-reference-offline-verifier`: 只在 diagnostic 评估里打开
-- `--force-reverify`: 只和 `--attach-reference-offline-verifier` 一起用
-- `--verifier-backend`: 只在 diagnostic 评估里使用
-- `--verifier-model-path`
-- `--verifier-device-map`
-- `--verifier-torch-dtype`
-- `--verifier-attn-implementation`
-- `--verifier-hybrid-alpha`
-- `--teacher-judge-model-path`
-- `--teacher-judge-input-mode`
-- `--teacher-judge-device-map`
-
-## 8. Summarize
+## 9. Summarize
 
 ```bash
 export SUMMARY_JSON=${ROLLOUT_RUN_DIR}/summary.json
@@ -468,18 +422,12 @@ export SUMMARY_JSON=${ROLLOUT_RUN_DIR}/summary.json
 python summarize_saver_scores.py \
   --input "${SCORED_ROLLOUT_JSONL}" \
   --output "${SUMMARY_JSON}" \
-  --data "${ORACLE_TEST_JSONL}" \
+  --data "${RUNTIME_TEST_JSONL}" \
   --data-root "${DATA_ROOT}" \
   --max-teacher-disagreement-cases 50
 ```
 
-输出文件：
-
-- `RAW_ROLLOUT_JSONL`
-- `SCORED_ROLLOUT_JSONL`
-- `SUMMARY_JSON`
-
-`summary.json` 现在除了 `complete / incomplete / redundant / misaligned` 和 reward 均值外，还会给出 teacher 诊断统计：
+`summary.json` 现在除了基础 reward 和 verify 统计，还会输出 teacher 相关诊断，例如：
 
 - `teacher_judge_decision_counts`
 - `teacher_judge_alignment_counts`
@@ -489,164 +437,131 @@ python summarize_saver_scores.py \
 - `teacher_disagreement_cases`
 - `teacher_reward_by_label_group`
 
-## 9. RL
+## 10. RL
 
 4 卡训练直接用 `torchrun`。如果只是单卡调试，把 `torchrun --nproc_per_node=4` 改成 `python` 即可。
 
 ```bash
 export RL_OUTPUT_DIR=${CKPT_DIR}/saver_cea_grpo_v1
 
-export RL_NPROC_PER_NODE=4
-export RL_NUM_ITERATIONS=3
-export RL_ROLLOUT_COUNT=16
-export RL_NUM_GENERATIONS=4
-export RL_ROLLOUT_MAX_TURNS=12
-
-export RL_LEARNING_RATE=5e-6
-export RL_NUM_TRAIN_EPOCHS=1.0
-export RL_PER_DEVICE_TRAIN_BATCH_SIZE=1
-export RL_GRADIENT_ACCUMULATION_STEPS=16
-
-export RL_KL_BETA=0.02
-export RL_GRPO_VARIANT=cea_grpo
-
-export RL_CEA_SEARCH_LOCAL_ALPHA=0.5
-export RL_CEA_ALERT_LOCAL_ALPHA=0.5
-export RL_CEA_EVIDENCE_LOCAL_ALPHA=0.5
-export RL_TEACHER_JUDGE_LOCAL_ALPHA=0.5
-
-export RL_MAX_IMAGE_SIDE=640
-export RL_MAX_IMAGE_PIXELS=0
-export RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES=0
-export RL_MAX_TOTAL_IMAGES=44
-export RL_MAX_SEQ_LENGTH=4096
-export RL_KEEP_RECENT_TEXT_MESSAGES=12
-export RL_TENSOR_CACHE_DIR="${RL_OUTPUT_DIR}/tensor_cache"
-
-torchrun --nproc_per_node=${RL_NPROC_PER_NODE} train_saver_rl.py \
-  --data "${AGENT_TRAIN_JSONL}" \
+torchrun --nproc_per_node=4 train_saver_rl.py \
+  --data "${RUNTIME_TRAIN_JSONL}" \
   --data-root "${DATA_ROOT}" \
   --include-splits "${TRAIN_SPLIT}" \
   --model-path "${SFT_OUTPUT_DIR}" \
   --reference-model-path "${SFT_OUTPUT_DIR}" \
   --output-dir "${RL_OUTPUT_DIR}" \
-  --eval-data "${ORACLE_TEST_JSONL}" \
+  --eval-data "${RUNTIME_TEST_JSONL}" \
   --eval-data-root "${DATA_ROOT}" \
-  --eval-rollout-max-turns 12 \
-  --num-iterations "${RL_NUM_ITERATIONS}" \
-  --rollout-count "${RL_ROLLOUT_COUNT}" \
-  --num-generations "${RL_NUM_GENERATIONS}" \
-  --rollout-max-turns "${RL_ROLLOUT_MAX_TURNS}" \
-  --grpo-variant "${RL_GRPO_VARIANT}" \
+  --eval-include-splits "${EVAL_SPLIT}" \
+  --eval-rollout-max-turns 14 \
+  --eval-max-new-tokens-per-turn 256 \
+  --eval-max-total-images "${MAX_TOTAL_IMAGES}" \
+  --num-iterations 3 \
+  --rollout-count 16 \
+  --num-generations 4 \
+  --rollout-max-turns 14 \
+  --policy-max-new-tokens 256 \
+  --policy-do-sample \
+  --policy-temperature 0.7 \
+  --policy-top-p 0.9 \
+  --min-weight 0.1 \
+  --advantage-clip 3.0 \
+  --grpo-variant cea_grpo \
   --cea-enable-search-group \
   --cea-enable-alert-group \
   --cea-enable-evidence-group \
-  --cea-search-local-alpha "${RL_CEA_SEARCH_LOCAL_ALPHA}" \
-  --cea-alert-local-alpha "${RL_CEA_ALERT_LOCAL_ALPHA}" \
-  --cea-evidence-local-alpha "${RL_CEA_EVIDENCE_LOCAL_ALPHA}" \
+  --cea-search-local-alpha 0.5 \
+  --cea-alert-local-alpha 0.5 \
+  --cea-evidence-local-alpha 0.5 \
+  --teacher-judge-local-alpha 0.5 \
+  --cea-local-verifier-backend self_teacher \
+  --cea-max-search-anchors-per-rollout 2 \
+  --cea-max-alert-anchors-per-rollout 2 \
+  --cea-max-evidence-anchors-per-rollout 2 \
+  --kl-beta 0.02 \
+  --proposal-model-path "${PROPOSAL_MODEL_PATH}" \
+  --proposal-torch-dtype auto \
+  --eval-proposal-model-path "${PROPOSAL_MODEL_PATH}" \
+  --eval-proposal-torch-dtype auto \
   --teacher-judge-model-path "${TEACHER_JUDGE_MODEL_PATH}" \
   --teacher-judge-input-mode "${TEACHER_JUDGE_INPUT_MODE}" \
   --teacher-judge-torch-dtype auto \
   --teacher-judge-device-map auto \
   --teacher-judge-attn-implementation flash_attention_3 \
   --teacher-judge-topk-frames-per-view "${TEACHER_JUDGE_TOPK_FRAMES_PER_VIEW}" \
-  --teacher-judge-local-alpha "${RL_TEACHER_JUDGE_LOCAL_ALPHA}" \
-  --cea-local-verifier-backend self_teacher \
-  --kl-beta "${RL_KL_BETA}" \
-  --policy-do-sample \
-  --policy-temperature 0.7 \
-  --policy-top-p 0.9 \
   --lora \
   --bf16 \
   --gradient-checkpointing \
-  --per-device-train-batch-size "${RL_PER_DEVICE_TRAIN_BATCH_SIZE}" \
-  --gradient-accumulation-steps "${RL_GRADIENT_ACCUMULATION_STEPS}" \
-  --learning-rate "${RL_LEARNING_RATE}" \
-  --num-train-epochs "${RL_NUM_TRAIN_EPOCHS}" \
-  --max-image-side "${RL_MAX_IMAGE_SIDE}" \
-  --max-image-pixels "${RL_MAX_IMAGE_PIXELS}" \
-  --keep-recent-tool-image-messages "${RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES}" \
-  --max-total-images "${RL_MAX_TOTAL_IMAGES}" \
-  --max-seq-length "${RL_MAX_SEQ_LENGTH}" \
-  --keep-recent-text-messages "${RL_KEEP_RECENT_TEXT_MESSAGES}" \
-  --tensor-cache-dir "${RL_TENSOR_CACHE_DIR}" \
-  --tensor-cache-progress-every 25 \
-  --dataloader-num-workers 4 \
-  --dataloader-prefetch-factor 2 \
+  --per-device-train-batch-size 1 \
+  --gradient-accumulation-steps 16 \
+  --learning-rate 5e-6 \
+  --num-train-epochs 1.0 \
+  --max-image-side "${MAX_IMAGE_SIDE}" \
+  --max-image-pixels "${MAX_IMAGE_PIXELS}" \
+  --keep-recent-tool-image-messages 0 \
+  --max-total-images "${MAX_TOTAL_IMAGES}" \
+  --max-seq-length "${MAX_SEQ_LENGTH}" \
+  --keep-recent-text-messages "${KEEP_RECENT_TEXT_MESSAGES}" \
+  --dataloader-num-workers 8 \
+  --dataloader-prefetch-factor 4 \
   --dataloader-persistent-workers \
   --attn-implementation flash_attention_3 \
   --logging-steps 10
 ```
 
-如果你要为 RL 显式打开 legacy diagnostic 路线，再额外加：
+说明：
 
-```bash
-  --diagnostic-online-verifier-fallback \
-  --diagnostic-attach-reference-offline-verifier \
-  --eval-attach-reference-diagnostics \
-  --eval-verifier-backend heuristic \
-  --verifier-backend heuristic \
-  --verifier-model-path "${VERIFIER_MODEL_PATH}"
+- RL 主数据直接读取 `runtime_train.jsonl`
+- RL eval 直接读取 `runtime_test.jsonl`
+- 当前主路径的 verify 能力来自 `policy self-verification`
+- `teacher judge` 只作为训练期辅助信号，不是线上推理决策器
+
+## 11. 当前主数据与消费关系
+
+```mermaid
+flowchart TD
+    accTitle: SAVER Main Data Artifacts
+    accDescr: Canonical annotations are transformed into runtime train/test JSONLs and final SFT JSONLs. Runtime artifacts feed cache building, rollout, and RL. Final SFT artifacts feed tensor cache and SFT training.
+
+    canonical["canonical JSONL<br/>msad_saver_with_qwen.jsonl"]
+    builder["build_saver_data.py"]
+    runtime_train["runtime_train.jsonl"]
+    runtime_test["runtime_test.jsonl"]
+    sft_train["sft_train.jsonl"]
+    sft_teacher["sft_train.teacher.jsonl"]
+    frame_cache[".frame_cache"]
+    feature_cache[".feature_cache"]
+    tensor_cache["tensor_cache"]
+    sft["SFT"]
+    rollout["rollout / score / summarize"]
+    rl["RL"]
+
+    canonical --> builder
+    builder --> runtime_train
+    builder --> runtime_test
+    builder --> sft_train
+    sft_train --> sft_teacher
+    runtime_train --> frame_cache
+    runtime_test --> frame_cache
+    frame_cache --> feature_cache
+    sft_teacher --> tensor_cache
+    tensor_cache --> sft
+    runtime_test --> rollout
+    runtime_train --> rl
+    runtime_test --> rl
 ```
 
-默认 RL 主路径是：
+## 12. 最短主路径
 
-- 单 policy 自验证
-- 单 teacher judge
-- 不附加 reference-conditioned offline verifier
+如果你只想跑当前推荐主路径，最短顺序就是：
 
-如果你只想做 diagnostic ablation，再额外加：
-
-```bash
-  --diagnostic-online-verifier-fallback \
-  --diagnostic-attach-reference-offline-verifier \
-  --diagnostic-force-reverify
-```
-
-相关变量：
-
-- `RL_OUTPUT_DIR`
-- `RL_NPROC_PER_NODE`
-- `RL_NUM_ITERATIONS`
-- `RL_ROLLOUT_COUNT`
-- `RL_NUM_GENERATIONS`
-- `RL_ROLLOUT_MAX_TURNS`
-- `RL_LEARNING_RATE`
-- `RL_NUM_TRAIN_EPOCHS`
-- `RL_PER_DEVICE_TRAIN_BATCH_SIZE`
-- `RL_GRADIENT_ACCUMULATION_STEPS`
-- `RL_KL_BETA`
-- `RL_GRPO_VARIANT`
-- `RL_CEA_SEARCH_LOCAL_ALPHA`
-- `RL_CEA_ALERT_LOCAL_ALPHA`
-- `RL_CEA_EVIDENCE_LOCAL_ALPHA`
-- `RL_TEACHER_JUDGE_LOCAL_ALPHA`
-- `RL_MAX_IMAGE_SIDE`
-- `RL_MAX_IMAGE_PIXELS`
-- `RL_KEEP_RECENT_TOOL_IMAGE_MESSAGES`
-- `RL_MAX_TOTAL_IMAGES`
-- `RL_MAX_SEQ_LENGTH`
-- `RL_KEEP_RECENT_TEXT_MESSAGES`
-- `RL_TENSOR_CACHE_DIR`
-
-## 10. 最短顺序
-
-按顺序执行下面这些入口即可：
-
-```text
-python convert_to_saver_agent.py   # agent_train
-python convert_to_saver_agent.py   # oracle_sft_train
-python convert_to_saver_agent.py   # oracle_sft_test
-python train_saver_sft.py --prepare-only
-python annotate_teacher_judge_sft.py
-python prepare_sft_tensor_cache.py
-python build_frame_cache.py        # train
-python build_frame_cache.py        # test
-python build_feature_cache.py      # train
-python build_feature_cache.py      # test
-torchrun train_saver_sft.py
-python batch_run_saver_rollout.py
-python score_saver_rollout.py
-python summarize_saver_scores.py
-torchrun train_saver_rl.py
-```
+1. `build_saver_data.py`
+2. `build_frame_cache.py` for train/test
+3. `build_feature_cache.py` for train/test
+4. `prepare_sft_tensor_cache.py`
+5. `train_saver_sft.py`
+6. `batch_run_saver_rollout.py`
+7. `score_saver_rollout.py`
+8. `summarize_saver_scores.py`
+9. `train_saver_rl.py`
